@@ -7,7 +7,8 @@ public record Job(
     string? Subject, string? Origin, int? Pages, string? Error,
     DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, DateTimeOffset? FinishedAt)
 {
-    public bool IsTerminal => State is "sent" or "failed" or "received";
+    /// <summary>faxd TERMINAL_STATES: sent, failed, received, cancelled.</summary>
+    public bool IsTerminal => State is "sent" or "failed" or "received" or "cancelled";
 }
 
 public record ArmState(bool Armed, DateTimeOffset? Until, int RemainingMin, string Ext);

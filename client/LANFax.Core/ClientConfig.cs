@@ -38,11 +38,32 @@ public sealed class ClientConfig
         public string? SpoolDir { get; set; }
     }
 
+    /// <summary>
+    /// Why the last <see cref="Load"/> fell back to defaults or dropped the token (null when the file was fine or
+    /// absent). Safe to show the user: it never contains the token.
+    /// </summary>
+    public string? LoadError { get; private set; }
+
+    /// <summary>Never throws: a missing file gives defaults; a blank, corrupt or unreadable one gives defaults and <see cref="LoadError"/>.</summary>
     public static ClientConfig Load(string path)
     {
         var c = new ClientConfig();
-        if (!File.Exists(path)) return c;
-        var m = JsonSerializer.Deserialize<FileModel>(File.ReadAllText(path), FileOptions) ?? new FileModel();
+        FileModel? m;
+        try
+        {
+            if (!File.Exists(path)) return c;
+            m = JsonSerializer.Deserialize<FileModel>(File.ReadAllText(path), FileOptions);
+        }
+        catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            c.LoadError = $"{path} could not be read ({e.GetType().Name}: {e.Message}); using defaults";
+            return c;
+        }
+        if (m == null)
+        {
+            c.LoadError = $"{path} holds no settings object; using defaults";
+            return c;
+        }
         if (!string.IsNullOrWhiteSpace(m.Server)) c.Server = m.Server;
         if (m.Port is int p) c.Port = p;
         if (m.KeepLocalCopies is bool k) c.KeepLocalCopies = k;
@@ -55,9 +76,10 @@ public sealed class ClientConfig
                 var plain = Dpapi.Unprotect(Convert.FromBase64String(m.Token));
                 c.Token = Encoding.UTF8.GetString(plain);
             }
-            catch (Exception e) when (e is CryptographicException or FormatException)
+            catch (Exception e) when (e is CryptographicException or FormatException or ArgumentException)
             {
                 c.Token = null; // unreadable (other machine or hand-edited): user re-enters it in Settings
+                c.LoadError = "the saved token could not be decrypted on this machine; enter it again in Settings";
             }
         }
         return c;
@@ -72,7 +94,11 @@ public sealed class ClientConfig
             prot = Convert.ToBase64String(Dpapi.Protect(Encoding.UTF8.GetBytes(Token)));
         var m = new FileModel { Server = Server, Port = Port, Token = prot, KeepLocalCopies = KeepLocalCopies, PrinterName = PrinterName, SpoolDir = SpoolDir };
         var tmp = path + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(m, FileOptions));
-        File.Move(tmp, path, overwrite: true);
+        try
+        {
+            File.WriteAllText(tmp, JsonSerializer.Serialize(m, FileOptions));
+            File.Move(tmp, path, overwrite: true);
+        }
+        finally { try { File.Delete(tmp); } catch { } }
     }
 }

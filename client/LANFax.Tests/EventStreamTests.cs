@@ -134,4 +134,104 @@ public class EventStreamTests : IDisposable
         _cts.Cancel();
         await run.WaitAsync(TimeSpan.FromSeconds(5));
     }
+
+    [Fact]
+    public void StallTimeoutDefaultsTo45Seconds() => Assert.Equal(TimeSpan.FromSeconds(45), Stream().StallTimeout);
+
+    [Fact]
+    public async Task SilentStreamIsDetectedAsStallAndReconnects()
+    {
+        int n = 0;
+        _srv.Handler = async (ctx, _) =>
+        {
+            int c = Interlocked.Increment(ref n);
+            Open(ctx);
+            await Write(ctx, $"id: {c}\nevent: arm\ndata: {{\"armed\":false,\"remaining_min\":0,\"ext\":\"300\"}}\n\n");
+            await Task.Delay(Timeout.Infinite, _cts.Token); // then silence: no keepalive
+        };
+        var es = Stream();
+        es.StallTimeout = TimeSpan.FromMilliseconds(500);
+        var errors = new List<Exception?>();
+        int arms = 0;
+        es.ArmChanged += _ => Interlocked.Increment(ref arms);
+        es.Disconnected += e => { lock (errors) errors.Add(e); };
+        var run = es.StartAsync(_cts.Token);
+        await WaitFor(() => Volatile.Read(ref arms) >= 2);
+        _cts.Cancel();
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+
+        lock (errors) Assert.IsType<TimeoutException>(errors[0]);
+        var reqs = _srv.Requests;
+        Assert.True(reqs.Length >= 2);
+        Assert.Equal("1", reqs[1].Headers["Last-Event-ID"]);
+    }
+
+    [Fact]
+    public async Task KeepalivesPreventStallDetection()
+    {
+        _srv.Handler = async (ctx, _) =>
+        {
+            Open(ctx);
+            for (int i = 0; i < 12; i++) { await Write(ctx, ": keepalive\n\n"); await Task.Delay(150, _cts.Token); }
+            await Task.Delay(Timeout.Infinite, _cts.Token);
+        };
+        var es = Stream();
+        es.StallTimeout = TimeSpan.FromMilliseconds(600);
+        int discon = 0;
+        es.Disconnected += _ => Interlocked.Increment(ref discon);
+        var run = es.StartAsync(_cts.Token);
+        await Task.Delay(1500);
+        Assert.Equal(0, Volatile.Read(ref discon));
+        _cts.Cancel();
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task CrLfLineEndingsAreParsed()
+    {
+        _srv.Handler = async (ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, ": keepalive\r\n\r\n");
+            await Write(ctx, "id: 9\r\nevent: job\r\ndata: " + JobJson + "\r\n\r\n");
+            // bare CR: StreamReader must see the next byte to rule out CRLF, so a trailing CR is only
+            // delivered with the following line (faxd sends \n, and a keepalive follows within 15 s anyway)
+            await Write(ctx, "event: arm\rdata: {\"armed\":true,\"remaining_min\":3,\"ext\":\"300\"}\r\r: keepalive\r\n");
+            await Task.Delay(Timeout.Infinite, _cts.Token);
+        };
+        var es = Stream();
+        var jobs = new List<Job>(); var arms = new List<ArmState>();
+        es.JobChanged += j => { lock (jobs) jobs.Add(j); };
+        es.ArmChanged += a => { lock (arms) arms.Add(a); };
+        var run = es.StartAsync(_cts.Token);
+        await WaitFor(() => { lock (arms) return arms.Count >= 1; });
+        _cts.Cancel();
+        await run;
+        Assert.Equal("lf1", Assert.Single(jobs).Id);
+        Assert.Equal(3, arms[0].RemainingMin);
+        Assert.Equal("9", es.LastEventId);
+    }
+
+    [Fact]
+    public async Task MalformedEventIsSkippedAndLogged()
+    {
+        _srv.Handler = async (ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, "event: job\ndata: {not json\n\n");
+            await Write(ctx, "event: job\ndata: " + JobJson + "\n\n");
+            await Task.Delay(Timeout.Infinite, _cts.Token);
+        };
+        var es = Stream();
+        var logs = new List<string>();
+        es.Log = m => { lock (logs) logs.Add(m); };
+        int jobs = 0;
+        es.JobChanged += _ => Interlocked.Increment(ref jobs);
+        var run = es.StartAsync(_cts.Token);
+        await WaitFor(() => Volatile.Read(ref jobs) >= 1);
+        _cts.Cancel();
+        await run;
+        lock (logs) Assert.Contains(logs, l => l.Contains("malformed") && l.Contains("job"));
+        Assert.All(logs, l => Assert.DoesNotContain("tok", l));
+    }
 }

@@ -51,4 +51,50 @@ public class ClientConfigTests
         new ClientConfig { Server = "h" }.Save(path);
         Assert.Null(ClientConfig.Load(path).Token);
     }
+
+    private static string WriteTmp(string content)
+    {
+        var path = Tmp();
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, content);
+        return path;
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("{")]
+    [InlineData("{\"port\":\"8080\"}")]
+    [InlineData("[1,2]")]
+    [InlineData("null")]
+    public void CorruptFileGivesDefaultsAndLoadError(string content)
+    {
+        var c = ClientConfig.Load(WriteTmp(content));
+        Assert.Equal(8080, c.Port);
+        Assert.Equal("192.0.2.10", c.Server);
+        Assert.Null(c.Token);
+        Assert.False(string.IsNullOrWhiteSpace(c.LoadError));
+    }
+
+    [Theory]
+    [InlineData("!!! not base64 !!!")]
+    [InlineData("AAAAAAAA")] // base64, but not a DPAPI blob
+    public void GarbageTokenIsDroppedWithLoadError(string token)
+    {
+        var c = ClientConfig.Load(WriteTmp("{\"server\":\"10.0.0.5\",\"token\":\"" + token + "\"}"));
+        Assert.Equal("10.0.0.5", c.Server);
+        Assert.Null(c.Token);
+        Assert.Contains("token", c.LoadError, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(token, c.LoadError);
+    }
+
+    [Fact]
+    public void GoodFileHasNoLoadError()
+    {
+        var path = Tmp();
+        new ClientConfig { Server = "h", Token = "t" }.Save(path);
+        var c = ClientConfig.Load(path);
+        Assert.Null(c.LoadError);
+        Assert.Null(ClientConfig.Load(Tmp()).LoadError); // missing file is not an error
+    }
 }
