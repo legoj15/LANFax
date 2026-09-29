@@ -1,0 +1,216 @@
+using System.Net;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+
+namespace LANFax.Core;
+
+/// <summary>Non-2xx answer from faxd (or a network failure, StatusCode 0). Message is the server's "error" text.</summary>
+public class FaxApiException(int statusCode, string message, Exception? inner = null) : Exception(message, inner)
+{
+    public int StatusCode { get; } = statusCode;
+}
+
+public sealed class FaxApiUnauthorizedException() : FaxApiException(401, "unauthorized (check the token in Settings)");
+
+/// <summary>HttpClient wrapper for the faxd API. The token is sent as a Bearer header and never logged.</summary>
+public sealed class FaxApi(ClientConfig cfg, HttpClient http)
+{
+    public const int MaxAttempts = 3;
+
+    /// <summary>Waits before attempt 2, 3 (index 0, 1). Tests replace <see cref="Delay"/>.</summary>
+    public IReadOnlyList<TimeSpan> Backoffs { get; set; } =
+        new[] { TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(8) };
+
+    public Func<TimeSpan, CancellationToken, Task> Delay { get; set; } = (d, ct) => Task.Delay(d, ct);
+
+    // ---- reads ----
+
+    public async Task<ServerStatus> GetStatusAsync(CancellationToken ct = default)
+    {
+        var (_, body) = await SendAsync(() => Req(HttpMethod.Get, "status"), ct);
+        using var doc = JsonDocument.Parse(body);
+        return ServerStatus.FromJson(doc.RootElement);
+    }
+
+    public async Task<IReadOnlyList<Job>> GetJobsAsync(string? direction = null, IEnumerable<string>? states = null,
+        int limit = 100, DateTimeOffset? updatedSince = null, CancellationToken ct = default)
+    {
+        var q = new List<string>();
+        if (direction != null) q.Add("direction=" + Uri.EscapeDataString(direction));
+        var st = states?.ToArray();
+        if (st is { Length: > 0 }) q.Add("state=" + string.Join(",", st.Select(Uri.EscapeDataString)));
+        q.Add("limit=" + limit);
+        if (updatedSince is { } s)
+            q.Add("updated_since=" + Uri.EscapeDataString(s.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")));
+        return await ListAsync("jobs?" + string.Join("&", q), ct);
+    }
+
+    public Task<IReadOnlyList<Job>> GetInboxAsync(int limit = 50, CancellationToken ct = default) =>
+        ListAsync("inbox?limit=" + limit, ct);
+
+    public async Task<Job> GetJobAsync(string id, CancellationToken ct = default)
+    {
+        var (_, body) = await SendAsync(() => Req(HttpMethod.Get, "jobs/" + Uri.EscapeDataString(id)), ct);
+        return ParseJob(body);
+    }
+
+    public async Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default)
+    {
+        var dir = Path.GetDirectoryName(Path.GetFullPath(destPath));
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        var tmp = destPath + ".part";
+        try
+        {
+            using var req = Req(HttpMethod.Get, "jobs/" + Uri.EscapeDataString(id) + "/pdf");
+            HttpResponseMessage resp;
+            try { resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct); }
+            catch (Exception e) when (IsNetwork(e, ct)) { throw new FaxApiException(0, "cannot reach faxd: " + e.Message, e); }
+            using (resp)
+            {
+                if (!resp.IsSuccessStatusCode) throw await ToException(resp);
+                await using var src = await resp.Content.ReadAsStreamAsync(ct);
+                await using (var dst = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+                    await src.CopyToAsync(dst, ct);
+            }
+            File.Move(tmp, destPath, overwrite: true);
+        }
+        finally { try { File.Delete(tmp); } catch { } }
+    }
+
+    // ---- writes ----
+
+    /// <summary>
+    /// POST /jobs. Retries only timeout, connection failure, 502 and 503 (same Idempotency-Key), up to
+    /// <see cref="MaxAttempts"/> attempts. 200 and 201 both mean accepted.
+    /// </summary>
+    public async Task<Job> PostJobAsync(Stream pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default)
+    {
+        using var buf = new MemoryStream();
+        await pdf.CopyToAsync(buf, ct);
+        var bytes = buf.ToArray();
+        return await PostWithRetryAsync(() =>
+        {
+            var r = Req(HttpMethod.Post, "jobs");
+            r.Content = new ByteArrayContent(bytes);
+            r.Content.Headers.ContentType = new MediaTypeHeaderValue("application/pdf");
+            r.Headers.TryAddWithoutValidation("X-Fax-To", to);
+            if (!string.IsNullOrEmpty(subject)) r.Headers.TryAddWithoutValidation("X-Fax-Subject", Ascii(subject));
+            r.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+            return r;
+        }, ct);
+    }
+
+    public Task<Job> SendTestPageAsync(string to, string? note, string idempotencyKey, CancellationToken ct = default) =>
+        PostWithRetryAsync(() =>
+        {
+            var r = Req(HttpMethod.Post, "test/send");
+            r.Content = JsonBody(new { to, note = note ?? "" });
+            r.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+            return r;
+        }, ct);
+
+    public async Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default) =>
+        await PostArmAsync("arm", new { minutes }, ct);
+
+    public async Task<ArmState> DisarmAsync(CancellationToken ct = default) =>
+        await PostArmAsync("disarm", null, ct);
+
+    public async Task<ArmState> ReceiveTestAsync(int minutes = 20, CancellationToken ct = default) =>
+        await PostArmAsync("test/receive", new { minutes }, ct);
+
+    // ---- plumbing ----
+
+    private async Task<ArmState> PostArmAsync(string path, object? body, CancellationToken ct)
+    {
+        var (_, resp) = await SendAsync(() =>
+        {
+            var r = Req(HttpMethod.Post, path);
+            r.Content = body == null ? new ByteArrayContent(Array.Empty<byte>()) : JsonBody(body);
+            return r;
+        }, ct);
+        return JsonSerializer.Deserialize<ArmState>(resp, Json.Options)
+               ?? throw new FaxApiException(0, "empty arm response");
+    }
+
+    private async Task<Job> PostWithRetryAsync(Func<HttpRequestMessage> make, CancellationToken ct)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                var (_, body) = await SendAsync(make, ct);
+                return ParseJob(body);
+            }
+            catch (FaxApiException e) when (attempt < MaxAttempts && e.StatusCode is 0 or 502 or 503 && e is not FaxApiUnauthorizedException)
+            {
+                await Delay(Backoffs[Math.Min(attempt - 1, Backoffs.Count - 1)], ct);
+            }
+        }
+    }
+
+    private async Task<IReadOnlyList<Job>> ListAsync(string path, CancellationToken ct)
+    {
+        var (_, body) = await SendAsync(() => Req(HttpMethod.Get, path), ct);
+        using var doc = JsonDocument.Parse(body);
+        var list = new List<Job>();
+        if (doc.RootElement.TryGetProperty("jobs", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            foreach (var e in arr.EnumerateArray())
+                list.Add(e.Deserialize<Job>(Json.Options)!);
+        return list;
+    }
+
+    private static Job ParseJob(byte[] body) =>
+        JsonSerializer.Deserialize<Job>(body, Json.Options) ?? throw new FaxApiException(0, "empty job response");
+
+    private HttpRequestMessage Req(HttpMethod m, string path)
+    {
+        var r = new HttpRequestMessage(m, new Uri(cfg.BaseUri, path));
+        if (!string.IsNullOrEmpty(cfg.Token)) r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", cfg.Token);
+        return r;
+    }
+
+    private static StringContent JsonBody(object o) =>
+        new(JsonSerializer.Serialize(o, Json.Options), Encoding.UTF8, "application/json");
+
+    private static bool IsNetwork(Exception e, CancellationToken ct) =>
+        e is HttpRequestException || (e is TaskCanceledException or TimeoutException && !ct.IsCancellationRequested);
+
+    private async Task<(HttpStatusCode, byte[])> SendAsync(Func<HttpRequestMessage> make, CancellationToken ct)
+    {
+        try
+        {
+            using var req = make();
+            using var resp = await http.SendAsync(req, ct);
+            if (!resp.IsSuccessStatusCode) throw await ToException(resp);
+            return (resp.StatusCode, await resp.Content.ReadAsByteArrayAsync(ct));
+        }
+        catch (Exception e) when (IsNetwork(e, ct))
+        {
+            throw new FaxApiException(0, "cannot reach faxd: " + e.Message, e);
+        }
+    }
+
+    private static async Task<FaxApiException> ToException(HttpResponseMessage resp)
+    {
+        if (resp.StatusCode == HttpStatusCode.Unauthorized) return new FaxApiUnauthorizedException();
+        string msg = resp.ReasonPhrase ?? ("HTTP " + (int)resp.StatusCode);
+        try
+        {
+            var text = await resp.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(text);
+            if (doc.RootElement.TryGetProperty("error", out var e) && e.ValueKind == JsonValueKind.String)
+                msg = e.GetString() ?? msg;
+        }
+        catch { /* not JSON: keep the reason phrase */ }
+        return new FaxApiException((int)resp.StatusCode, msg);
+    }
+
+    /// <summary>HTTP header values must be ASCII; replace anything else so a subject never breaks the request.</summary>
+    private static string Ascii(string s)
+    {
+        var sb = new StringBuilder(s.Length);
+        foreach (var c in s) sb.Append(c is >= ' ' and <= '~' ? c : '?');
+        return sb.ToString();
+    }
+}
