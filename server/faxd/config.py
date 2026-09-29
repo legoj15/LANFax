@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Mapping
@@ -30,6 +31,7 @@ class Config:
     station_id: str = "LANFax"
     faxin_ext: str = "300"
     allowed_numbers: str = "nanp,000,ext"  # enqueue.check_number rule names
+    event_retention_days: int = 30          # job_events rows older than this are pruned; 0 = keep
 
     @property
     def outbox(self) -> str:
@@ -77,6 +79,7 @@ _KEYS: dict[str, tuple[str, type]] = {
     "FAXD_STATION_ID": ("station_id", str),
     "FAXIN_EXT": ("faxin_ext", str),
     "FAXD_ALLOWED_NUMBERS": ("allowed_numbers", str),
+    "FAXD_EVENT_RETENTION_DAYS": ("event_retention_days", int),
 }
 
 
@@ -115,7 +118,10 @@ def load(env_file: str = DEFAULT_ENV_FILE, environ: Mapping[str, str] = os.envir
             continue
         raw = values[key]
         try:
-            setattr(cfg, field, typ(raw))
+            val = typ(raw)
+            if typ is float and not math.isfinite(val):
+                raise ValueError("not finite")
+            setattr(cfg, field, val)
         except ValueError:
             log.warning("bad value for %s: %r; using default", key, raw)
     return cfg

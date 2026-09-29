@@ -199,10 +199,11 @@ class E2ETests(unittest.TestCase):
         stop.set()
         self.assertEqual(faxmain.run_loop(self.d, stop, interval=0.01), 0)
 
-    def test_status_counts_converting(self):
-        self.d.reg.upsert_job({"id": "sh000000000001", "direction": "out", "state": "converting"})
+    def test_status_queue_counts(self):
+        # phase 1 cannot observe `converting` (the bash pipeline converts), so it is not a state
+        self.d.reg.upsert_job({"id": "sh000000000001", "direction": "out", "state": "dialing"})
         q = self.d.status_fn()["queue"]
-        self.assertEqual(q, {"queued": 0, "converting": 1, "dialing": 0, "sending": 0})
+        self.assertEqual(q, {"queued": 0, "dialing": 1, "sending": 0})
 
     def test_empty_token_refused(self):
         rc = faxmain.main(["--env-file", os.path.join(self.tmp, "none.env")], environ={})
@@ -214,6 +215,74 @@ class E2ETests(unittest.TestCase):
         self.d.stop()
         self.addCleanup(self.d.reg.close)
         self.assertEqual(self.d.reg.list_jobs(), [])   # a late request thread must not hit a closed db
+
+class StatusFnTests(unittest.TestCase):
+    def setUp(self):
+        from faxd.db import Registry
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.reg = Registry(os.path.join(self.tmp, "f.db"))
+        self.addCleanup(self.reg.close)
+        self.cfg = Config(db_path=os.path.join(self.tmp, "f.db"))
+
+    def test_full_status_carries_receiving_false(self):
+        class Down:
+            def connected(self):
+                return False
+        st = faxmain.build_status_fn(self.cfg, self.reg, Down())()
+        self.assertIs(st["receiving"], False)
+        self.assertEqual(set(st["queue"]), {"queued", "dialing", "sending"})
+
+    def test_registration_refresh_does_not_block_other_callers(self):
+        gate, entered = threading.Event(), threading.Event()
+
+        class SlowAmi:
+            calls = 0
+
+            def connected(self):
+                return True
+
+            def action(self, name, **kw):
+                SlowAmi.calls += 1
+                entered.set()
+                gate.wait(5)
+                return {"Response": "Success", "list": [
+                    {"Event": "OutboundRegistrationDetail", "ObjectName": "reg-out",
+                     "Status": "Registered"}]}
+        status = faxmain.build_status_fn(self.cfg, self.reg, SlowAmi())
+        first = threading.Thread(target=status, daemon=True)
+        first.start()
+        self.assertTrue(entered.wait(2))
+        t0 = time.monotonic()
+        st = status()                                   # refresh in flight: stale value, no wait
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertEqual(st["registrations"], [])
+        gate.set()
+        first.join(5)
+        self.assertEqual(status()["registrations"], [{"name": "reg-out", "status": "Registered"}])
+        self.assertEqual(SlowAmi.calls, 1)
+
+    def test_ami_outage_reported(self):
+        from faxd.ami import AmiClient
+        server = FakeAmiServer(user="faxd", secret="s", actions={
+            "PJSIPShowRegistrationsOutbound": registrations,
+            "Ping": lambda p: [{"Response": "Success", "Ping": "Pong"}]})
+        self.addCleanup(server.close)
+        ami = AmiClient("127.0.0.1", server.port, "faxd", "s", lambda ev: None,
+                        backoff_initial=5.0, backoff_max=5.0, idle_ping_after=0.2, dead_after=0.6)
+        self.addCleanup(ami.stop)
+        ami.start()
+        self.assertTrue(server.wait_logins(1))
+        status = faxmain.build_status_fn(self.cfg, self.reg, ami)
+        end = time.monotonic() + 3
+        while not ami.connected() and time.monotonic() < end:
+            time.sleep(0.01)
+        self.assertTrue(status()["daemon"]["ami_connected"])
+        server.mute()
+        end = time.monotonic() + 3
+        while status()["daemon"]["ami_connected"] and time.monotonic() < end:
+            time.sleep(0.05)
+        self.assertFalse(status()["daemon"]["ami_connected"])
 
 
 if __name__ == "__main__":

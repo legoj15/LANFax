@@ -120,11 +120,11 @@ class RegistryTests(unittest.TestCase):
         self.assertIsNone(self.reg.set_state_if("missing", ("queued",), "dialing"))
 
     def test_count_by_state(self):
-        for i, st in enumerate(("queued", "queued", "converting", "sending", "sent")):
+        for i, st in enumerate(("queued", "queued", "dialing", "sending", "sent")):
             self.reg.upsert_job(self._job(i, state=st))
         self.reg.upsert_job(self._job(9, direction="in", state="received"))
         self.assertEqual(self.reg.count_by_state(direction="out"),
-                         {"queued": 2, "converting": 1, "sending": 1, "sent": 1})
+                         {"queued": 2, "dialing": 1, "sending": 1, "sent": 1})
 
 
     # ---- follow-up review items -----------------------------------------
@@ -140,9 +140,9 @@ class RegistryTests(unittest.TestCase):
     def test_client_key_unique(self):
         a = self.reg.upsert_job(self._job(1, client_key="k-1"))
         self.assertEqual(a["client_key"], "k-1")
-        self.assertEqual(self.reg.find_by_client_key("k-1")["id"], a["id"])
-        self.assertIsNone(self.reg.find_by_client_key("nope"))
-        self.assertIsNone(self.reg.find_by_client_key(""))
+        self.assertEqual(self.reg.find_by_client_key("k-1", None)["id"], a["id"])
+        self.assertIsNone(self.reg.find_by_client_key("nope", None))
+        self.assertIsNone(self.reg.find_by_client_key("", None))
         self.reg.upsert_job(self._job(2))          # NULL keys never collide
         self.reg.upsert_job(self._job(3))
         with self.assertRaises(sqlite3.IntegrityError):
@@ -200,6 +200,91 @@ class RegistryTests(unittest.TestCase):
                          [(b, r2["event_id"]), (a, r3["event_id"])])
         self.assertEqual(len(self.reg.job_events_since(0, limit=1)), 1)
         self.assertEqual(self.reg.job_events_since(r3["event_id"]), [])
+
+    # ---- third-party review fixes -----------------------------------------
+    def test_converting_dropped(self):
+        self.assertNotIn("converting", JOB_STATES)
+        j = self.reg.upsert_job(self._job(1))["id"]
+        with self.assertRaises(ValueError):
+            self.reg.set_state(j, "converting")
+
+    def test_get_jobs_one_query(self):
+        a = self.reg.upsert_job(self._job(1))["id"]
+        b = self.reg.upsert_job(self._job(2))["id"]
+        got = {r["id"]: r for r in self.reg.get_jobs([a, b, "missing"])}
+        self.assertEqual(set(got), {a, b})
+        self.assertEqual(got[a], self.reg.get_job(a))
+        self.assertEqual(self.reg.get_jobs([]), [])
+
+    def test_annotate_writes_no_event_row(self):
+        j = self.reg.upsert_job(self._job(1))["id"]
+        self.reg.set_state(j, "sending", detail="Negotiating")
+        n = len(self.reg.job_events(j))
+        row = self.reg.annotate(j, pages=2, detail="sent 2 page(s)")
+        self.assertEqual((row["state"], row["pages"], row["detail"]), ("sending", 2, "sent 2 page(s)"))
+        self.assertNotIn("event_id", row)
+        self.assertEqual(len(self.reg.job_events(j)), n)
+        self.assertIsNone(self.reg.annotate(j, pages=2, detail="sent 2 page(s)"))   # nothing changed
+        self.assertIsNone(self.reg.annotate("missing", pages=1))
+        self.reg.set_state(j, "sent")
+        self.assertIsNone(self.reg.annotate(j, pages=5))                           # finished: no-op
+        self.assertEqual(self.reg.get_job(j)["pages"], 2)
+
+    def test_prune_events(self):
+        j = self.reg.upsert_job(self._job(1))["id"]
+        self.reg.set_state(j, "queued")
+        self.reg.set_state(j, "dialing")
+        with self.reg._lock:
+            self.reg._conn().execute("UPDATE job_events SET ts='2020-01-01T00:00:00Z' "
+                                     "WHERE id=(SELECT MIN(id) FROM job_events)")
+        self.assertEqual(self.reg.prune_events("2021-01-01T00:00:00Z"), 1)
+        self.assertEqual([e["state"] for e in self.reg.job_events(j)], ["dialing"])
+        self.assertIsNotNone(self.reg.get_job(j))
+
+    def test_max_event_id(self):
+        self.assertIsNone(self.reg.max_event_id())
+        j = self.reg.upsert_job(self._job(1))["id"]
+        e = self.reg.set_state(j, "queued")["event_id"]
+        self.assertEqual(self.reg.max_event_id(), e)
+
+    def test_client_key_scoped_to_client(self):
+        a = self.reg.upsert_job(self._job(1, client_key="k", client="10.0.0.1"))
+        b = self.reg.upsert_job(self._job(2, client_key="k", client="10.0.0.2"))
+        self.assertEqual(self.reg.find_by_client_key("k", "10.0.0.1")["id"], a["id"])
+        self.assertEqual(self.reg.find_by_client_key("k", "10.0.0.2")["id"], b["id"])
+        self.assertIsNone(self.reg.find_by_client_key("k", "10.0.0.3"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.reg.upsert_job(self._job(3, client_key="k", client="10.0.0.1"))
+
+    def test_migration_scopes_old_unique_client_key_index(self):
+        path = os.path.join(self.tmp.name, "v2.db")
+        db = sqlite3.connect(path)
+        db.executescript("""
+            CREATE TABLE jobs (id TEXT PRIMARY KEY, direction TEXT NOT NULL DEFAULT 'out',
+              state TEXT NOT NULL DEFAULT 'queued', filename TEXT, to_number TEXT,
+              from_number TEXT, subject TEXT, origin TEXT, client TEXT, ast_jobid TEXT,
+              pages INTEGER, error TEXT, pdf_path TEXT, created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL, finished_at TEXT, client_key TEXT);
+            CREATE TABLE job_events (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+              ts TEXT NOT NULL, state TEXT, detail TEXT);
+            CREATE UNIQUE INDEX jobs_client_key ON jobs(client_key);
+            INSERT INTO jobs (id, created_at, updated_at, client, client_key)
+              VALUES ('lfold', 'x', 'x', '10.0.0.1', 'k');
+        """)
+        db.close()
+        reg = Registry(path)
+        try:
+            names = {r[0] for r in reg._conn().execute(
+                "SELECT name FROM sqlite_master WHERE type='index'")}
+            self.assertNotIn("jobs_client_key", names)
+            self.assertEqual(reg.find_by_client_key("k", "10.0.0.1")["id"], "lfold")
+            reg.upsert_job(self._job(1, client_key="k", client="10.0.0.2"))   # other client: fine
+            with self.assertRaises(sqlite3.IntegrityError):
+                reg.upsert_job(self._job(2, client_key="k", client="10.0.0.1"))
+            self.assertIsNone(reg.get_job("lfold")["detail"])                  # detail column added
+        finally:
+            reg.close()
+        Registry(path).close()
 
 
 if __name__ == "__main__":

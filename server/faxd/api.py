@@ -20,7 +20,7 @@ MAX_BODY = 25 * 1024 * 1024   # faxd.service caps the whole daemon at 96 MB
 MAX_CONNS = 32                # concurrent connections, SSE streams included
 REQUEST_TIMEOUT = 30          # seconds; socket timeout for every connection
 MAX_UPLOADS = 2               # concurrent POST /jobs body reads (each may hold MAX_BODY)
-REPLAY_PAGE = 500             # job_events rows per query when replaying Last-Event-ID
+REPLAY_MAX = 200              # missed job_events rows replayed on reconnect; more -> `resync`
 CHUNK = 64 * 1024
 _TOKEN_RE = re.compile(r"(token=)[^&\s]*", re.IGNORECASE)
 _ID = r"([A-Za-z0-9_-]+)"
@@ -336,7 +336,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _prior(self, key):
         """The job an earlier request with this Idempotency-Key created, else None."""
-        return self.api.reg.find_by_client_key(key) if key else None
+        return self.api.reg.find_by_client_key(key, self.client_ip) if key else None
 
     def r_post_job(self, query):
         key = self._client_key()
@@ -425,23 +425,29 @@ class _Handler(BaseHTTPRequestHandler):
         return n if n >= 0 else None
 
     def _replay(self, after):
-        """[(event_id, job event)] for every job with a job_events row newer than `after`:
-        the job's full current row once, ordered by its newest event, oldest first."""
+        """[(sse type, event_id, payload)] for the job_events rows newer than `after`.
+
+        Up to REPLAY_MAX rows: one `job` per job, its full current row (looked up in one
+        query), ordered by its newest event, oldest first. More than that: a single
+        `resync` {"reason": "too_many_events", "since": <ts of the oldest missed row>} whose
+        id is the newest event, and no replay; the client reloads via GET /jobs?updated_since=.
+        """
         reg = self.api.reg
-        newest = {}
-        while True:
-            rows = reg.job_events_since(after, limit=REPLAY_PAGE)
-            for e in rows:
-                newest[e["job_id"]] = e["id"]
-            if len(rows) < REPLAY_PAGE:
-                break
-            after = rows[-1]["id"]
-        out = []
+        rows = reg.job_events_since(after, limit=REPLAY_MAX + 1)
         now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        if len(rows) > REPLAY_MAX:
+            return [("resync", reg.max_event_id(),
+                     {"type": "resync", "ts": now, "reason": "too_many_events",
+                      "since": rows[0]["ts"]})]
+        newest = {}
+        for e in rows:
+            newest[e["job_id"]] = e["id"]
+        jobs = {j["id"]: j for j in reg.get_jobs(list(newest))} if newest else {}
+        out = []
         for job_id, eid in sorted(newest.items(), key=lambda kv: kv[1]):
-            row = reg.get_job(job_id)
+            row = jobs.get(job_id)
             if row:
-                out.append((eid, {"type": "job", "ts": now, **row, "event_id": eid}))
+                out.append(("job", eid, {"type": "job", "ts": now, **row, "event_id": eid}))
         return out
 
     def _event_id(self, ev):
@@ -474,8 +480,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._sse("status", status)
             self._sse("arm", arm)
-            for eid, ev in replay:
-                self._sse("job", ev, eid)
+            for etype, eid, ev in replay:
+                self._sse(etype, ev, eid)
             last = time.monotonic()
             tick = max(0.05, min(0.5, api.sse_keepalive))
             while not api.stop.is_set():

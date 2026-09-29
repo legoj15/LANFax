@@ -67,6 +67,13 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("StartLimitIntervalSec=120", unit)
         self.assertIn("StartLimitBurst=5", unit)
 
+    def test_ami_conf_never_world_readable(self):
+        s = read(SH)
+        sec = s[s.index("# 4. AMI user"):s.index("# 5.")]
+        self.assertIn("mktemp", sec)
+        self.assertIn('install -m 0640 -o root -g asterisk', sec)
+        self.assertNotIn('cat > "$AMI_CONF"', sec)   # a plain redirect is created world-readable
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,12 +3,12 @@ import logging
 import select
 import socket
 import threading
+import time
 import uuid
 
 _log = logging.getLogger("faxd.ami")
 
-_TERMINAL = ("sent", "failed", "received", "cancelled")   # db.TERMINAL_STATES
-_ACTIVE = ("queued", "converting", "dialing", "sending")
+_ACTIVE = ("queued", "dialing", "sending")
 
 
 class AmiError(Exception):
@@ -56,7 +56,8 @@ def _parse(text):
 
 class AmiClient:
     def __init__(self, host, port, user, secret, on_event, logger=None,
-                 backoff_initial=1.0, backoff_max=30.0, connect_timeout=5.0, on_connect=None):
+                 backoff_initial=1.0, backoff_max=30.0, connect_timeout=5.0, on_connect=None,
+                 idle_ping_after=30.0, dead_after=90.0):
         self._host, self._port = host, port
         self._user, self._secret = user, secret
         self._on_event = on_event
@@ -65,6 +66,13 @@ class AmiClient:
         self._backoff_initial = backoff_initial
         self._backoff_max = backoff_max
         self._connect_timeout = connect_timeout
+        # liveness: a silent link gets `Action: Ping` after idle_ping_after seconds and is
+        # dropped (then reconnected) after dead_after seconds without a single byte
+        self._idle_ping_after = idle_ping_after
+        self._dead_after = dead_after
+        self._tick = max(0.01, min(0.5, idle_ping_after / 4.0, dead_after / 4.0))
+        self._last_rx = 0.0
+        self._pinged = False
         self._stop = threading.Event()
         self._connected = threading.Event()
         self._thread = None
@@ -133,8 +141,13 @@ class AmiClient:
     def _session(self):
         """One connection. Returns True if login succeeded."""
         sock = socket.create_connection((self._host, self._port), self._connect_timeout)
-        sock.settimeout(5.0)
+        sock.settimeout(5.0)   # bounds sendall; reads only happen after select() says readable
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            pass
         self._sock = sock
+        self._last_rx, self._pinged = time.monotonic(), False
         if self._stop.is_set():
             return False
         buf = bytearray()
@@ -185,16 +198,32 @@ class AmiClient:
         return _parse(raw.decode("utf-8", "replace"))
 
     def _fill(self, sock, buf):
-        """Read more bytes; False on EOF or stop."""
+        """Read more bytes; False on EOF, stop, or a link silent for dead_after seconds."""
         while not self._stop.is_set():
-            r, _, _ = select.select([sock], [], [], 0.5)
+            r, _, _ = select.select([sock], [], [], self._tick)
             if r:
                 data = sock.recv(65536)
                 if not data:
                     return False
                 buf.extend(data)
+                self._last_rx, self._pinged = time.monotonic(), False
                 return True
+            idle = time.monotonic() - self._last_rx
+            if idle >= self._dead_after:
+                self._log.warning("AMI silent for %.0f s; dropping the connection", idle)
+                return False
+            if idle >= self._idle_ping_after and not self._pinged and self._connected.is_set():
+                self._pinged = True
+                self._ping(sock)
         return False
+
+    def _ping(self, sock):
+        """Keepalive probe from the reader thread; the reply is just traffic (no waiter)."""
+        try:
+            with self._send_lock:
+                sock.sendall(_encode({"Action": "Ping", "ActionID": "faxd-ping-" + uuid.uuid4().hex}))
+        except OSError as e:
+            self._log.warning("AMI ping failed: %s", e)
 
     def _dispatch(self, pkt):
         aid = pkt.get("ActionID")
@@ -330,15 +359,12 @@ class AmiProgress:
             return
         del self._pending[uid]
         self._jobs[uid] = row["id"]
-        self._publish(self._reg.set_state_if(row["id"], ("queued", "converting"), "dialing"))
+        self._publish(self._reg.set_state_if(row["id"], ("queued",), "dialing"))
 
     def _annotate(self, job_id, *, pages=None, detail=None):
-        """Record pages/detail without changing state; a no-op once the job finished."""
-        row = self._reg.get_job(job_id)
-        if not row or row.get("state") in _TERMINAL:
-            return
-        st = row["state"]
-        self._publish(self._reg.set_state_if(job_id, (st,), st, pages=pages, detail=detail))
+        """Record pages/detail without a state change or a job_events row (Registry.annotate
+        is a no-op once the job finished or when nothing changed)."""
+        self._publish(self._reg.annotate(job_id, pages=pages, detail=detail))
 
     def handle(self, ev):
         with self._lock:

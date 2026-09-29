@@ -643,6 +643,63 @@ class FollowUpFakeCase(unittest.TestCase):
         self.assertIn('cancelled: "gray"', html)
         self.assertIn("reloadOnOpen", html)
 
+class ThirdPartyReviewCase(unittest.TestCase):
+    """Bounded replay, one-query job lookup, caller-scoped Idempotency-Key."""
+
+    # RealRegCase's harness, without re-running its tests
+    setUp, post, _history, _replay = (RealRegCase.setUp, RealRegCase.post, RealRegCase._history,
+                                      RealRegCase._replay)
+
+    def _many(self, n):
+        a = self.reg.upsert_job({"id": "lfaaaaaaaaaaaa", "direction": "out", "state": "queued"})["id"]
+        first = self.reg.set_state(a, "queued")
+        for _ in range(n - 1):
+            last = self.reg.set_state(a, "queued")
+        return a, first, last
+
+    def test_replay_over_200_events_sends_one_resync(self):
+        a, first, last = self._many(201)
+        r = self._replay("/events?token=" + TOKEN, {"Last-Event-ID": "0"})
+        ev, data, eid = read_event_full(r)
+        self.assertEqual(ev, "resync")
+        self.assertEqual(data["reason"], "too_many_events")
+        self.assertEqual(data["since"], self.reg.job_events(a)[0]["ts"])
+        self.assertEqual(eid, str(last["event_id"]))       # a later reconnect does not resync again
+        self.bus.publish("arm", armed=False)                # then the live stream, no job replay
+        self.assertEqual(read_event_full(r)[0], "arm")
+
+    def test_replay_of_200_events_is_normal(self):
+        a, first, last = self._many(200)
+        r = self._replay("/events?token=" + TOKEN, {"Last-Event-ID": "0"})
+        ev, data, eid = read_event_full(r)
+        self.assertEqual((ev, data["id"], eid), ("job", a, str(last["event_id"])))
+
+    def test_replay_looks_jobs_up_in_one_query(self):
+        a, b, e1, e2, e3 = self._history()
+
+        def boom(job_id):
+            raise AssertionError("per-job get_job in the replay")
+        self.reg.get_job = boom
+        r = self._replay("/events?token=" + TOKEN, {"Last-Event-ID": str(e1)})
+        self.assertEqual(read_event_full(r)[1]["id"], a)
+        self.assertEqual(read_event_full(r)[1]["id"], b)
+
+    def test_idempotency_key_scoped_to_caller(self):
+        other = self.reg.upsert_job({"id": "lfcccccccccccc", "direction": "out", "state": "queued",
+                                     "client": "10.9.9.9", "client_key": "shared:1"})
+        s1, j1 = self.post("shared:1")
+        self.assertEqual(s1, 201)                           # another caller's key is not ours
+        self.assertNotEqual(j1["id"], other["id"])
+        s2, j2 = self.post("shared:1")
+        self.assertEqual((s2, j2["id"]), (200, j1["id"]))
+
+    def test_web_page_resync_and_receiving_expiry(self):
+        from faxd import api as api_mod
+        with open(api_mod._WEB, encoding="utf-8") as f:
+            html = f.read()
+        self.assertIn('on("resync"', html)
+        self.assertIn("RECEIVING_TTL_MS = 120000", html)
+
 
 if __name__ == "__main__":
     unittest.main()

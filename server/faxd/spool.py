@@ -9,7 +9,8 @@ import logging
 import os
 import re
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .config import Config
@@ -26,8 +27,11 @@ _INBOX_RE = re.compile(r"^fax_(\d{8}-\d{6})_from_(.+)\.pdf$", re.IGNORECASE)
 _RECV_FAIL_RE = re.compile(r"^recv_(\d{8}-\d{6})_from_(.+)\.txt$", re.IGNORECASE)
 _JOBID_RE = re.compile(r"^j\d{8}-\d{6}-")
 _API_ID_RE = re.compile(r"^lf[0-9a-f]{12}$")
-_ACTIVE = ("queued", "converting", "dialing", "sending")
+_ACTIVE = ("queued", "dialing", "sending")
 _STAMP = "%Y%m%d-%H%M%S"
+MIN_POLL = 0.2              # seconds; a 0/negative FAXD_POLL_INTERVAL must not busy-loop
+STUCK_QUEUED_AFTER = 300    # seconds a queued row may point at a missing file
+PRUNE_EVERY = 3600          # seconds between job_events retention passes
 
 
 def _norm(s: str) -> str:
@@ -131,7 +135,11 @@ class SpoolObserver:
         self.bus = bus
         self._arm_sig: Optional[tuple[int, int]] = None
         self._receipts_done: dict[str, tuple[int, int]] = {}  # receipt path -> sig when settled
+        # receipt path -> (sig, folder listing hash) when it matched nothing: not re-read until
+        # the receipt or the files beside it change
+        self._receipts_skipped: dict[str, tuple] = {}
         self._warned: set[str] = set()                        # ambiguous receipts already logged
+        self._last_prune: Optional[float] = None              # time.monotonic() of the last prune
 
     # ---- helpers ------------------------------------------------------
     def _queue_meta(self, filename: Optional[str]) -> dict[str, Any]:
@@ -156,7 +164,8 @@ class SpoolObserver:
         for key in ("subject", "origin", "client", "client_key", "created_at"):
             if isinstance(meta.get(key), str) and meta[key]:
                 out[key] = meta[key]
-        if out.get("client_key") and self.reg.find_by_client_key(out["client_key"]):
+        if out.get("client_key") and self.reg.find_by_client_key(out["client_key"],
+                                                                 out.get("client")):
             del out["client_key"]
         return out
 
@@ -243,13 +252,13 @@ class SpoolObserver:
                     "to_number": to or None, "origin": "share", "ast_jobid": jobid,
                 })
             state = None
-            if row["state"] in ("queued", "converting") and not _isfile(
+            if row["state"] == "queued" and not _isfile(
                     os.path.join(self.cfg.outqueue, jobid + ".result")):
                 state = "dialing"
             sending = os.path.join(self.cfg.sending, filename) if filename else None
             # SELFTEST.env duplicates the pipeline's own <jobid>.env; never let it steal the id
             ast = None if selftest and row.get("ast_jobid") else jobid
-            self._apply(row, state, expected=("queued", "converting"), ast_jobid=ast,
+            self._apply(row, state, expected=("queued",), ast_jobid=ast,
                         to_number=to or None,
                         pdf_path=sending if sending and _isfile(sending) else None)
 
@@ -275,25 +284,36 @@ class SpoolObserver:
                 sig = _sig(path)
                 if sig is None or self._receipts_done.get(path) == sig:
                     continue  # already applied to a finished row and unchanged since
-                if self._receipt(directory, target, name, path, ls):
+                skip_key = (sig, hash(tuple(ls[directory])))
+                if self._receipts_skipped.get(path) == skip_key:
+                    continue  # matched nothing, and neither it nor its folder changed since
+                self._receipts_skipped.pop(path, None)
+                result = self._receipt(directory, target, name, path, ls)
+                if result is True:
                     self._receipts_done[path] = sig
-        for path in [p for p in self._receipts_done if p not in live]:
-            del self._receipts_done[path]
+                elif result is None:
+                    self._receipts_skipped[path] = skip_key
+        for seen in (self._receipts_done, self._receipts_skipped):
+            for path in [p for p in seen if p not in live]:
+                del seen[path]
         self._warned &= live
 
     def _receipt(self, directory: str, target: str, name: str, path: str,
-                 ls: dict[str, list[str]]) -> bool:
-        """Apply one receipt; True once it is settled (its row is finished)."""
+                 ls: dict[str, list[str]]) -> Optional[bool]:
+        """Apply one receipt. True once it is settled (its row is finished), False to look
+        again next scan, None when a SELFTEST.txt matches nothing (skipped until it or the
+        files beside it change)."""
         jobid = name[:-4]
         rec = parse_receipt(path)
         row = self.reg.find_by_ast_jobid(jobid)
         selftest = jobid == "SELFTEST"
         if row is None and selftest:
-            row = self._selftest_row(path)
-            if row is None:
-                return False  # stale receipt from an earlier self-test, or no matching job
+            row, stale = self._selftest_row(path)
+            if stale:
+                return None   # older than SELFTEST.env: an earlier self-test's receipt
         if row is None:
-            cands = self._receipt_candidates(directory, rec, ls)
+            cands = self._receipt_candidates(directory, rec, ls,
+                                             selftest_receipt=path if selftest else None)
             if len(cands) == 1:
                 row = cands[0]
             elif cands:
@@ -301,6 +321,8 @@ class SpoolObserver:
                     self._warned.add(path)
                     log.warning("receipt %s ambiguous between %d rows; skipped", jobid, len(cands))
                 return False
+            elif selftest:
+                return True if self._adopt_selftest(directory, target, path, rec, ls) else None
             else:
                 if _JOBID_RE.match(jobid):
                     self._adopt_receipt(directory, target, jobid, rec, ls)
@@ -322,30 +344,83 @@ class SpoolObserver:
                               error=err, ast_jobid=ast, pdf_path=pdf)
         return row["state"] in TERMINAL_STATES
 
-    def _selftest_row(self, receipt_path: str) -> Optional[dict]:
-        """Row for sent|failed/SELFTEST.txt: the job named by SELFTEST.env, if the receipt is newer."""
+    def _selftest_row(self, receipt_path: str) -> tuple[Optional[dict], bool]:
+        """(row, stale) for sent|failed/SELFTEST.txt: the job named by SELFTEST.env when the
+        receipt is newer than it; stale=True when the receipt predates SELFTEST.env. With no
+        SELFTEST.env (cleaned up) it is (None, False) and the caller searches by file."""
         env_path = os.path.join(self.cfg.outqueue, "SELFTEST.env")
         try:
-            if os.stat(receipt_path).st_mtime < os.stat(env_path).st_mtime:
-                return None
+            env_mtime = os.stat(env_path).st_mtime
         except OSError:
-            return None
+            return None, False
+        try:
+            if os.stat(receipt_path).st_mtime < env_mtime:
+                return None, True
+        except OSError:
+            return None, False
         src = parse_env_file(env_path).get("SRCFILE", "").replace("\\", "/")
-        return self.reg.find_by_filename(src.rsplit("/", 1)[-1]) if src else None
+        return (self.reg.find_by_filename(src.rsplit("/", 1)[-1]) if src else None), False
 
     def _receipt_candidates(self, directory: str, rec: dict[str, str],
-                            ls: dict[str, list[str]]) -> list[dict]:
-        """Unmatched active rows whose file sits beside the receipt (and match its number)."""
-        to = _norm(rec["to"]) if rec.get("to") else None
+                            ls: dict[str, list[str]], *,
+                            selftest_receipt: Optional[str] = None) -> list[dict]:
+        """Unmatched active rows whose file sits beside the receipt (and match its number).
+
+        For SELFTEST.txt (`selftest_receipt` = its path; `To: SELFTEST` is not a number) the
+        candidates are active `000` rows created no later than the receipt; they may carry the
+        pipeline's own job id, which never gets a receipt of its own."""
         here = set(ls[directory])
+        if selftest_receipt:
+            to, done = "000", _mtime_iso(selftest_receipt) or ""
+        else:
+            to, done = (_norm(rec["to"]) if rec.get("to") else None), ""
         cands = []
         for row in self.reg.list_jobs(direction="out", states=_ACTIVE, limit=1000):
-            if row["ast_jobid"] or not row["filename"] or row["filename"] not in here:
+            if not row["filename"] or row["filename"] not in here:
                 continue
-            if to and row["to_number"] and row["to_number"] != to:
+            if selftest_receipt:
+                if row["to_number"] != to or (row["created_at"] or "") > done:
+                    continue
+            elif row["ast_jobid"] or (to and row["to_number"] and row["to_number"] != to):
                 continue
             cands.append(row)
         return cands
+
+    def _adopt_selftest(self, directory: str, target: str, path: str, rec: dict[str, str],
+                        ls: dict[str, list[str]]) -> bool:
+        """History for a SELFTEST.txt with no job: the newest `000_*` file beside it that is
+        not newer than the receipt (2 min slack) becomes a finished row. False when there is
+        no such file; True, writing nothing, when that file already has a row."""
+        try:
+            limit = os.stat(path).st_mtime + 120
+        except OSError:
+            return False
+        best, best_mtime = None, None
+        for fn in ls[directory]:
+            if not fn.startswith("000_") or os.path.splitext(fn)[1].lower() not in _OUTBOX_EXTS:
+                continue
+            try:
+                m = os.stat(os.path.join(directory, fn)).st_mtime
+            except OSError:
+                continue
+            if m <= limit and (best_mtime is None or m > best_mtime):
+                best, best_mtime = fn, m
+        if best is None:
+            return False
+        if self.reg.find_by_filename(best):
+            return True   # already known (adopted earlier, or settled while SELFTEST.env existed)
+        pdf = os.path.join(directory, best)
+        done = date_cmd_to_utc_iso(rec.get("date", "")) or _mtime_iso(path) or utcnow_iso()
+        fields: dict[str, Any] = {
+            "_prefix": "sh", "direction": "out", "state": target, "filename": best,
+            "to_number": "000", "origin": "share", "pdf_path": pdf,
+            "pages": _to_int(rec.get("pages")), "created_at": _mtime_iso(pdf) or done,
+        }
+        if target == "failed":
+            fields["error"] = rec.get("error") or rec.get("status") or "failed"
+        row = self._create(fields)
+        self.reg.upsert_job({"id": row["id"], "finished_at": done})
+        return True
 
     def _adopt_receipt(self, directory: str, target: str, jobid: str, rec: dict[str, str],
                        ls: dict[str, list[str]]) -> None:
@@ -432,6 +507,21 @@ class SpoolObserver:
                 "created_at": local_to_utc_iso(m.group(1), _STAMP) or utcnow_iso(),
             })
 
+    def _rule_stuck_queued(self) -> None:
+        """A `queued` row whose pdf_path is gone and that has not changed for 5 minutes never
+        reached the pipeline (the enqueue died before its rename, or the file was removed)."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=STUCK_QUEUED_AFTER)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        for row in self.reg.list_jobs(direction="out", states=["queued"], limit=1000):
+            path = row["pdf_path"]
+            if not path or (row["updated_at"] or "") >= cutoff or _isfile(path):
+                continue
+            new = self.reg.set_state_if(row["id"], ("queued",), "failed",
+                                        error="file never appeared")
+            if new is not None:
+                log.warning("job %s: %s never appeared; marked failed", row["id"], path)
+                self.bus.publish("job", **new)
+
     def _rule_arm(self) -> None:
         try:
             st = os.stat(self.cfg.arm_status_file)
@@ -453,20 +543,39 @@ class SpoolObserver:
         for rule, args in ((self._rule_outbox, ()), (self._rule_env, ()), (self._rule_sending, ()),
                            (self._rule_receipts, (ls,)), (self._rule_failed_markers, (ls,)),
                            (self._rule_inbox, (ls,)), (self._rule_failed_recv, (ls,)),
-                           (self._rule_arm, ())):
+                           (self._rule_stuck_queued, ()), (self._rule_arm, ())):
             try:
                 rule(*args)
             except Exception:
                 log.exception("spool rule %s failed", rule.__name__)
 
+    def maybe_prune(self, now: Optional[float] = None) -> None:
+        """Hourly: delete job_events rows older than cfg.event_retention_days (0 = keep all).
+        `now` is a time.monotonic() value (tests pass their own)."""
+        days = getattr(self.cfg, "event_retention_days", 0) or 0
+        if days <= 0:
+            return
+        now = time.monotonic() if now is None else now
+        if self._last_prune is not None and now - self._last_prune < PRUNE_EVERY:
+            return
+        self._last_prune = now
+        before = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        n = self.reg.prune_events(before)
+        if n:
+            log.info("pruned %d job_events rows older than %s", n, before)
+
     def run(self, stop: threading.Event) -> None:
-        """Scan every poll_interval until `stop` is set."""
+        """Scan every poll_interval (at least MIN_POLL) until `stop` is set; prune hourly."""
         while not stop.is_set():
             try:
                 self.scan_once()
             except Exception:
                 log.exception("spool scan failed")
-            stop.wait(self.cfg.poll_interval)
+            try:
+                self.maybe_prune()
+            except Exception:
+                log.exception("job_events retention failed")
+            stop.wait(max(MIN_POLL, self.cfg.poll_interval))
 
     def arm_state(self) -> dict:
         """Parse ARM-STATUS.txt via arm.parse_status (same dict shape as ArmController.state)."""

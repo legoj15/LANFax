@@ -141,7 +141,7 @@ function fmtTime(s) {
   const d = new Date(s);
   return isNaN(d) ? esc(s) : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
-const BADGE = { queued: "amber", converting: "amber", dialing: "amber", sending: "amber", sent: "green", failed: "red", received: "blue", cancelled: "gray" };
+const BADGE = { queued: "amber", dialing: "amber", sending: "amber", sent: "green", failed: "red", received: "blue", cancelled: "gray" };
 function badge(st) { return '<span class="badge b-' + (BADGE[st] || "gray") + '">' + esc(st) + "</span>"; }
 function pdfLink(j) { return j.pdf_path ? '<a class="lnk" data-pdf="' + esc(j.id) + '">open</a>' : ""; }
 
@@ -165,9 +165,15 @@ async function loadInbox() {
 }
 
 let lastStatus = {};
+// `receiving` expires by itself: the PBX sends no "receive finished" status event
+const RECEIVING_TTL_MS = 120000;
+let receivingAt = 0;
+function receivingNow() { return receivingAt && Date.now() - receivingAt < RECEIVING_TTL_MS; }
 // status events from the PBX carry only {receiving, from}: merge, never replace
 function setStatus(s) {
-  s = lastStatus = Object.assign({}, lastStatus, s);
+  if (s.receiving) receivingAt = Date.now();
+  else if (s.daemon || s.receiving === false) receivingAt = 0;   // a full status clears it
+  s = lastStatus = Object.assign({}, lastStatus, s, { receiving: !!receivingNow() });
   if (s.receiving) say("Receiving a fax" + (s.from ? " from " + s.from : "") + "...");
   const regs = s.registrations || [];
   const bad = regs.filter(r => !/registered/i.test(r.status || "") || /unregistered/i.test(r.status || ""));
@@ -193,6 +199,12 @@ function tick() {
     " (" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0") + " left)";
 }
 setInterval(tick, 1000);
+setInterval(() => {
+  if (!receivingAt || receivingNow()) return;
+  receivingAt = 0;
+  lastStatus.receiving = false;
+  if ($("msg").textContent.startsWith("Receiving a fax")) say("");
+}, 1000);
 
 function connectEvents() {
   if (es) es.close();
@@ -203,6 +215,8 @@ function connectEvents() {
   on("arm", setArm);
   on("job", () => { loadJobs(); loadInbox(); });
   on("received", () => { loadJobs(); loadInbox(); });
+  // too many missed events to replay: reload the tables instead
+  on("resync", () => { loadJobs(); loadInbox(); });
   es.onerror = () => {
     setPill("bad", "reconnecting");
     if (es.readyState === 2) { es.close(); es = null; setTimeout(start, 5000); }   // closed for good (e.g. 401)

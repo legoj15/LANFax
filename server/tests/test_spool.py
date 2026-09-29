@@ -531,6 +531,110 @@ class SpoolTests(unittest.TestCase):
         self.obs.scan_once()
         self.assertIsNone(self.only()["to_number"])
 
+    # ---- third-party review fixes -----------------------------------------
+    def _selftest_receipt(self, when=None):
+        p = os.path.join(self.cfg.sent, "SELFTEST.txt")
+        _write(p, "Status: DELIVERED\nTo: SELFTEST\nPages: 1\nDate: Tue Sep 29 18:13:58 EDT 2026\n")
+        if when is not None:
+            os.utime(p, (when, when))
+        return p
+
+    def test_23_selftest_receipt_without_env_settles(self):
+        name = self._selftest_setup()
+        self.obs.scan_once()
+        os.replace(os.path.join(self.cfg.outbox, name), os.path.join(self.cfg.sent, name))
+        os.remove(os.path.join(self.cfg.outqueue, "SELFTEST.env"))
+        self._selftest_receipt()
+        self.obs.scan_once()
+        row = self.only()
+        self.assertEqual((row["state"], row["pages"], row["to_number"]), ("sent", 1, "000"))
+        self.assertEqual(row["pdf_path"], os.path.join(self.cfg.sent, name))
+        self.assertEqual(row["ast_jobid"], "j20260929-181336-000testpagelf1")
+
+    def test_24_rebuilt_registry_adopts_past_selftest(self):
+        _write(os.path.join(self.cfg.sent, "000_testpage-lf1.pdf"), "%PDF")
+        self._selftest_receipt()
+        self.obs.scan_once()
+        row = self.only()
+        self.assertEqual((row["state"], row["to_number"], row["pages"]), ("sent", "000", 1))
+        self.assertEqual(row["filename"], "000_testpage-lf1.pdf")
+        self.assertEqual(row["pdf_path"], os.path.join(self.cfg.sent, "000_testpage-lf1.pdf"))
+        self.assertTrue(row["finished_at"].startswith("2026-09-29"), row)
+        self.obs.scan_once()
+        SpoolObserver(self.cfg, self.reg, self.bus).scan_once()   # a restart adopts nothing new
+        self.assertEqual(len(self.reg.list_jobs()), 1)
+
+    def test_25_unmatched_selftest_receipt_read_once(self):
+        from unittest import mock
+        import faxd.spool as sp
+        p = self._selftest_receipt()
+        with mock.patch.object(sp, "parse_receipt", wraps=sp.parse_receipt) as pr:
+            self.obs.scan_once()
+            self.obs.scan_once()
+            self.obs.scan_once()
+            self.assertEqual(pr.call_count, 1)
+            st = os.stat(p).st_mtime + 5
+            os.utime(p, (st, st))                                  # changed: read again
+            self.obs.scan_once()
+            self.assertEqual(pr.call_count, 2)
+        self.assertEqual(self.reg.list_jobs(), [])
+
+    def test_26_stuck_queued_row_fails_after_5_minutes(self):
+        old = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        gone = self.reg.upsert_job({"id": "lf00000000000a", "direction": "out", "state": "queued",
+                                    "filename": "000_x-lf00000000000a.pdf",
+                                    "pdf_path": os.path.join(self.cfg.outbox, "000_x-lf00000000000a.pdf")})
+        fresh = self.reg.upsert_job({"id": "lf00000000000b", "direction": "out", "state": "queued",
+                                     "filename": "000_y-lf00000000000b.pdf",
+                                     "pdf_path": os.path.join(self.cfg.outbox, "000_y-lf00000000000b.pdf")})
+        present = self._queue("000_z.pdf")
+        with self.reg._lock:
+            self.reg._conn().execute("UPDATE jobs SET updated_at=? WHERE id<>?", (old, fresh["id"]))
+        self.events()
+        self.obs.scan_once()
+        g = self.reg.get_job(gone["id"])
+        self.assertEqual((g["state"], g["error"]), ("failed", "file never appeared"))
+        self.assertEqual(self.reg.get_job(fresh["id"])["state"], "queued")
+        self.assertEqual(self.reg.find_by_filename(present)["state"], "queued")
+        self.assertEqual(self.job_events(), [("job", "failed")])
+
+    def test_27_poll_interval_clamped(self):
+        import threading
+        from unittest import mock
+        stop = threading.Event()
+        self.cfg.poll_interval = 0.0
+        with mock.patch.object(self.obs, "scan_once") as scan:
+            t = threading.Thread(target=self.obs.run, args=(stop,))
+            t.start()
+            stop.wait(0.5)
+            stop.set()
+            t.join(timeout=5)
+        self.assertLessEqual(scan.call_count, 4)
+
+    def test_28_event_retention_hourly(self):
+        from unittest import mock
+        j = self.reg.upsert_job({"id": "sh0000000000aa", "direction": "out", "state": "queued"})["id"]
+        self.reg.set_state(j, "queued")
+        self.reg.set_state(j, "dialing")
+        with self.reg._lock:
+            self.reg._conn().execute("UPDATE job_events SET ts='2020-01-01T00:00:00Z' "
+                                     "WHERE id=(SELECT MIN(id) FROM job_events)")
+        with mock.patch.object(self.reg, "prune_events", wraps=self.reg.prune_events) as pe:
+            self.obs.maybe_prune(now=1000.0)
+            self.obs.maybe_prune(now=1000.0 + 1800)          # within the hour: no second prune
+            self.assertEqual(pe.call_count, 1)
+            self.obs.maybe_prune(now=1000.0 + 3601)
+            self.assertEqual(pe.call_count, 2)
+        self.assertEqual([e["state"] for e in self.reg.job_events(j)], ["dialing"])
+        self.assertIsNotNone(self.reg.get_job(j))             # jobs are kept
+
+    def test_29_retention_zero_disables(self):
+        from unittest import mock
+        self.cfg.event_retention_days = 0
+        with mock.patch.object(self.reg, "prune_events") as pe:
+            self.obs.maybe_prune(now=1000.0)
+        pe.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

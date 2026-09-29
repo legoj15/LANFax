@@ -184,6 +184,7 @@ class FakeReg:
     def __init__(self):
         self.jobs = {}
         self.calls = []
+        self.annotations = []
 
     def add(self, job_id, ast_jobid, state="queued"):
         self.jobs[job_id] = dict(id=job_id, ast_jobid=ast_jobid, state=state, pages=None,
@@ -219,6 +220,17 @@ class FakeReg:
         if not j or j["state"] not in expected:
             return None
         return self.set_state(job_id, state, **kw)
+
+    def annotate(self, job_id, *, pages=None, detail=None):
+        j = self.jobs.get(job_id)
+        if not j or j["state"] in ("sent", "failed", "received", "cancelled"):
+            return None
+        self.annotations.append((job_id, pages, detail))
+        if pages is not None:
+            j["pages"] = pages
+        if detail is not None:
+            j["detail"] = detail
+        return dict(j)
 
 
 class FakeBus:
@@ -349,6 +361,61 @@ class TestProgress(unittest.TestCase):
             def action(self, *a, **k):
                 raise AmiNotConnected()
         AmiProgress(self.reg, self.bus, Bad()).poll_sessions()
+
+class TestLiveness(unittest.TestCase):
+    """A silent peer is detected (Ping after idle, reconnect after dead_after)."""
+
+    def setUp(self):
+        self.server = FakeAmiServer(user="faxd", secret="s3cret", actions=ACTIONS)
+        self.client = AmiClient("127.0.0.1", self.server.port, "faxd", "s3cret", lambda ev: None,
+                                backoff_initial=0.05, backoff_max=0.2,
+                                idle_ping_after=0.2, dead_after=0.6)
+        self.addCleanup(self.server.close)
+        self.addCleanup(self.client.stop)
+        self.client.start()
+        self.assertTrue(self.server.wait_logins(1))
+        self.assertTrue(wait_until(self.client.connected))
+
+    def pings(self):
+        return [p for p in self.server.received if p.get("Action") == "Ping"]
+
+    def test_answered_pings_keep_the_link(self):
+        time.sleep(1.5)
+        self.assertTrue(self.client.connected())
+        self.assertEqual(self.server.logins, 1)
+        self.assertGreaterEqual(len(self.pings()), 2)
+
+    def test_silent_peer_is_dropped_and_reconnected(self):
+        self.server.mute()
+        t0 = time.monotonic()
+        self.assertTrue(wait_until(lambda: not self.client.connected(), timeout=3.0))
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertTrue(self.pings())                   # it asked before giving up
+        self.assertTrue(self.server.wait_logins(2, timeout=3.0))
+        self.assertTrue(wait_until(self.client.connected))
+
+    def test_keepalive_socket_option(self):
+        import socket
+        s = self.client._sock
+        self.assertNotEqual(s.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE), 0)
+
+
+class TestAnnotateNoEvent(unittest.TestCase):
+    """Pages/detail annotations go through Registry.annotate (no job_events row)."""
+
+    def test_sendfax_and_originate_failure_use_annotate(self):
+        reg, bus = FakeReg(), FakeBus()
+        p = AmiProgress(reg, bus, FakeAmi())
+        reg.add("lf1", "j1")
+        p.handle(varset("u1", "j1"))
+        p.handle({"Event": "OriginateResponse", "Response": "Failure", "Channel": "PJSIP/x-1",
+                  "Uniqueid": "u1"})
+        p.handle({"Event": "SendFAX", "Uniqueid": "u1", "PagesTransferred": "3"})
+        self.assertEqual(reg.calls, [("lf1", "dialing", None, None)])   # no state writes
+        self.assertEqual(reg.annotations, [("lf1", None, "dial attempt failed"),
+                                           ("lf1", 3, "sent 3 page(s)")])
+        self.assertEqual(reg.jobs["lf1"]["pages"], 3)
+        self.assertEqual(bus.published[-1][1]["pages"], 3)
 
 
 if __name__ == "__main__":

@@ -117,7 +117,10 @@ if [ -f "$AMI_CONF" ]; then
 fi
 [ -n "$AMI_SECRET" ] || AMI_SECRET="$(gen_hex)"
 install -d /etc/asterisk/manager.d
-cat > "$AMI_CONF" <<EOF
+# written to a private temp file (mktemp is 0600) and installed with its final owner and mode
+# in one step, so the secret is never world-readable, not even for a moment
+TMP_AMI="$(mktemp)"
+cat > "$TMP_AMI" <<EOF
 [faxd]
 secret = ${AMI_SECRET}
 deny=0.0.0.0/0.0.0.0
@@ -125,8 +128,8 @@ permit=127.0.0.1/255.255.255.255
 read=system,call,user,reporting,dialplan
 write=system,call,reporting
 EOF
-chown root:asterisk "$AMI_CONF"
-chmod 0640 "$AMI_CONF"
+install -m 0640 -o root -g asterisk "$TMP_AMI" "$AMI_CONF"
+rm -f "$TMP_AMI"
 asterisk -rx "manager reload" >/dev/null || echo "warning: asterisk manager reload failed" >&2
 set_env FAXD_AMI_SECRET "$AMI_SECRET"
 unset AMI_SECRET

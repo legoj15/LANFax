@@ -52,6 +52,7 @@ class Config:
     station_id: str = "LANFax"             # printed on test pages
     faxin_ext: str = "300"
     allowed_numbers: str = "nanp,000,ext"  # FAXD_ALLOWED_NUMBERS, see enqueue.py
+    event_retention_days: int = 30         # FAXD_EVENT_RETENTION_DAYS; job_events older are pruned, 0 = keep
 
 def load(env_file="/etc/faxserver/settings.env", environ=os.environ) -> Config
 ```
@@ -61,7 +62,9 @@ strip optional quotes), then overlays `os.environ`. Keys: `FAXD_SHARE_ROOT`,
 `FAXD_OUTQUEUE`, `FAXD_DB_PATH`, `FAXD_HTTP_BIND`,
 `FAXD_HTTP_PORT`, `FAXD_TOKEN`, `FAXD_AMI_HOST`, `FAXD_AMI_PORT`,
 `FAXD_AMI_USER`, `FAXD_AMI_SECRET`, `FAXD_ARM_SCRIPT`, `FAXD_POLL_INTERVAL`,
-`FAXD_STATION_ID`, `FAXIN_EXT`, `FAXD_ALLOWED_NUMBERS`. Helper properties:
+`FAXD_STATION_ID`, `FAXIN_EXT`, `FAXD_ALLOWED_NUMBERS`,
+`FAXD_EVENT_RETENTION_DAYS`. A value that does not parse, or a float that is
+not finite (`nan`, `inf`), keeps the default and logs a warning. Helper properties:
 `outbox`, `sending`, `sent`, `failed`, `inbox`, `queue_meta`, `arm_status_file`.
 
 ## events.py
@@ -87,7 +90,7 @@ a `threading.RLock`; every method takes the lock. (Per-thread connections
 leaked one handle per HTTP request under the thread-per-request server.)
 
 ```python
-JOB_STATES = ("queued", "converting", "dialing", "sending", "sent", "failed", "received", "cancelled")
+JOB_STATES = ("queued", "dialing", "sending", "sent", "failed", "received", "cancelled")
 TERMINAL_STATES = ("sent", "failed", "received", "cancelled")
 
 class Registry:
@@ -100,7 +103,11 @@ class Registry:
     def set_state_if(self, job_id, expected_states, state, *, pages=None, error=None, detail=None) -> dict | None
                                                  # atomic: only when current state is in expected_states, else None
                                                  # set_state/set_state_if return the row plus "event_id" (job_events rowid)
-    def find_by_client_key(self, client_key) -> dict | None   # the row an Idempotency-Key created
+    def annotate(self, job_id, *, pages=None, detail=None) -> dict | None
+                                                 # pages/detail on an unfinished job, no state change and
+                                                 # no job_events row; None if missing, finished or unchanged
+    def get_jobs(self, ids) -> list[dict]        # one IN (...) query (per 500 ids); missing ids skipped
+    def find_by_client_key(self, client_key, client) -> dict | None  # the row this caller's Idempotency-Key created
     def find_by_filename(self, filename) -> dict | None       # newest row, any state; filename = basename in the share
     def find_active_by_filename(self, filename) -> dict | None  # newest non-terminal row (names are reused)
     def count_by_state(self, *, direction=None) -> dict[str, int]
@@ -111,15 +118,24 @@ class Registry:
     def job_events(self, job_id) -> list[dict]
     def last_event_id(self, job_id) -> int | None             # newest job_events rowid of the job
     def job_events_since(self, rowid, limit=500) -> list[dict] # rows with id > rowid, oldest first (SSE replay)
+    def max_event_id(self) -> int | None                      # newest job_events rowid overall
+    def prune_events(self, before_iso) -> int                 # delete job_events with ts < before_iso; jobs kept
     def close(self)
 ```
 
 `cancelled` exists as a state (terminal, grey badge) but no route sets it yet.
+There is no `converting` state: phase 1 cannot observe the bash pipeline's
+conversion (the pdf may still sit in `outbox/` or already in `sending/` while
+it converts). Phase 4 adds it back when faxd converts itself.
 Schema migration: columns added after the first deployment are added with
 `ALTER TABLE jobs ADD COLUMN` when `PRAGMA table_info(jobs)` lacks them
-(currently `client_key`). Indexes: `filename`, `ast_jobid`, `created_at`,
-`updated_at`, and UNIQUE `client_key` (SQLite cannot add a UNIQUE column, so
-uniqueness is the index; NULLs never collide).
+(currently `client_key`, `detail`). Indexes: `filename`, `ast_jobid`,
+`created_at`, `updated_at`, `job_events(ts)`, and UNIQUE
+`jobs_client_scoped_key` on `(ifnull(client,''), client_key)`: an
+Idempotency-Key is unique per caller (SQLite cannot add a UNIQUE column, so
+uniqueness is the index; NULL keys never collide). Every start drops the old
+global UNIQUE `jobs_client_key` index if present (the live database migrates
+itself on the first start after deploy).
 
 Job dict columns: `id` (text pk, faxd's own: `lf`+12 hex for api-originated,
 `sh`+12 hex for share-dropped, `in`+12 hex for inbound), `direction`
@@ -129,8 +145,11 @@ Job dict columns: `id` (text pk, faxd's own: `lf`+12 hex for api-originated,
 bash pipeline, nullable), `pages` (int, nullable), `error` (text, nullable),
 `pdf_path` (current absolute path of the pdf, nullable), `created_at`,
 `updated_at`, `finished_at` (iso8601 UTC), `client_key` (the POST's
-`Idempotency-Key`, nullable, unique). `job_events`: id, job_id, ts, state,
-detail.
+`Idempotency-Key`, nullable, unique per `client`), `detail` (latest progress
+note: the AMI `Status` text, "sent 2 page(s) at 14400", "dial attempt failed";
+set by `annotate` and by `set_state*` when given a detail). `job_events`: id,
+job_id, ts, state, detail; one row per state transition only (annotations
+write none), pruned after `event_retention_days`.
 
 ## spool.py
 
@@ -138,16 +157,18 @@ detail.
 class SpoolObserver:
     def __init__(self, cfg: Config, reg: Registry, bus: EventBus)
     def scan_once(self) -> None        # one reconciliation pass; idempotent; safe to call from tests
-    def run(self, stop: threading.Event) -> None   # loop scan_once every cfg.poll_interval
+    def run(self, stop: threading.Event) -> None   # loop scan_once every max(0.2, cfg.poll_interval) s,
+                                                   # and maybe_prune() after each scan
+    def maybe_prune(self, now=None) -> None        # at most hourly: Registry.prune_events(now - retention days)
     def arm_state(self) -> dict        # parsed from ARM-STATUS.txt, see arm.py format
 ```
 
 Reconciliation rules for `scan_once`, in order:
 
 Every state transition a rule makes goes through `set_state_if` with the
-states the rule legitimately moves from: rule 2 `queued|converting ->
-dialing`, rule 3 `queued -> dialing`, rules 4 and 5 `queued|converting|
-dialing|sending -> sent|failed`. The observer's copy of a row can be stale
+states the rule legitimately moves from: rule 2 `queued -> dialing`, rule 3
+`queued -> dialing`, rules 4 and 5 `queued|dialing|sending -> sent|failed`,
+rule 9 `queued -> failed`. The observer's copy of a row can be stale
 (AMI moves rows concurrently); when `set_state_if` returns None the row
 already moved on and the rule writes nothing for it (no field updates, no
 publish). New rows log their first state with `set_state_if(id, (state,),
@@ -177,7 +198,7 @@ listings are shared by the rules.
    skip the file; `SELFTEST.env` never creates a row when any row has its
    SRCFILE name. If none, create `sh…` row. Set
    `ast_jobid=JOBID`, `to_number=TO`. If `outqueue/<JOBID>.result` does not
-   exist and state is `queued`/`converting`, set `dialing`. `SELFTEST.env`
+   exist and state is `queued`, set `dialing`. `SELFTEST.env`
    maps to `to_number="000"`.
 3. `sending/<filename>` exists and state is `queued` -> `dialing`.
 4. `sent/<ast_jobid>.txt` / `failed/<ast_jobid>.txt` receipts: parse lines
@@ -199,11 +220,30 @@ listings are shared by the rules.
 7. `failed/recv_<ts>_from_<id>.txt`: inbound failed row (state `failed`,
    direction in, error from the `Error:` line).
 8. Re-read `ARM-STATUS.txt` when its mtime changes; publish `arm`.
+9. A `queued` outbound row whose `pdf_path` is set but no longer exists and
+   whose `updated_at` is more than 5 minutes old never reached the pipeline
+   (the enqueue died before its rename, or someone removed the file): state
+   `failed`, error `file never appeared`. (Runs after rules 1-8, so a file
+   that moved to `sending/`, `sent/` or `failed/` was matched first.)
+
+`SELFTEST.txt` (rule 4) in detail: the row named by `SELFTEST.env`'s
+SRCFILE when the receipt is newer than `SELFTEST.env`; a receipt older than
+`SELFTEST.env` is an earlier self-test's and is skipped. With no
+`SELFTEST.env` (cleaned up, or never seen by this registry) the receipt falls
+through to the candidate search: active `000` rows whose file sits beside
+the receipt and that were created no later than it (these rows may carry
+the pipeline's own `<jobid>`, and `To: SELFTEST` is not a number). With no
+candidate, history adoption takes the newest `000_*` pdf beside it (mtime at
+most 2 min after the receipt) as a finished row (`created_at` = pdf mtime,
+`finished_at` = receipt `Date:`); if that pdf already has a row nothing is
+written. A SELFTEST receipt that still matches nothing is remembered by
+`(mtime, size)` plus the folder listing and not re-read until either changes.
 
 Every state change publishes `job` with the full job dict (spool and AMI alike). Never delete or
 move files; the observer only reads.
 
-**spool.py is frozen: no new special cases.** Phase 4 has faxd write the
+**spool.py is frozen: no new special cases** (rule 9 and the SELFTEST
+fallback were added by an explicit review fix, 2026-09-29). Phase 4 has faxd write the
 call files itself, and then these parts go away: rule 2 (reading
 `outqueue/*.env`), the candidate search in rule 4 (matching a receipt to a
 row by the file beside it), rule 5 (`invalid-number-`/`convert-failed-`
@@ -218,6 +258,12 @@ doubling to 30 s). The Login response is matched by its ActionID.
 `on_connect` (optional kwarg) runs after every successful login; main wires it
 to `AmiProgress.reset()` so Uniqueid maps from a dead session are dropped.
 `alive()` reports whether the reader thread runs.
+Liveness: the socket has `SO_KEEPALIVE`; the reader tracks the time of the
+last byte received. After `idle_ping_after` (constructor kwarg, default 30 s)
+of silence it sends one `Action: Ping` (its reply is just traffic); after
+`dead_after` (default 90 s) of silence it closes the socket, `connected()`
+turns false (so `/status` reports `ami_connected: false`), pending actions
+fail, and the reconnect loop takes over.
 
 ```python
 class AmiClient:
@@ -245,9 +291,10 @@ class AmiProgress:
     def reset(self) -> None          # forget all channel maps (AMI reconnect)
 ```
 
-Every change it writes (dialing, sending, pages/detail) goes through
-`Registry.set_state_if` (so a `sent` row never moves back) and publishes `job`
-with the returned row.
+Every state change it writes (dialing, sending) goes through
+`Registry.set_state_if` (so a `sent` row never moves back); pages/detail
+annotations go through `Registry.annotate` (no `job_events` row, no-op on a
+finished row). Each publishes `job` with the returned row.
 
 Rules (field names confirmed on the server 2026-09-29, Asterisk 20.6,
 `res_fax.conf` has `statusevents=yes`):
@@ -259,7 +306,7 @@ Rules (field names confirmed on the server 2026-09-29, Asterisk 20.6,
   No `Getvar` round-trip is needed.
 - `FAXStatus` (fields: common channel header, `Operation` send|receive|gateway,
   `Status` free text, `LocalStationID`, `FileName`) on a known `Uniqueid`
-  -> state `sending` (only from queued/converting/dialing/sending), `detail` = Status text. It carries **no page number**.
+  -> state `sending` (only from queued/dialing/sending), `detail` = Status text. It carries **no page number**.
   Optional: while any job is `sending`, poll the `FAXSessions` action every
   2 s and use `FAXSessionsEntry`/`FAXSession` (`PageNumber`,
   `PagesTransmitted`) to set `pages` for live progress.
@@ -398,7 +445,7 @@ Routes:
 | `GET /jobs?direction=out&state=sent,failed&limit=50` | `{"jobs":[…]}` newest first. `since=` filters `created_at >=` (raw text compare); `updated_since=<iso8601>` filters `updated_at >=` (normalized to UTC `…Z`, naive = UTC, 400 if unparseable). A reconnecting client polls `updated_since=<last sync>` to catch up. |
 | `GET /jobs/<id>` | job dict + `"events": [...]` |
 | `GET /jobs/<id>/pdf` | streams `pdf_path` as `application/pdf`, `Content-Disposition: inline; filename="<filename>"`; 404 if missing |
-| `POST /jobs` | body is the PDF (`Content-Type: application/pdf`), headers `X-Fax-To` (required), `X-Fax-Subject` (optional), `Idempotency-Key` (optional, 1-128 chars `[A-Za-z0-9._:-]`, else 400). Returns 201 with the new job dict; a repeated key returns 200 with the job it created first and writes nothing (the body is read and discarded). Max body 25 MB (413 before reading; read into one preallocated buffer, no extra copy). At most 2 bodies are read at once: a third upload gets 503 `Retry-After: 2` without its body being read, and the connection is closed (a client that already sent the body may see a reset instead: retry with the same key). |
+| `POST /jobs` | body is the PDF (`Content-Type: application/pdf`), headers `X-Fax-To` (required), `X-Fax-Subject` (optional), `Idempotency-Key` (optional, 1-128 chars `[A-Za-z0-9._:-]`, else 400; scoped to the caller's ip: another client's identical key is a new job). Returns 201 with the new job dict; a repeated key from the same caller returns 200 with the job it created first and writes nothing (the body is read and discarded). Max body 25 MB (413 before reading; read into one preallocated buffer, no extra copy). At most 2 bodies are read at once: a third upload gets 503 `Retry-After: 2` without its body being read, and the connection is closed (a client that already sent the body may see a reset instead: retry with the same key). |
 | `GET /inbox?limit=50` | inbound jobs newest first |
 | `POST /arm` | JSON `{"minutes": 60}` -> arm state |
 | `POST /disarm` | -> arm state |
@@ -417,12 +464,19 @@ Event ids and replay (`/events`):
 - A client reconnecting with `Last-Event-ID: <n>` (EventSource sends it by
   itself on auto-reconnect) or `?last_event_id=<n>` gets, after the
   `status` and `arm` events, one `job` event per job that has `job_events`
-  rows newer than `n`: the job's full current row, `id` = its newest event,
-  ordered oldest first, then the live stream. The bus subscription is taken
+  rows newer than `n`: the job's full current row (all rows fetched with one
+  `Registry.get_jobs` query), `id` = its newest event, ordered oldest first,
+  then the live stream. At most 200 missed `job_events` rows are replayed:
+  with more, the server sends a single `event: resync`, `id` = the newest
+  event overall, data `{"reason": "too_many_events", "since": "<ts of the
+  oldest missed row>"}`, and no job events; the client reloads with
+  `GET /jobs?updated_since=<since>`. The bus subscription is taken
   before the replay query, so a transition during the replay is sent live
   (a job may then arrive twice; clients treat events as "row changed").
-- Changes that are not state transitions (pages, pdf_path, ...) have no
-  `job_events` row; `GET /jobs?updated_since=` covers those.
+- Changes that are not state transitions (pages, detail, pdf_path, ...) have
+  no `job_events` row; `GET /jobs?updated_since=` covers those. Rows older
+  than `event_retention_days` are pruned, so a very old `Last-Event-ID`
+  replays only what is left (or gets `resync`).
 - The status, arm and replay payloads are computed before the 200 headers;
   a failure there is a normal JSON 500. After the headers any error ends the
   stream (logged), never a second status line.
@@ -439,12 +493,15 @@ Connect button, one-line hint) shown when no token is stored or any request
 returns 401 (no `prompt()`: embedded and some mobile browsers refuse it); kept
 in `localStorage`, sent as Bearer header on every fetch; a header
 "Disconnect" link clears it. `status` events are merged into the last known
-status (the AMI `receiving` event is partial); open PDFs via fetch -> blob ->
+status (the AMI `receiving` event is partial). `receiving` expires by itself:
+the banner shows only while the last receiving event is under 120 s old
+(`RECEIVING_TTL_MS`), and a full status (it carries `"receiving": false`)
+clears it. Open PDFs via fetch -> blob ->
 `window.open`. Subscribes to `/events` with `EventSource` — note EventSource
 cannot set headers, so `/events` additionally accepts `?token=` **only for
-this route**. Refresh tables on `job`/`received` events; update arm card on
+this route**. Refresh tables on `job`/`received`/`resync` events; update arm card on
 `arm`; on every `onopen` after the first (an EventSource reconnect) reload
-the jobs and inbox tables. Badges: queued/converting/dialing/sending amber,
+the jobs and inbox tables. Badges: queued/dialing/sending amber,
 sent green, failed red, received blue, cancelled grey. Phone-width friendly
 (single column under 700 px).
 
@@ -453,8 +510,11 @@ sent green, failed red, received blue, cancelled grey. Phone-width friendly
 ```python
 def build_status_fn(cfg, reg, ami) -> Callable[[], dict]
     # {"daemon": {"version", "started_at", "ami_connected"},
-    #  "queue": {"queued","converting","dialing","sending"} counts (one Registry.count_by_state query),
+    #  "receiving": false (a full status resets the web page's partial AMI flag),
+    #  "queue": {"queued","dialing","sending"} counts (one Registry.count_by_state query),
     #  "registrations": [{"name","status"}] from AMI action PJSIPShowRegistrationsOutbound if connected else [],
+    #     cached 10 s; the lock guards only the cache, the AMI call runs outside it, and while
+    #     one refresh is in flight other callers get the stale value instead of waiting
     #  "last_sent": job|None, "last_received": job|None}
 def main(argv=None) -> int
 ```
@@ -496,7 +556,7 @@ stops after 5 starts in 2 minutes), `WantedBy=multi-user.target`.
 3. Sudoers `/etc/sudoers.d/faxd`: `faxd ALL=(root) NOPASSWD: /usr/local/bin/fax-arm.sh` (mode 0440, validate with `visudo -c`). Abort first unless the script exists, is owned by root and is not group/world writable.
 4. `/etc/asterisk/manager.d/faxd.conf`: `[faxd]` with `secret` (generate once,
    keep if present), `deny=0.0.0.0/0.0.0.0`, `permit=127.0.0.1/255.255.255.255`,
-   `read=system,call,user,reporting,dialplan`, `write=system,call,reporting`. The file must be readable by the `asterisk` user (`chown root:asterisk`, mode 0640).
+   `read=system,call,user,reporting,dialplan`, `write=system,call,reporting`. The file must be readable by the `asterisk` user and never world-readable: it is written to a `mktemp` file (0600) and put in place with `install -m 0640 -o root -g asterisk`.
    Then `asterisk -rx "manager reload"`. Write the same secret into
    `/etc/faxserver/settings.env` as `FAXD_AMI_SECRET=` (add or replace line).
 5. `FAXD_TOKEN=` in `settings.env`: generate 32 hex if absent. Print it once at the end.

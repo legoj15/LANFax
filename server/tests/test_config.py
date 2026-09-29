@@ -76,6 +76,19 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.queue_meta, j("x", "fax", "queue-meta"))
         self.assertEqual(cfg.arm_status_file, j("x", "fax", "ARM-STATUS.txt"))
 
+    def test_non_finite_float_falls_back_to_default(self):
+        for bad in ("nan", "inf", "-inf"):
+            with self.assertLogs("faxd.config", "WARNING"):
+                cfg = config.load(os.path.join("nonexistent", "x.env"),
+                                  environ={"FAXD_POLL_INTERVAL": bad})
+            self.assertEqual(cfg.poll_interval, 2.0, bad)
+
+    def test_event_retention_days(self):
+        self.assertEqual(config.Config().event_retention_days, 30)
+        cfg = config.load(os.path.join("nonexistent", "x.env"),
+                          environ={"FAXD_EVENT_RETENTION_DAYS": "7"})
+        self.assertEqual(cfg.event_retention_days, 7)
+
 
 if __name__ == "__main__":
     unittest.main()
