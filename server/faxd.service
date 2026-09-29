@@ -1,0 +1,19 @@
+[Unit]
+Description=LANFax daemon (API, spool observer, AMI progress)
+After=network-online.target asterisk.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=faxd
+Group=faxd
+SupplementaryGroups=asterisk fax
+WorkingDirectory=/opt/faxd
+Environment=PYTHONPATH=/opt/faxd
+ExecStart=/usr/bin/python3 -m faxd
+Restart=on-failure
+RestartSec=5
+MemoryMax=96M
+
+[Install]
+WantedBy=multi-user.target
