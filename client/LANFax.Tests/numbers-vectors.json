@@ -32,6 +32,9 @@
     { "input": "1234567890",        "normalized": "1234567890",  "allowed": false, "reason": "only 10/11-digit" },
     { "input": "1",                 "normalized": "1",           "allowed": false, "reason": "at least 2 digits" },
     { "input": "ab",                "normalized": "",            "allowed": false, "reason": "at least 2 digits" },
-    { "input": "",                  "normalized": "",            "allowed": false, "reason": "at least 2 digits" }
+    { "input": "",                  "normalized": "",            "allowed": false, "reason": "at least 2 digits" },
+    { "input": "５５５", "normalized": "", "allowed": false, "reason": "digits" },
+    { "input": "٥٥٥", "normalized": "", "allowed": false, "reason": "digits" },
+    { "input": "1 (954) 321-6309 ５", "normalized": "19543216309", "allowed": true, "reason": "" }
   ]
 }

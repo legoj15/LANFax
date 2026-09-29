@@ -19,7 +19,7 @@ def safe_slug(s: str, maxlen=24) -> str:
 
 
 def normalize_number(s: str) -> str:
-    digits = re.sub(r"\D", "", s or "")
+    digits = re.sub(r"[^0-9]", "", s or "")
     if len(digits) < 2:
         raise ValueError("number must have at least 2 digits")
     if re.fullmatch(r"[2-9][0-9]{9}", digits):

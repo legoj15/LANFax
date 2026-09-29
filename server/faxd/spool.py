@@ -35,7 +35,7 @@ def _norm(s: str) -> str:
     try:
         return normalize_number(s)
     except ValueError:
-        return re.sub(r"\D", "", s or "")
+        return re.sub(r"[^0-9]", "", s or "")
 
 
 def _unescape(v: str) -> str:
