@@ -12,14 +12,15 @@ from .events import utcnow_iso
 
 log = logging.getLogger("faxd.db")
 
-JOB_STATES = ("queued", "converting", "dialing", "sending", "sent", "failed", "received",
-              "cancelled")
+# No `converting`: phase 1 cannot observe it (the bash pipeline converts); phase 4 adds it
+# back when faxd converts itself.
+JOB_STATES = ("queued", "dialing", "sending", "sent", "failed", "received", "cancelled")
 TERMINAL_STATES = ("sent", "failed", "received", "cancelled")
 
 COLUMNS = (
     "id", "direction", "state", "filename", "to_number", "from_number", "subject",
     "origin", "client", "ast_jobid", "pages", "error", "pdf_path",
-    "created_at", "updated_at", "finished_at", "client_key",
+    "created_at", "updated_at", "finished_at", "client_key", "detail",
 )
 
 _SCHEMA = """
@@ -40,7 +41,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     finished_at TEXT,
-    client_key TEXT
+    client_key TEXT,
+    detail TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_filename ON jobs(filename);
 CREATE INDEX IF NOT EXISTS jobs_ast ON jobs(ast_jobid);
@@ -53,17 +55,22 @@ CREATE TABLE IF NOT EXISTS job_events (
     detail TEXT
 );
 CREATE INDEX IF NOT EXISTS job_events_job ON job_events(job_id);
+CREATE INDEX IF NOT EXISTS job_events_ts ON job_events(ts);
 """
 
-# Run after the column migration: an existing db gains the columns first.
+# Run after the column migration: an existing db gains the columns first. An Idempotency-Key
+# is unique per caller: the old global index `jobs_client_key` is dropped (a no-op once gone).
+# ifnull() so a row without a client still collides with another one without a client.
 _INDEXES = """
-CREATE UNIQUE INDEX IF NOT EXISTS jobs_client_key ON jobs(client_key);
+DROP INDEX IF EXISTS jobs_client_key;
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_client_scoped_key ON jobs(ifnull(client, ''), client_key);
 CREATE INDEX IF NOT EXISTS jobs_updated ON jobs(updated_at);
 """
 
 # Columns added after the first deployment: (name, type). SQLite cannot ADD a UNIQUE
-# column, so uniqueness comes from the jobs_client_key index (NULLs never collide).
-_ADDED_COLUMNS = (("client_key", "TEXT"),)
+# column, so uniqueness comes from the jobs_client_scoped_key index (NULL keys never collide).
+# `detail` is the latest progress note (AMI Status text, "dial attempt failed", ...).
+_ADDED_COLUMNS = (("client_key", "TEXT"), ("detail", "TEXT"))
 
 _NOT_TERMINAL_SQL = "state NOT IN (%s)" % ",".join("?" * len(TERMINAL_STATES))
 
@@ -182,6 +189,9 @@ class Registry:
                 if error is not None:
                     sets.append("error=?")
                     vals.append(error)
+                if detail is not None:
+                    sets.append("detail=?")
+                    vals.append(detail)
                 if state in TERMINAL_STATES:
                     sets.append("finished_at=?")
                     vals.append(now)
@@ -197,6 +207,48 @@ class Registry:
         if row is not None:
             row["event_id"] = event_id
         return row
+
+    def annotate(self, job_id: str, *, pages: Optional[int] = None,
+                 detail: Optional[str] = None) -> Optional[dict]:
+        """Record pages/detail on an unfinished job without a state change: no job_events row
+        (those are transitions only). None when the job is missing, finished, or nothing
+        changed; otherwise the updated row (no `event_id`)."""
+        with self._lock:
+            conn = self._conn()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute("SELECT state, pages, detail FROM jobs WHERE id=?",
+                                   (job_id,)).fetchone()
+                sets: list[str] = []
+                vals: list[Any] = []
+                if cur is not None and cur["state"] not in TERMINAL_STATES:
+                    if pages is not None and cur["pages"] != pages:
+                        sets.append("pages=?")
+                        vals.append(pages)
+                    if detail is not None and cur["detail"] != detail:
+                        sets.append("detail=?")
+                        vals.append(detail)
+                if not sets:
+                    conn.execute("ROLLBACK")
+                    return None
+                conn.execute(f"UPDATE jobs SET {','.join(sets)},updated_at=? WHERE id=?",
+                             [*vals, utcnow_iso(), job_id])
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            return self.get_job(job_id)
+
+    def get_jobs(self, ids: Iterable[str]) -> list[dict]:
+        """Rows for these ids in one query per 500 ids (missing ids are skipped; any order)."""
+        ids = list(dict.fromkeys(ids))
+        out: list[dict] = []
+        with self._lock:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                out.extend(dict(r) for r in self._conn().execute(
+                    f"SELECT * FROM jobs WHERE id IN ({','.join('?' * len(chunk))})", chunk))
+        return out
 
     def find_by_filename(self, filename: Optional[str]) -> Optional[dict]:
         """Newest row with this share filename, in any state."""
@@ -215,11 +267,14 @@ class Registry:
             "ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (filename, *TERMINAL_STATES))
 
-    def find_by_client_key(self, client_key: Optional[str]) -> Optional[dict]:
-        """The row created with this Idempotency-Key, if any."""
+    def find_by_client_key(self, client_key: Optional[str],
+                           client: Optional[str]) -> Optional[dict]:
+        """The row this caller (`client`) created with this Idempotency-Key, if any. Keys are
+        scoped per caller: another client's identical key is a different request."""
         if not client_key:
             return None
-        return self._one("SELECT * FROM jobs WHERE client_key=?", (client_key,))
+        return self._one("SELECT * FROM jobs WHERE ifnull(client, '')=? AND client_key=?",
+                         (client or "", client_key))
 
     def find_by_ast_jobid(self, ast_jobid: Optional[str]) -> Optional[dict]:
         if not ast_jobid:
@@ -282,6 +337,19 @@ class Registry:
             r = self._conn().execute("SELECT MAX(id) AS m FROM job_events WHERE job_id=?",
                                      (job_id,)).fetchone()
         return r["m"] if r is not None else None
+
+    def max_event_id(self) -> Optional[int]:
+        """Newest job_events rowid overall (None while there are none)."""
+        with self._lock:
+            r = self._conn().execute("SELECT MAX(id) AS m FROM job_events").fetchone()
+        return r["m"] if r is not None else None
+
+    def prune_events(self, before_iso: str) -> int:
+        """Delete job_events rows older than `before_iso` (UTC ISO text); jobs are kept.
+        Returns the number of rows deleted."""
+        with self._lock:
+            return self._conn().execute("DELETE FROM job_events WHERE ts<?",
+                                        (before_iso,)).rowcount
 
     def job_events_since(self, rowid: int, limit: int = 500) -> list[dict]:
         """job_events rows with id > rowid, oldest first (SSE Last-Event-ID replay)."""

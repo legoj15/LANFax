@@ -36,6 +36,7 @@ class FakeAmiServer:
         self.pre_login = []   # packets sent right before the Login reply
         self._cond = threading.Condition()
         self._conn = None
+        self._muted = None    # a connection that is kept open but never answered again
         self._closed = False
         self._lsock = socket.socket()
         self._lsock.bind(("127.0.0.1", 0))
@@ -91,6 +92,9 @@ class FakeAmiServer:
             return
 
     def _dispatch(self, conn, pkt):
+        with self._cond:
+            if conn is self._muted:
+                return
         aid = pkt.get("ActionID")
         name = pkt.get("Action")
         if name == "Login":
@@ -131,6 +135,12 @@ class FakeAmiServer:
             conn = self._conn
         if conn:
             self._send(conn, packet)
+
+    def mute(self):
+        """Stop answering the current client without closing its socket (a hung PBX or a
+        half-open TCP connection). A later client is answered normally."""
+        with self._cond:
+            self._muted = self._conn
 
     def drop_client(self):
         with self._cond:

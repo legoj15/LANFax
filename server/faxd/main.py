@@ -27,32 +27,38 @@ REG_CACHE_SECONDS = 10.0
 PROGRESS_INTERVAL = 2.0
 WATCHDOG_INTERVAL = 2.0
 EXIT_THREAD_DIED = 3   # non-zero: systemd Restart=on-failure brings the daemon back
-QUEUE_STATES = ("queued", "converting", "dialing", "sending")
+QUEUE_STATES = ("queued", "dialing", "sending")
 
 
 def build_status_fn(cfg: Config, reg: Registry, ami: AmiClient) -> Callable[[], dict]:
     """Return a function producing the /status payload (registrations cached 10 s)."""
     started = utcnow_iso()
-    cache = {"at": None, "value": []}
+    cache = {"at": None, "value": [], "refreshing": False}
     lock = threading.Lock()
 
     def registrations() -> list[dict]:
         if not ami.connected():
             return []
+        # The lock only guards the cache: the AMI round trip (up to 5 s) runs outside it, and
+        # while one caller refreshes, everyone else gets the stale value instead of waiting.
         with lock:
             now = time.monotonic()
-            if cache["at"] is not None and now - cache["at"] < REG_CACHE_SECONDS:
+            fresh = cache["at"] is not None and now - cache["at"] < REG_CACHE_SECONDS
+            if fresh or cache["refreshing"]:
                 return list(cache["value"])
-            try:
-                resp = ami.action("PJSIPShowRegistrationsOutbound")
-                value = [{"name": e.get("ObjectName", ""), "status": e.get("Status", "")}
-                         for e in resp.get("list", [])
-                         if e.get("Event") == "OutboundRegistrationDetail"]
-            except AmiError as e:
-                log.debug("registration query failed: %s", e)
-                value = []
-            cache["at"], cache["value"] = now, value
-            return list(value)
+            cache["refreshing"] = True
+        value: list[dict] = []
+        try:
+            resp = ami.action("PJSIPShowRegistrationsOutbound")
+            value = [{"name": e.get("ObjectName", ""), "status": e.get("Status", "")}
+                     for e in resp.get("list", [])
+                     if e.get("Event") == "OutboundRegistrationDetail"]
+        except AmiError as e:
+            log.debug("registration query failed: %s", e)
+        finally:
+            with lock:
+                cache["at"], cache["value"], cache["refreshing"] = time.monotonic(), value, False
+        return list(value)
 
     def status() -> dict:
         by_state = reg.count_by_state(direction="out")
@@ -62,6 +68,7 @@ def build_status_fn(cfg: Config, reg: Registry, ami: AmiClient) -> Callable[[], 
         return {
             "daemon": {"version": __version__, "started_at": started,
                        "ami_connected": ami.connected()},
+            "receiving": False,   # a full status resets the partial AMI `receiving` flag
             "queue": counts,
             "registrations": registrations(),
             "last_sent": sent[0] if sent else None,

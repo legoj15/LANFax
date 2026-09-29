@@ -24,12 +24,19 @@ class FakeRegistry:
     def job_events(self, job_id):
         return list(self.events.get(job_id, []))
 
-    def find_by_client_key(self, key):
+    def get_jobs(self, ids):
+        return [self.jobs[i] for i in ids if i in self.jobs]
+
+    def find_by_client_key(self, key, client):
         return None
 
     def last_event_id(self, job_id):
         evs = self.events.get(job_id) or []
         return evs[-1]["id"] if evs else None
+
+    def max_event_id(self):
+        ids = [e["id"] for es in self.events.values() for e in es]
+        return max(ids) if ids else None
 
     def job_events_since(self, rowid, limit=500):
         evs = sorted((e for es in self.events.values() for e in es), key=lambda e: e["id"])
