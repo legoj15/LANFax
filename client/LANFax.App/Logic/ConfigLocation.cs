@@ -7,9 +7,10 @@ public sealed record ConfigLocation(string Path, bool IsFallback, string ReadPat
         Core.ClientConfig.DefaultPath,
         System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LANFax", "config.json"));
 
-    public static ConfigLocation Choose(string primary, string fallback)
+    /// <param name="canWrite">Directory write probe; tests pass a fake for a read-only ProgramData.</param>
+    public static ConfigLocation Choose(string primary, string fallback, Func<string, bool>? canWrite = null)
     {
-        if (CanWrite(System.IO.Path.GetDirectoryName(primary)!)) return new ConfigLocation(primary, false, primary);
+        if ((canWrite ?? CanWrite)(System.IO.Path.GetDirectoryName(primary)!)) return new ConfigLocation(primary, false, primary);
         // Not writable: save to the fallback, but until one exists keep reading the machine-wide file.
         var read = !File.Exists(fallback) && File.Exists(primary) ? primary : fallback;
         return new ConfigLocation(fallback, true, read);

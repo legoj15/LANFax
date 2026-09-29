@@ -41,14 +41,15 @@ client/
   LANFax.App/                       net10.0-windows WinForms, single-file self-contained win-x64
     Program.cs                      single-instance mutex; tray icon; no console
     TrayContext.cs                  NotifyIcon + menu: Open, Send a test..., Receive a test (arm 20 min), Settings, Install printer, Exit
-    SendDialog.cs                   number, subject, preview page count, Send / Cancel; "Send test page instead" checkbox
+    SendDialog.cs                   non-modal; number, subject, page count, Send / Cancel; "Send test page instead" checkbox
+    Logic/                          testable plain classes: SendSession, JobTracker, DialogQueue, PdfInfo, PrinterSetup, ...
     MainForm.cs                     (phase 3) status header, arm card with countdown, jobs grid, inbox grid, open PDF
-    SettingsDialog.cs               server host/ip, port, token, "Test connection"
+    SettingsDialog.cs               server host/ip, port, token, "Clear token", "Test connection"
   LANFax.Tests/                     xunit: Core only (no UI)
   install/
     Install-LANFaxPrinter.ps1       elevated: Add-PrinterPort -Name <spool path>; Add-Printer -Name "LAN Fax" -DriverName "Microsoft Print To PDF" -PortName <spool path>; idempotent
     Uninstall-LANFaxPrinter.ps1
-    LANFax.iss                      Inno Setup: installs app to Program Files, runs Install-LANFaxPrinter.ps1, adds Run key for tray autostart, uninstall removes printer
+    LANFax.iss                      Inno Setup: installs app to Program Files, runs Install-LANFaxPrinter.ps1 from [Code] (non-zero exit = non-fatal message), adds Run key for tray autostart; uninstall taskkills LANFax.exe first, then removes the printer
   build.ps1                         dotnet test, dotnet publish, iscc -> dist/LANFax-Setup.exe
 ```
 
@@ -80,10 +81,14 @@ client/
 
 ## Send flow (phase 2)
 
-1. `NewPrintJob` -> `SendDialog` on the UI thread, focused, topmost.
+1. `NewPrintJob` -> queued in a `DialogQueue`: one non-modal, topmost
+   `SendDialog` at a time; the title shows "Send fax (1 of N waiting)" while
+   more print jobs wait. Retries and orphans use the same queue.
 2. Number field: accepts anything, normalized client-side the same way as
    faxd (`normalize_number` rules in `faxd-spec.md`; block 911/933/988 and
-   900/976 area codes client-side too, with a clear message).
+   900/976 area codes client-side too, with a clear message). The document
+   line shows "N page(s), X KB" (`PdfInfo`: largest `/Count`, else the number
+   of `/Type /Page` objects).
 3. Subject optional. "Send test page instead of this document" checkbox
    turns the request into `POST /test/send` and discards the PDF.
 4. `POST /jobs` with `Content-Type: application/pdf`, `X-Fax-To` (the
@@ -94,12 +99,40 @@ client/
    500, 401 or other 4xx). 201 or 200 both mean accepted. A 2xx body that is
    not the expected JSON is a `FaxApiException` with that 2xx status (not
    retried).
-5. On accept: balloon "Fax to <number> queued", keep `spool\jobs\<guid>.pdf`
-   until the job is terminal, then delete (or move to `spool\sent\` if the
-   "keep local copies" setting is on). On terminal `failed`: balloon with the
-   error and a "Retry" action that reopens the dialog with the same PDF.
-6. Cancel: delete the PDF.
-
+5. `SendSession` (one per dialog) owns the key, a fresh GUID that is not the
+   spool file id. After a failed call:
+   - uncertain (status 0, any 5xx, an unreadable 2xx, or an unexpected
+     exception): the plan is frozen and the number, subject and test-page
+     box become read-only with "The server may already have this job; fields
+     are locked. Cancel to discard." Only Send (same key, same request) or
+     Cancel remain. Once locked, the dialog stays locked.
+   - rejected (any 4xx): fields stay editable and the key rotates.
+   - nothing sent (bad number, unreadable PDF): no change.
+6. On accept: balloon "Fax to <number> queued" using the server's `to_number`;
+   if it differs from what was entered: "Server queued this fax to X (you
+   entered Y)". Document jobs are recorded by `JobTracker` in
+   `spool\jobs\<guid>.json` beside the PDF (spool id, server job id, number,
+   subject, keepLocalCopies, state). The PDF stays until a terminal state
+   arrives by `JobChanged` or by the fallback poll (`GET /jobs/<id>` for
+   tracked jobs at startup, on every stream (re)connect and every 60 s):
+   `sent`/`cancelled` delete it (or move it to `spool\sent\` with "keep local
+   copies") and remove the json; `failed` keeps both and the balloon click
+   reopens the dialog with the same PDF, number and subject prefilled and a
+   fresh key. Test-page jobs are not tracked on disk (no PDF); the PDF of a
+   print job sent as a test page is deleted on accept.
+7. Cancel (button or close box): delete the PDF and its json. App exit or
+   shutdown with a dialog open keeps the PDF.
+8. Startup, before the watcher starts: `JobTracker.Scan` re-tracks non-terminal
+   json records, finishes terminal leftovers, and collects orphans (a
+   guid-named PDF with no json, unreadable json, or a `failed` record). One
+   balloon "N unsent document(s) found" opens a dialog for each (prefilled for
+   failed ones). Startup balloons are shown one after another: settings
+   problem (`ClientConfig.LoadError`, click opens Settings), orphans, printer
+   missing, token missing.
+9. A 401 on the event stream shows "The server rejected the LANFax token"
+   once per app run (again after Settings are saved); the click opens
+   Settings. `SpoolWatcher.Error` shows a balloon (Core rate-limits it).
+   `FaxApi`, `EventStream` and `SpoolWatcher` `Log` go to the app log.
 ## Monitor (phase 3)
 
 - `MainForm` mirrors the web page: status pill (registrations, daemon,

@@ -18,4 +18,8 @@
   <ItemGroup>
     <ProjectReference Include="..\LANFax.Core\LANFax.Core.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- PrinterSetup runs install\Install-LANFaxPrinter.ps1 from beside the exe: loose files, not bundled into the single file. -->
+    <None Include="..\install\*.ps1" Link="install\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+  </ItemGroup>
 </Project>

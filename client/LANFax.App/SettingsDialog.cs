@@ -13,6 +13,10 @@ internal sealed class SettingsDialog : Form
     private readonly CheckBox _keep = new() { Text = "Keep local copies of sent faxes", AutoSize = true };
     private readonly Button _test = new() { Text = "Test connection", AutoSize = true };
     private readonly Label _result = new() { AutoSize = true, MaximumSize = new Size(420, 0) };
+    private readonly Button _clearToken = new() { Text = "Clear token", AutoSize = true };
+    private readonly Label _tokenHint = new() { AutoSize = true, ForeColor = SystemColors.GrayText };
+    private readonly Icon _icon = IconFactory.Create(true);
+    private bool _tokenCleared;
 
     public SettingsDialog(ClientConfig cfg, ConfigLocation loc)
     {
@@ -22,7 +26,7 @@ internal sealed class SettingsDialog : Form
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false; MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        Icon = IconFactory.Create(true);
+        Icon = _icon;
         AutoSize = true; AutoSizeMode = AutoSizeMode.GrowAndShrink;
         Padding = new Padding(12);
 
@@ -41,11 +45,12 @@ internal sealed class SettingsDialog : Form
         Row("Server (host or IP):", _host, 0);
         Row("Port:", _port, 1);
         Row("Token:", _token, 2);
-        t.Controls.Add(new Label
-        {
-            Text = string.IsNullOrEmpty(cfg.Token) ? "No token stored yet." : "Leave blank to keep the stored token.",
-            AutoSize = true, ForeColor = SystemColors.GrayText,
-        }, 1, 3);
+        _tokenHint.Text = string.IsNullOrEmpty(cfg.Token) ? "No token stored yet." : "Leave blank to keep the stored token.";
+        _clearToken.Enabled = !string.IsNullOrEmpty(cfg.Token);
+        var tokenRow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, Margin = Padding.Empty };
+        tokenRow.Controls.Add(_tokenHint);
+        tokenRow.Controls.Add(_clearToken);
+        t.Controls.Add(tokenRow, 1, 3);
         t.Controls.Add(_keep, 0, 4); t.SetColumnSpan(_keep, 2);
         t.Controls.Add(_test, 0, 5); t.SetColumnSpan(_test, 2);
         t.Controls.Add(_result, 0, 6); t.SetColumnSpan(_result, 2);
@@ -67,6 +72,14 @@ internal sealed class SettingsDialog : Form
         AcceptButton = ok; CancelButton = cancel;
 
         _test.Click += async (_, _) => await TestAsync();
+        _clearToken.Click += (_, _) =>
+        {
+            _tokenCleared = true;
+            _token.Text = "";
+            _clearToken.Enabled = false;
+            _tokenHint.Text = "The stored token will be removed when you save.";
+        };
+        _token.TextChanged += (_, _) => { if (_token.Text.Length > 0) _tokenCleared = false; };
         FormClosing += (_, e) =>
         {
             if (DialogResult == DialogResult.OK && !Save()) e.Cancel = true;
@@ -77,7 +90,7 @@ internal sealed class SettingsDialog : Form
     {
         Server = _host.Text.Trim(),
         Port = (int)_port.Value,
-        Token = string.IsNullOrEmpty(_token.Text) ? _cfg.Token : _token.Text,
+        Token = _token.Text.Length > 0 ? _token.Text : _tokenCleared ? null : _cfg.Token,
         PrinterName = _cfg.PrinterName,
         SpoolDir = _cfg.SpoolDir,
         KeepLocalCopies = _keep.Checked,
@@ -131,5 +144,11 @@ internal sealed class SettingsDialog : Form
         }
         _cfg.Server = c.Server; _cfg.Port = c.Port; _cfg.Token = c.Token; _cfg.KeepLocalCopies = c.KeepLocalCopies;
         return true;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _icon.Dispose();
+        base.Dispose(disposing);
     }
 }
