@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LANFax</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--fg:#1c2330;--mut:#667085;--line:#dfe3ea;--pri:#2456c8;--pri-fg:#fff;
+--amber:#b26a00;--amber-bg:#fff1d6;--green:#12703a;--green-bg:#d9f5e3;--red:#b42318;--red-bg:#fde4e1;--blue:#1849a9;--blue-bg:#dbe8ff}
+@media (prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1b2029;--fg:#e6e9ef;--mut:#98a2b3;--line:#2c3441;--pri:#5b8cff;--pri-fg:#0b1020;
+--amber:#f5b449;--amber-bg:#3a2b0d;--green:#5fd58f;--green-bg:#0f3220;--red:#ff8f85;--red-bg:#3c1512;--blue:#8fb4ff;--blue-bg:#14284f}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;background:var(--card);border-bottom:1px solid var(--line)}
+h1{font-size:18px;margin:0}
+h2{font-size:15px;margin:0 0 10px}
+main{max-width:1100px;margin:0 auto;padding:16px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;min-width:0}
+section.wide{grid-column:1/-1}
+@media (max-width:700px){main{grid-template-columns:1fr;padding:10px}}
+.pill,.badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600;white-space:nowrap}
+.pill{background:var(--line);color:var(--mut)}.pill.ok{background:var(--green-bg);color:var(--green)}.pill.bad{background:var(--red-bg);color:var(--red)}
+.b-amber{background:var(--amber-bg);color:var(--amber)}.b-green{background:var(--green-bg);color:var(--green)}
+.b-red{background:var(--red-bg);color:var(--red)}.b-blue{background:var(--blue-bg);color:var(--blue)}.b-gray{background:var(--line);color:var(--mut)}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+button,input{font:inherit;padding:8px 12px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+input{flex:1 1 140px;min-width:0}
+button{cursor:pointer}button.pri{background:var(--pri);color:var(--pri-fg);border-color:var(--pri)}
+button:disabled{opacity:.5;cursor:default}
+.big{font-size:22px;font-weight:700}.mut{color:var(--mut)}.small{font-size:13px}
+.tw{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--mut);font-weight:600}
+td.err{white-space:normal;max-width:240px}
+a.lnk{color:var(--pri);cursor:pointer;text-decoration:underline}
+.empty{color:var(--mut);padding:14px 4px}
+#msg{min-height:1.3em;margin-top:6px}#msg.err{color:var(--red)}
+</style>
+</head>
+<body>
+<header><h1>LANFax</h1><span id="pill" class="pill">connecting</span></header>
+<main>
+<section id="armcard">
+  <h2>Receive faxes</h2>
+  <div id="armstate" class="big">...</div>
+  <div id="armsub" class="mut small">&nbsp;</div>
+  <div class="row">
+    <button data-arm="60">Arm 1h</button><button data-arm="240">Arm 4h</button><button data-arm="480">Arm 8h</button>
+    <button class="pri" data-test="20">Test window (20 min)</button><button id="disarm">Disarm</button>
+  </div>
+</section>
+<section>
+  <h2>Send</h2>
+  <div class="row"><input id="tnum" type="tel" placeholder="Number, e.g. 555-123-4567"><button class="pri" id="btest">Send test page</button></div>
+  <div class="row"><input id="file" type="file" accept="application/pdf,.pdf"></div>
+  <div class="row"><input id="num" type="tel" placeholder="Number"><input id="subj" placeholder="Subject (optional)"></div>
+  <div class="row"><button class="pri" id="bsend">Send PDF</button></div>
+  <div id="msg" class="small"></div>
+</section>
+<section class="wide">
+  <h2>Sent and queued</h2>
+  <div class="tw"><table><thead><tr><th>Time</th><th>To</th><th>State</th><th>Pages</th><th>Error</th><th>PDF</th></tr></thead><tbody id="jobs"></tbody></table></div>
+  <div id="jobs-empty" class="empty" hidden>No faxes yet</div>
+</section>
+<section class="wide">
+  <h2>Inbox</h2>
+  <div class="tw"><table><thead><tr><th>Time</th><th>From</th><th>State</th><th>Pages</th><th>PDF</th></tr></thead><tbody id="inbox"></tbody></table></div>
+  <div id="inbox-empty" class="empty" hidden>No received faxes yet</div>
+</section>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const KEY = "faxd_token";
+let token = "", until = null, es = null;
+try { token = localStorage.getItem(KEY) || ""; } catch (e) {}
+
+function askToken() {
+  const t = (prompt("LANFax access token:") || "").trim();
+  token = t;
+  try { t ? localStorage.setItem(KEY, t) : localStorage.removeItem(KEY); } catch (e) {}
+  return t;
+}
+function dropToken() { token = ""; try { localStorage.removeItem(KEY); } catch (e) {} }
+
+async function api(path, opts) {
+  opts = opts || {};
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!token && !askToken()) throw new Error("token required");
+    const h = Object.assign({}, opts.headers, { Authorization: "Bearer " + token });
+    const r = await fetch(path, Object.assign({}, opts, { headers: h }));
+    if (r.status === 401) { dropToken(); if (attempt === 0) { setPill("bad", "unauthorized"); continue; } }
+    return r;
+  }
+  throw new Error("unauthorized");
+}
+async function jget(path) {
+  const r = await api(path);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
+  return r.json();
+}
+async function jpost(path, body) {
+  const r = await api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || r.status);
+  return d;
+}
+function say(text, bad) { const m = $("msg"); m.textContent = text; m.className = "small" + (bad ? " err" : ""); }
+function setPill(cls, text) { const p = $("pill"); p.className = "pill " + cls; p.textContent = text; }
+
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function fmtTime(s) {
+  if (!s) return "";
+  const d = new Date(s);
+  return isNaN(d) ? esc(s) : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+const BADGE = { queued: "amber", converting: "amber", dialing: "amber", sending: "amber", sent: "green", failed: "red", received: "blue" };
+function badge(st) { return '<span class="badge b-' + (BADGE[st] || "gray") + '">' + esc(st) + "</span>"; }
+function pdfLink(j) { return j.pdf_path ? '<a class="lnk" data-pdf="' + esc(j.id) + '">open</a>' : ""; }
+
+function fill(tbody, empty, rows, ncols) {
+  $(tbody).innerHTML = rows.join("");
+  $(empty).hidden = rows.length > 0;
+}
+async function loadJobs() {
+  try {
+    const d = await jget("/jobs?direction=out&limit=50");
+    fill("jobs", "jobs-empty", d.jobs.map(j => "<tr><td>" + fmtTime(j.created_at) + "</td><td>" + esc(j.to_number) + "</td><td>" + badge(j.state) +
+      "</td><td>" + esc(j.pages) + '</td><td class="err">' + esc(j.error) + "</td><td>" + pdfLink(j) + "</td></tr>"));
+  } catch (e) { say("Could not load jobs: " + e.message, true); }
+}
+async function loadInbox() {
+  try {
+    const d = await jget("/inbox?limit=50");
+    fill("inbox", "inbox-empty", d.jobs.map(j => "<tr><td>" + fmtTime(j.created_at) + "</td><td>" + esc(j.from_number || "unknown") + "</td><td>" + badge(j.state) +
+      "</td><td>" + esc(j.pages) + "</td><td>" + pdfLink(j) + "</td></tr>"));
+  } catch (e) { say("Could not load inbox: " + e.message, true); }
+}
+
+function setStatus(s) {
+  const regs = s.registrations || [];
+  const bad = regs.filter(r => !/registered/i.test(r.status || "") || /unregistered/i.test(r.status || ""));
+  const daemonOk = !s.daemon || s.daemon.ami_connected !== false;
+  if (!regs.length && s.daemon && s.daemon.ami_connected === false) setPill("bad", "PBX link down");
+  else if (bad.length || !daemonOk) setPill("bad", bad.length ? bad.length + " line(s) down" : "degraded");
+  else setPill("ok", regs.length ? regs.length + " lines registered" : "daemon ok");
+}
+function setArm(a) {
+  until = a && a.armed && a.until ? new Date(a.until) : null;
+  const armed = !!(a && a.armed);
+  $("armstate").textContent = armed ? "ARMED" : "Disarmed";
+  $("armstate").style.color = armed ? "var(--green)" : "";
+  if (!armed) $("armsub").textContent = "Send-only. Inbound calls go to the phones.";
+  else if (!until) $("armsub").textContent = "Receiving on ext " + (a.ext || "");
+  tick();
+}
+function tick() {
+  if (!until) return;
+  const left = Math.max(0, Math.round((until - Date.now()) / 1000));
+  const m = Math.floor(left / 60), s = left % 60;
+  $("armsub").textContent = "Receiving until " + until.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) +
+    " (" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0") + " left)";
+}
+setInterval(tick, 1000);
+
+function connectEvents() {
+  if (es) es.close();
+  if (!token) return;
+  es = new EventSource("/events?token=" + encodeURIComponent(token));
+  const on = (t, f) => es.addEventListener(t, e => { try { f(JSON.parse(e.data)); } catch (x) {} });
+  on("status", setStatus);
+  on("arm", setArm);
+  on("job", () => { loadJobs(); loadInbox(); });
+  on("received", () => { loadJobs(); loadInbox(); });
+  es.onerror = () => {
+    setPill("bad", "reconnecting");
+    if (es.readyState === 2) { es.close(); setTimeout(start, 5000); }   // closed for good (e.g. 401)
+  };
+  es.onopen = () => setPill("ok", "connected");
+}
+
+async function openPdf(id) {
+  const r = await api("/jobs/" + encodeURIComponent(id) + "/pdf");
+  if (!r.ok) { say("PDF not available", true); return; }
+  const blob = await r.blob();
+  window.open(URL.createObjectURL(blob));
+}
+document.addEventListener("click", e => {
+  const a = e.target.closest("[data-pdf]");
+  if (a) openPdf(a.dataset.pdf);
+});
+
+async function act(fn, ok) {
+  say("");
+  try { await fn(); if (ok) say(ok); } catch (e) { say(e.message, true); }
+}
+document.querySelectorAll("[data-arm]").forEach(b => b.onclick = () =>
+  act(async () => setArm(await jpost("/arm", { minutes: +b.dataset.arm })), "Armed."));
+document.querySelector("[data-test]").onclick = () =>
+  act(async () => setArm(await jpost("/test/receive", { minutes: 20 })), "Armed for 20 minutes. Send the test fax now.");
+$("disarm").onclick = () => act(async () => setArm(await jpost("/disarm")), "Disarmed.");
+
+$("btest").onclick = () => {
+  const to = $("tnum").value.trim();
+  if (!to) return say("Enter a number first.", true);
+  if (!confirm("Send a test page to " + to + "? This places a phone call.")) return;
+  act(async () => { await jpost("/test/send", { to }); loadJobs(); }, "Test page queued.");
+};
+$("bsend").onclick = () => {
+  const f = $("file").files[0], to = $("num").value.trim();
+  if (!f) return say("Choose a PDF first.", true);
+  if (!to) return say("Enter a number.", true);
+  if (!confirm("Send " + f.name + " to " + to + "? This places a phone call.")) return;
+  const headers = { "Content-Type": "application/pdf", "X-Fax-To": to };
+  const subj = $("subj").value.trim();
+  if (subj) headers["X-Fax-Subject"] = subj;
+  act(async () => {
+    const r = await api("/jobs", { method: "POST", headers, body: f });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || r.status);
+    $("file").value = "";
+    loadJobs();
+  }, "Queued.");
+};
+
+async function start() {
+  try {
+    const st = await jget("/status");
+    setStatus(st); setArm(st.arm);
+  } catch (e) { setPill("bad", "offline"); }
+  loadJobs(); loadInbox(); connectEvents();
+}
+start();
+</script>
+</body>
+</html>
