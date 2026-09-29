@@ -233,6 +233,118 @@ class ApiCase(unittest.TestCase):
             api.shutdown()
 
 
+def raw_request(api, data):
+    import socket
+    s = socket.create_connection(("127.0.0.1", api.port), timeout=5)
+    try:
+        s.sendall(data)
+        out = b""
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            out += b
+        return out
+    finally:
+        s.close()
+
+
+class ReviewFixCase(unittest.TestCase):
+    def test_no_content_length_is_empty_body(self):
+        api = make_api()
+        try:
+            auth = ("Authorization: Bearer %s\r\n" % TOKEN).encode()
+            out = raw_request(api, b"POST /disarm HTTP/1.1\r\nHost: x\r\n" + auth + b"Connection: close\r\n\r\n")
+            self.assertTrue(out.startswith(b"HTTP/1.0 200") or out.startswith(b"HTTP/1.1 200"), out[:80])
+            out = raw_request(api, b"POST /test/receive HTTP/1.1\r\nHost: x\r\n" + auth + b"Connection: close\r\n\r\n")
+            self.assertIn(b" 200 ", out.split(b"\r\n")[0])
+            self.assertEqual(api.arm_.calls[-1][1], 20)
+            out = raw_request(api, b"POST /arm HTTP/1.1\r\nHost: x\r\n" + auth + b"Connection: close\r\n\r\n")
+            self.assertIn(b" 400 ", out.split(b"\r\n")[0])
+        finally:
+            api.shutdown()
+
+    def test_arm_error_is_502(self):
+        from faxd.arm import ArmError
+        api = make_api()
+        try:
+            def boom(*a):
+                raise ArmError("sudo: a password is required")
+            api.arm.arm = boom
+            s, d = jreq(api, "POST", "/arm", {"minutes": 5})
+            self.assertEqual((s, d), (502, {"error": "sudo: a password is required"}))
+        finally:
+            api.shutdown()
+
+    def test_events_token_never_logged(self):
+        api = make_api(sse_keepalive=0.1)
+        try:
+            with self.assertLogs("faxd.api", "DEBUG") as cm:
+                c, r = open_sse(api)
+                read_event(r)
+                c.close()
+                jreq(api, "GET", "/jobs?token=" + TOKEN)
+            self.assertTrue(cm.output)
+            self.assertFalse([m for m in cm.output if TOKEN in m], cm.output)
+        finally:
+            api.shutdown()
+
+    def test_upload_body_not_copied(self):
+        api = make_api()
+        try:
+            s, _ = jreq(api, "POST", "/jobs", PDF, {"Content-Type": "application/pdf", "X-Fax-To": "555"})
+            self.assertEqual(s, 201)
+            pdf = api.calls["enqueue"][-1]["pdf"]
+            self.assertIsInstance(pdf, bytearray)   # the receive buffer itself, no bytes() copy
+            self.assertEqual(pdf, PDF)
+        finally:
+            api.shutdown()
+
+    def test_limits(self):
+        from faxd.api import MAX_BODY, _Handler
+        self.assertEqual(MAX_BODY, 25 * 1024 * 1024)
+        self.assertEqual(_Handler.timeout, 30)
+
+    def test_connection_cap(self):
+        import socket
+        api = make_api(max_conns=1)
+        try:
+            c, r = open_sse(api)          # holds the only slot
+            read_event(r)
+            s = socket.create_connection(("127.0.0.1", api.port), timeout=5)
+            s.sendall(b"GET /healthz HTTP/1.0\r\n\r\n")
+            self.assertEqual(s.recv(100), b"")   # closed without an answer
+            s.close()
+            r.close()
+            c.close()
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                api.bus_.publish("job", id="x")
+                try:
+                    if jreq(api, "GET", "/healthz", token=False)[0] == 200:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.1)
+            self.assertEqual(jreq(api, "GET", "/healthz", token=False)[0], 200)
+        finally:
+            api.shutdown()
+
+    def test_registry_single_connection(self):
+        from faxd.db import Registry
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        reg = Registry(os.path.join(tmp.name, "r.db"))
+        self.addCleanup(reg.close)
+        api = make_api(reg)
+        try:
+            for _ in range(200):
+                self.assertEqual(jreq(api, "GET", "/jobs")[0], 200)
+            self.assertEqual(reg.connection_count(), 1)
+        finally:
+            api.shutdown()
+
+
 class BodyLimitCase(unittest.TestCase):
     def test_413(self):
         api = make_api(max_body=100)

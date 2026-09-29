@@ -17,7 +17,6 @@ class Config:
 
     share_root: str = "/srv/fax"
     outqueue: str = "/var/spool/asterisk/outqueue"
-    outgoing_done: str = "/var/spool/asterisk/outgoing_done"
     db_path: str = "/var/lib/faxd/faxd.db"
     http_bind: str = "0.0.0.0"
     http_port: int = 8080
@@ -30,7 +29,7 @@ class Config:
     poll_interval: float = 2.0
     station_id: str = "LANFax"
     faxin_ext: str = "300"
-    log_path: str = "/var/log/faxserver.log"
+    allowed_numbers: str = "nanp,000,ext"  # enqueue.check_number rule names
 
     @property
     def outbox(self) -> str:
@@ -65,7 +64,6 @@ class Config:
 _KEYS: dict[str, tuple[str, type]] = {
     "FAXD_SHARE_ROOT": ("share_root", str),
     "FAXD_OUTQUEUE": ("outqueue", str),
-    "FAXD_OUTGOING_DONE": ("outgoing_done", str),
     "FAXD_DB_PATH": ("db_path", str),
     "FAXD_HTTP_BIND": ("http_bind", str),
     "FAXD_HTTP_PORT": ("http_port", int),
@@ -78,7 +76,7 @@ _KEYS: dict[str, tuple[str, type]] = {
     "FAXD_POLL_INTERVAL": ("poll_interval", float),
     "FAXD_STATION_ID": ("station_id", str),
     "FAXIN_EXT": ("faxin_ext", str),
-    "FAXD_LOG_PATH": ("log_path", str),
+    "FAXD_ALLOWED_NUMBERS": ("allowed_numbers", str),
 }
 
 

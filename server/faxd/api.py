@@ -11,10 +11,15 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .arm import ArmError
+
 log = logging.getLogger("faxd.api")
 
-MAX_BODY = 50 * 1024 * 1024
+MAX_BODY = 25 * 1024 * 1024   # faxd.service caps the whole daemon at 96 MB
+MAX_CONNS = 32                # concurrent connections, SSE streams included
+REQUEST_TIMEOUT = 30          # seconds; socket timeout for every connection
 CHUNK = 64 * 1024
+_TOKEN_RE = re.compile(r"(token=)[^&\s]*", re.IGNORECASE)
 _ID = r"([A-Za-z0-9_-]+)"
 _WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")
 
@@ -26,18 +31,46 @@ class _HttpError(Exception):
         self.message = message
 
 
+def _redact(s):
+    """Hide ?token=... (the /events query) before anything reaches the log."""
+    return _TOKEN_RE.sub(r"\1***", str(s))
+
+
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
     allow_reuse_address = True
 
+    def __init__(self, addr, handler, max_conns=MAX_CONNS):
+        self._slots = threading.BoundedSemaphore(max_conns)
+        super().__init__(addr, handler)
+
+    def process_request(self, request, client_address):
+        # thread-per-connection: refuse (close) instead of spawning without bound
+        if not self._slots.acquire(blocking=False):
+            log.warning("connection limit reached; refusing %s", client_address[0])
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "faxd"
     sys_version = ""
+    timeout = REQUEST_TIMEOUT
 
     def log_message(self, fmt, *args):
-        log.debug("%s - %s", self.client_address[0], fmt % args)
+        log.debug("%s - %s", self.client_address[0], _redact(fmt % args))
 
     # ---- plumbing -------------------------------------------------------
     @property
@@ -68,10 +101,15 @@ class _Handler(BaseHTTPRequestHandler):
             supplied = (query.get("token") or [""])[0]
         return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
 
-    def _read_body(self, limit):
+    def _read_body(self, limit, required=True):
+        """Read the body into one preallocated bytearray (no second copy); 413 above
+        `limit` before reading anything. A missing Content-Length is an empty body
+        unless `required`."""
         raw = self.headers.get("Content-Length")
         if raw is None:
-            raise _HttpError(400, "Content-Length required")
+            if required:
+                raise _HttpError(400, "Content-Length required")
+            return bytearray()
         try:
             n = int(raw)
             if n < 0:
@@ -82,13 +120,15 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._drain(n, limit * 2)
             raise _HttpError(413, "body too large")
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = self.rfile.read(min(CHUNK, n - len(buf)))
-            if not chunk:
-                raise _HttpError(400, "truncated body")
-            buf += chunk
-        return bytes(buf)
+        buf = bytearray(n)
+        got = 0
+        with memoryview(buf) as view:
+            while got < n:
+                k = self.rfile.readinto(view[got:got + CHUNK])
+                if not k:
+                    raise _HttpError(400, "truncated body")
+                got += k
+        return buf
 
     def _drain(self, n, cap):
         # Read and discard so the client sees our 413 instead of a reset.
@@ -102,7 +142,7 @@ class _Handler(BaseHTTPRequestHandler):
             left -= len(chunk)
 
     def _json_body(self, required=True):
-        body = self._read_body(1024 * 1024)
+        body = self._read_body(1024 * 1024, required=False)
         if not body.strip():
             if required:
                 raise _HttpError(400, "JSON body required")
@@ -125,10 +165,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._dispatch(method)
         except _HttpError as e:
             self._safe_json(e.status, {"error": e.message})
+        except ArmError as e:
+            self._safe_json(502, {"error": str(e) or "arm script failed"})
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
         except Exception:
-            log.exception("unhandled error in %s %s", method, self.path)
+            log.exception("unhandled error in %s %s", method, _redact(self.path))
             self._safe_json(500, {"error": "internal error"})
 
     def _safe_json(self, status, obj):
@@ -278,7 +320,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(200, self.api.arm.arm(m, self._origin()))
 
     def r_disarm(self, query):
-        self._read_body(1024 * 1024)
+        self._read_body(1024 * 1024, required=False)
         self._json(200, self.api.arm.disarm(self._origin()))
 
     def r_test_receive(self, query):
@@ -322,6 +364,9 @@ class _Handler(BaseHTTPRequestHandler):
                 try:
                     ev = q.get(timeout=tick)
                 except queue.Empty:
+                    if not api.bus.subscribed(q):
+                        log.info("sse client %s fell behind; closing its stream", self.client_ip)
+                        break
                     if time.monotonic() - last >= api.sse_keepalive:
                         self.wfile.write(b": keepalive\n\n")
                         last = time.monotonic()
@@ -340,7 +385,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 class Api:
     def __init__(self, cfg, reg, bus, arm, status_fn, enqueue_fn, testpage_fn,
-                 *, sse_keepalive=15.0, max_body=MAX_BODY):
+                 *, sse_keepalive=15.0, max_body=MAX_BODY, max_conns=MAX_CONNS):
         self.cfg = cfg
         self.reg = reg
         self.bus = bus
@@ -366,7 +411,7 @@ class Api:
             (re.compile(r"/test/receive"), {"POST": H.r_test_receive}),
             (re.compile(r"/events"), {"GET": H.r_events}),
         ]
-        self.httpd = _Server((cfg.http_bind, cfg.http_port), _Handler)
+        self.httpd = _Server((cfg.http_bind, cfg.http_port), _Handler, max_conns)
         self.httpd.api = self
         self.port = self.httpd.server_address[1]
 

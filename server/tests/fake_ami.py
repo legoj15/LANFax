@@ -33,6 +33,7 @@ class FakeAmiServer:
         self.logins = 0
         self.failed_logins = 0
         self.received = []
+        self.pre_login = []   # packets sent right before the Login reply
         self._cond = threading.Condition()
         self._conn = None
         self._closed = False
@@ -100,6 +101,8 @@ class FakeAmiServer:
                 reply = {"Response": "Error", "Message": "Authentication failed"}
             if aid:
                 reply["ActionID"] = aid
+            for p in self.pre_login:
+                self._send(conn, p)
             self._send(conn, reply)
             with self._cond:
                 if ok:

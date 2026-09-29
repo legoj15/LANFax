@@ -88,6 +88,42 @@ class RegistryTests(unittest.TestCase):
             t.join()
         self.assertEqual(len(self.reg.list_jobs(limit=1000)), 100)
 
+    def test_one_shared_connection(self):
+        def work():
+            for _ in range(5):
+                self.reg.list_jobs()
+        ts = [threading.Thread(target=work) for _ in range(20)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(self.reg.connection_count(), 1)
+
+    def test_find_active_by_filename(self):
+        a = self.reg.upsert_job(self._job(1, created_at="2026-01-01T00:00:00Z"))["id"]
+        self.reg.set_state(a, "sent")
+        self.assertIsNone(self.reg.find_active_by_filename("f1.pdf"))
+        self.assertEqual(self.reg.find_by_filename("f1.pdf")["id"], a)
+        b = self.reg.upsert_job(self._job(2, filename="f1.pdf"))["id"]
+        self.assertEqual(self.reg.find_active_by_filename("f1.pdf")["id"], b)
+        self.assertIsNone(self.reg.find_active_by_filename(""))
+
+    def test_set_state_if(self):
+        j = self.reg.upsert_job(self._job(1))["id"]
+        self.assertEqual(self.reg.set_state_if(j, ("queued",), "dialing")["state"], "dialing")
+        self.reg.set_state(j, "sent")
+        self.assertIsNone(self.reg.set_state_if(j, ("dialing", "sending"), "sending", detail="x"))
+        self.assertEqual(self.reg.get_job(j)["state"], "sent")
+        self.assertEqual([e["state"] for e in self.reg.job_events(j)], ["dialing", "sent"])
+        self.assertIsNone(self.reg.set_state_if("missing", ("queued",), "dialing"))
+
+    def test_count_by_state(self):
+        for i, st in enumerate(("queued", "queued", "converting", "sending", "sent")):
+            self.reg.upsert_job(self._job(i, state=st))
+        self.reg.upsert_job(self._job(9, direction="in", state="received"))
+        self.assertEqual(self.reg.count_by_state(direction="out"),
+                         {"queued": 2, "converting": 1, "sending": 1, "sent": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ import uuid
 _log = logging.getLogger("faxd.ami")
 
 _TERMINAL = ("sent", "failed", "received")
+_ACTIVE = ("queued", "converting", "dialing", "sending")
 
 
 class AmiError(Exception):
@@ -54,10 +55,11 @@ def _parse(text):
 
 class AmiClient:
     def __init__(self, host, port, user, secret, on_event, logger=None,
-                 backoff_initial=1.0, backoff_max=30.0, connect_timeout=5.0):
+                 backoff_initial=1.0, backoff_max=30.0, connect_timeout=5.0, on_connect=None):
         self._host, self._port = host, port
         self._user, self._secret = user, secret
         self._on_event = on_event
+        self._on_connect = on_connect   # called on the reader thread after every login
         self._log = logger or _log
         self._backoff_initial = backoff_initial
         self._backoff_max = backoff_max
@@ -88,6 +90,11 @@ class AmiClient:
 
     def connected(self):
         return self._connected.is_set()
+
+    def alive(self):
+        """True while the reader thread runs (it survives disconnects; it only ends on stop)."""
+        t = self._thread
+        return bool(t and t.is_alive())
 
     def _close_sock(self):
         s = self._sock
@@ -141,13 +148,18 @@ class AmiClient:
             pkt = self._read_packet(sock, buf)
             if pkt is None:
                 return False
-            if "Response" in pkt:
+            if "Response" in pkt and pkt.get("ActionID") == aid:
                 break
         if pkt.get("Response") != "Success":
             self._log.error("AMI login failed for user %r: %s", self._user, pkt.get("Message", ""))
             return False
         self._log.info("AMI connected to %s:%s", self._host, self._port)
         self._connected.set()
+        if self._on_connect is not None:
+            try:
+                self._on_connect()
+            except Exception:  # noqa: BLE001
+                self._log.exception("AMI on_connect handler failed")
         while not self._stop.is_set():
             pkt = self._read_packet(sock, buf)
             if pkt is None:
@@ -289,6 +301,18 @@ class AmiProgress:
         with self._lock:
             return bool(self._jobs)
 
+    def reset(self):
+        """Forget every channel mapping (call on AMI reconnect: Uniqueids from the old
+        session will never see their Hangup)."""
+        with self._lock:
+            self._pending.clear()
+            self._jobs.clear()
+            self._chan.clear()
+
+    def _publish(self, row):
+        if row:
+            self._bus.publish("job", **row)
+
     def _resolve(self, uid):
         ast = self._pending.get(uid)
         if ast is None:
@@ -298,14 +322,15 @@ class AmiProgress:
             return
         del self._pending[uid]
         self._jobs[uid] = row["id"]
-        if row.get("state") not in _TERMINAL:
-            self._reg.set_state(row["id"], "dialing")
+        self._publish(self._reg.set_state_if(row["id"], ("queued", "converting"), "dialing"))
 
     def _annotate(self, job_id, *, pages=None, detail=None):
+        """Record pages/detail without changing state; a no-op once the job finished."""
         row = self._reg.get_job(job_id)
         if not row or row.get("state") in _TERMINAL:
             return
-        self._reg.set_state(job_id, row["state"], pages=pages, detail=detail)
+        st = row["state"]
+        self._publish(self._reg.set_state_if(job_id, (st,), st, pages=pages, detail=detail))
 
     def handle(self, ev):
         with self._lock:
@@ -329,9 +354,8 @@ class AmiProgress:
             if ev.get("Operation") == "receive":
                 self._receiving(ev)
             elif uid in self._jobs:
-                row = self._reg.get_job(self._jobs[uid])
-                if row and row.get("state") not in _TERMINAL:
-                    self._reg.set_state(self._jobs[uid], "sending", detail=ev.get("Status"))
+                self._publish(self._reg.set_state_if(
+                    self._jobs[uid], _ACTIVE, "sending", detail=ev.get("Status")))
         elif name == "ReceiveFAX":
             self._receiving(ev)
         elif name == "SendFAX":
@@ -378,8 +402,6 @@ class AmiProgress:
                     continue
                 uid = next((u for u, c in self._chan.items()
                             if c == chan and u in self._jobs), None)
-                if uid is None and chan in self._jobs:
-                    uid = chan
                 if uid is None:
                     continue
                 raw = ent.get("PagesTransmitted") or ent.get("PageNumber")

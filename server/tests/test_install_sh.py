@@ -21,6 +21,17 @@ class InstallShTests(unittest.TestCase):
                   "visudo -c", "swapon", "systemctl daemon-reload", "healthz", "manager reload"):
             self.assertIn(t, s)
 
+    def test_arm_script_checked_before_sudoers(self):
+        s = read(SH)
+        i = s.index("stat -c")
+        self.assertLess(i, s.index("/etc/sudoers.d/faxd"))
+        self.assertIn("-perm /022", s)
+
+    def test_health_port_from_settings(self):
+        s = read(SH)
+        self.assertIn("get_env FAXD_HTTP_PORT", s)
+        self.assertNotIn("127.0.0.1:8080/healthz", s)
+
     def test_unit(self):
         u = read(os.path.join(SERVER, "faxd.service"))
         for t in ("User=faxd", "SupplementaryGroups=asterisk fax", "MemoryMax=96M"):

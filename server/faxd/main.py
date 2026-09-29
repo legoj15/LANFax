@@ -25,6 +25,9 @@ log = logging.getLogger("faxd.main")
 
 REG_CACHE_SECONDS = 10.0
 PROGRESS_INTERVAL = 2.0
+WATCHDOG_INTERVAL = 2.0
+EXIT_THREAD_DIED = 3   # non-zero: systemd Restart=on-failure brings the daemon back
+QUEUE_STATES = ("queued", "converting", "dialing", "sending")
 
 
 def build_status_fn(cfg: Config, reg: Registry, ami: AmiClient) -> Callable[[], dict]:
@@ -52,8 +55,8 @@ def build_status_fn(cfg: Config, reg: Registry, ami: AmiClient) -> Callable[[], 
             return list(value)
 
     def status() -> dict:
-        counts = {s: len(reg.list_jobs(direction="out", states=[s], limit=1000))
-                  for s in ("queued", "dialing", "sending")}
+        by_state = reg.count_by_state(direction="out")
+        counts = {s: by_state.get(s, 0) for s in QUEUE_STATES}
         sent = reg.list_jobs(direction="out", states=["sent"], limit=1)
         recv = reg.list_jobs(direction="in", states=["received"], limit=1)
         return {
@@ -80,7 +83,8 @@ class Daemon:
         self.progress: Optional[AmiProgress] = None
         self.ami = AmiClient(cfg.ami_host, cfg.ami_port, cfg.ami_user, cfg.ami_secret,
                              lambda ev: self.progress.handle(ev) if self.progress else None,
-                             logging.getLogger("faxd.ami"))
+                             logging.getLogger("faxd.ami"),
+                             on_connect=lambda: self.progress.reset() if self.progress else None)
         self.progress = AmiProgress(self.reg, self.bus, self.ami)
         self.status_fn = build_status_fn(cfg, self.reg, self.ami)
 
@@ -111,6 +115,13 @@ class Daemon:
             self._threads.append(t)
         self.ami.start()
 
+    def dead_threads(self) -> list[str]:
+        """Names of worker threads that should be running but are not."""
+        dead = [t.name for t in self._threads if not t.is_alive()]
+        if self._threads and not self.ami.alive():
+            dead.append("ami")
+        return dead
+
     def stop(self) -> None:
         self._stop.set()
         self.ami.stop()
@@ -126,8 +137,22 @@ def _setup_logging() -> None:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
-def build(cfg: Config) -> Daemon:
-    return Daemon(cfg)
+def check_once(daemon: Daemon) -> Optional[int]:
+    """One watchdog pass: EXIT_THREAD_DIED if a worker thread died, else None."""
+    dead = daemon.dead_threads()
+    if dead:
+        log.critical("worker thread(s) died: %s; exiting so systemd restarts faxd", ", ".join(dead))
+        return EXIT_THREAD_DIED
+    return None
+
+
+def run_loop(daemon: Daemon, stop: threading.Event, interval: float = WATCHDOG_INTERVAL) -> int:
+    """Run until `stop` is set (0) or a worker thread dies (EXIT_THREAD_DIED)."""
+    while not stop.wait(interval):
+        rc = check_once(daemon)
+        if rc is not None:
+            return rc
+    return 0
 
 
 def main(argv=None, environ: Optional[Mapping[str, str]] = None) -> int:
@@ -139,7 +164,7 @@ def main(argv=None, environ: Optional[Mapping[str, str]] = None) -> int:
     if not cfg.token:
         log.error("FAXD_TOKEN is empty; refusing to start (set it in %s)", args.env_file)
         return 2
-    daemon = build(cfg)
+    daemon = Daemon(cfg)
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
@@ -147,9 +172,8 @@ def main(argv=None, environ: Optional[Mapping[str, str]] = None) -> int:
              cfg.http_bind, daemon.port, cfg.share_root, cfg.db_path)
     daemon.start()
     try:
-        while not stop.wait(1.0):
-            pass
+        rc = run_loop(daemon, stop)
     finally:
         log.info("shutting down")
         daemon.stop()
-    return 0
+    return rc

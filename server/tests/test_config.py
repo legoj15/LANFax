@@ -21,6 +21,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.poll_interval, 2.0)
         self.assertEqual(cfg.token, "")
         self.assertEqual(cfg.faxin_ext, "300")
+        self.assertEqual(cfg.allowed_numbers, "nanp,000,ext")
+        self.assertFalse(hasattr(cfg, "log_path"))
+        self.assertFalse(hasattr(cfg, "outgoing_done"))
+
+    def test_allowed_numbers_key(self):
+        cfg = config.load(os.devnull, environ={"FAXD_ALLOWED_NUMBERS": "nanp"})
+        self.assertEqual(cfg.allowed_numbers, "nanp")
 
     def test_file_values_quotes_comments(self):
         text = (

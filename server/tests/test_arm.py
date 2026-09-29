@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
-from faxd.arm import parse_status, ArmController, ArmError
+from faxd.arm import parse_status, sanitize_origin, ArmController, ArmError
 
 
 class Bus:
@@ -93,6 +93,20 @@ class ArmTests(unittest.TestCase):
         c.disarm("me")
         self.assertEqual(r.calls[1][0], ["sudo", "-n", "/usr/local/bin/fax-arm.sh", "off", "me"])
         self.assertEqual(len(self.bus.events), 2)
+
+    def test_sanitize_origin(self):
+        self.assertEqual(sanitize_origin("faxd api from 192.168.1.5"), "faxd api from 192.168.1.5")
+        self.assertEqual(sanitize_origin("faxd api from ::1"), "faxd api from ::1")
+        self.assertEqual(sanitize_origin('a"; rm -rf / $(x) `y` \n|&<>'), "a rm -rf  x y ")
+        self.assertEqual(sanitize_origin("user@host_name-1.x"), "user@host_name-1.x")
+        self.assertEqual(len(sanitize_origin("x" * 200)), 80)
+        self.assertEqual(sanitize_origin(None), "")
+
+    def test_origin_sanitized_on_command_line(self):
+        self.write(self.armed_text(timedelta(minutes=60)))
+        r = Runner()
+        ArmController(self.cfg, self.bus, r).arm(5, "evil`id`;x")
+        self.assertEqual(r.calls[0][0][-1], "evilidx")
 
     def test_error(self):
         c = ArmController(self.cfg, self.bus, Runner(rc=1, err="boom"))

@@ -76,9 +76,15 @@ install -d /etc/faxserver
 chgrp faxd "$ENV_FILE"
 chmod 0640 "$ENV_FILE"
 
-# 3. sudoers
+# 3. sudoers (only for a root-owned script nobody else can modify)
+ARM_SCRIPT=/usr/local/bin/fax-arm.sh
+if [ ! -f "$ARM_SCRIPT" ] || [ "$(stat -c %u "$ARM_SCRIPT")" != 0 ] || [ -n "$(find "$ARM_SCRIPT" -perm /022)" ]; then
+    echo "refusing to grant sudo: $ARM_SCRIPT must exist, be owned by root and not be group/world writable" >&2
+    stat -c '%U:%G %A %n' "$ARM_SCRIPT" >&2 || true
+    exit 1
+fi
 TMP_SUDO="$(mktemp)"
-echo 'faxd ALL=(root) NOPASSWD: /usr/local/bin/fax-arm.sh' > "$TMP_SUDO"
+echo "faxd ALL=(root) NOPASSWD: $ARM_SCRIPT" > "$TMP_SUDO"
 chmod 0440 "$TMP_SUDO"
 visudo -c -f "$TMP_SUDO" >/dev/null
 install -m 0440 -o root -g root "$TMP_SUDO" /etc/sudoers.d/faxd
@@ -121,9 +127,11 @@ systemctl daemon-reload
 systemctl enable faxd >/dev/null 2>&1
 systemctl restart faxd
 
+HTTP_PORT="$(get_env FAXD_HTTP_PORT)"
+HTTP_PORT="${HTTP_PORT:-8080}"
 HEALTH="failed"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if OUT="$(curl -fsS http://127.0.0.1:8080/healthz 2>/dev/null)"; then
+    if OUT="$(curl -fsS "http://127.0.0.1:${HTTP_PORT}/healthz" 2>/dev/null)"; then
         HEALTH="$OUT"
         break
     fi
@@ -134,8 +142,8 @@ done
 UFW_MSG="ufw not installed"
 if command -v ufw >/dev/null 2>&1; then
     if ufw status | grep -q '^Status: active'; then
-        ufw allow from 192.168.0.0/16 to any port 8080 proto tcp >/dev/null
-        UFW_MSG="ufw rule added for 192.168.0.0/16 -> 8080"
+        ufw allow from 192.168.0.0/16 to any port "$HTTP_PORT" proto tcp >/dev/null
+        UFW_MSG="ufw rule added for 192.168.0.0/16 -> $HTTP_PORT"
     else
         UFW_MSG="ufw inactive, no rule added"
     fi

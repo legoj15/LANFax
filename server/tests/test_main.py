@@ -78,11 +78,11 @@ class E2ETests(unittest.TestCase):
             "PJSIPShowRegistrationsOutbound": registrations, "FAXSessions": sessions})
         self.addCleanup(self.ami.close)
         self.cfg = Config(
-            share_root=t, outqueue=os.path.join(t, "outqueue"), outgoing_done=os.path.join(t, "done"),
+            share_root=t, outqueue=os.path.join(t, "outqueue"),
             db_path=os.path.join(t, "faxd.db"), http_bind="127.0.0.1", http_port=0, token=TOKEN,
             ami_host="127.0.0.1", ami_port=self.ami.port, ami_user="faxd", ami_secret="amisecret",
             arm_script="/nonexistent/fax-arm.sh", poll_interval=0.2, station_id="E2E")
-        self.d = faxmain.build(self.cfg)
+        self.d = faxmain.Daemon(self.cfg)
         self.d.start()
         self.stopped = False
         self.addCleanup(lambda: None if self.stopped else self.d.stop())
@@ -183,6 +183,26 @@ class E2ETests(unittest.TestCase):
         self.stopped = True
         self.d.stop()
         self.assertLess(time.monotonic() - t0, 5)
+
+    def test_dead_thread_exits_3(self):
+        import threading as th
+        self.assertIsNone(faxmain.check_once(self.d))
+        dead = th.Thread(target=lambda: None, name="spool")
+        dead.start()
+        dead.join()
+        self.d._threads[0] = dead
+        with self.assertLogs("faxd.main", "CRITICAL"):
+            self.assertEqual(faxmain.check_once(self.d), 3)
+        stop = th.Event()
+        with self.assertLogs("faxd.main", "CRITICAL"):
+            self.assertEqual(faxmain.run_loop(self.d, stop, interval=0.01), 3)
+        stop.set()
+        self.assertEqual(faxmain.run_loop(self.d, stop, interval=0.01), 0)
+
+    def test_status_counts_converting(self):
+        self.d.reg.upsert_job({"id": "sh000000000001", "direction": "out", "state": "converting"})
+        q = self.d.status_fn()["queue"]
+        self.assertEqual(q, {"queued": 0, "converting": 1, "dialing": 0, "sending": 0})
 
     def test_empty_token_refused(self):
         rc = faxmain.main(["--env-file", os.path.join(self.tmp, "none.env")], environ={})

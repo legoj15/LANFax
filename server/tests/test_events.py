@@ -36,6 +36,22 @@ class EventBusTests(unittest.TestCase):
         with self.assertRaises(queue.Empty):
             q.get_nowait()
 
+    def test_full_subscriber_is_dropped(self):
+        bus = EventBus()
+        slow = bus.subscribe(maxsize=2)
+        fast = bus.subscribe()
+        with self.assertLogs("faxd.events", "WARNING"):
+            for i in range(3):
+                bus.publish("job", n=i)
+        self.assertFalse(bus.subscribed(slow))
+        self.assertTrue(bus.subscribed(fast))
+        self.assertEqual(fast.qsize(), 3)
+        bus.publish("job", n=9)  # no error, slow no longer receives
+        self.assertEqual(slow.qsize(), 2)
+
+    def test_default_queue_is_bounded(self):
+        self.assertEqual(EventBus().subscribe().maxsize, 256)
+
     def test_utcnow_iso_format(self):
         self.assertRegex(utcnow_iso(), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 

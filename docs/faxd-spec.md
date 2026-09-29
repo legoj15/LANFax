@@ -39,7 +39,6 @@ server/
 class Config:
     share_root: str = "/srv/fax"          # outbox/ sending/ sent/ failed/ inbox/ queue-meta/ ARM-STATUS.txt
     outqueue: str = "/var/spool/asterisk/outqueue"
-    outgoing_done: str = "/var/spool/asterisk/outgoing_done"
     db_path: str = "/var/lib/faxd/faxd.db"
     http_bind: str = "0.0.0.0"
     http_port: int = 8080
@@ -52,35 +51,39 @@ class Config:
     poll_interval: float = 2.0
     station_id: str = "LANFax"             # printed on test pages
     faxin_ext: str = "300"
-    log_path: str = "/var/log/faxserver.log"
+    allowed_numbers: str = "nanp,000,ext"  # FAXD_ALLOWED_NUMBERS, see enqueue.py
 
 def load(env_file="/etc/faxserver/settings.env", environ=os.environ) -> Config
 ```
 
 `load` reads `KEY=value` lines from the env file (ignore blanks/comments,
 strip optional quotes), then overlays `os.environ`. Keys: `FAXD_SHARE_ROOT`,
-`FAXD_OUTQUEUE`, `FAXD_OUTGOING_DONE`, `FAXD_DB_PATH`, `FAXD_HTTP_BIND`,
+`FAXD_OUTQUEUE`, `FAXD_DB_PATH`, `FAXD_HTTP_BIND`,
 `FAXD_HTTP_PORT`, `FAXD_TOKEN`, `FAXD_AMI_HOST`, `FAXD_AMI_PORT`,
 `FAXD_AMI_USER`, `FAXD_AMI_SECRET`, `FAXD_ARM_SCRIPT`, `FAXD_POLL_INTERVAL`,
-`FAXD_STATION_ID`, `FAXIN_EXT`, `FAXD_LOG_PATH`. Helper properties:
+`FAXD_STATION_ID`, `FAXIN_EXT`, `FAXD_ALLOWED_NUMBERS`. Helper properties:
 `outbox`, `sending`, `sent`, `failed`, `inbox`, `queue_meta`, `arm_status_file`.
 
 ## events.py
 
 ```python
 class EventBus:
-    def subscribe(self) -> "queue.Queue[dict]"      # each subscriber gets its own queue
+    def subscribe(self, maxsize=256) -> "queue.Queue[dict]"   # each subscriber gets its own bounded queue
     def unsubscribe(self, q) -> None
-    def publish(self, type: str, **data) -> None    # puts {"type": type, "ts": iso8601, **data}
+    def subscribed(self, q) -> bool
+    def publish(self, type: str, **data) -> None    # puts {"type": type, "ts": iso8601, **data}; never blocks
 ```
 
-Thread-safe. Event types used across modules: `job` (data: the job dict),
+Thread-safe. A subscriber whose queue is full (a stalled SSE client) is
+unsubscribed and logged; its SSE stream then closes and the browser reconnects. Event types used across modules: `job` (data: the job dict),
 `arm` (data: arm state dict), `status` (data: status dict), `received`
 (data: the inbound job dict).
 
 ## db.py
 
-sqlite3, WAL mode, one connection per thread (use `threading.local`).
+sqlite3, WAL mode, ONE shared connection (`check_same_thread=False`) guarded by
+a `threading.RLock`; every method takes the lock. (Per-thread connections
+leaked one handle per HTTP request under the thread-per-request server.)
 
 ```python
 JOB_STATES = ("queued", "converting", "dialing", "sending", "sent", "failed", "received")
@@ -91,7 +94,12 @@ class Registry:
     def set_state(self, job_id, state, *, pages=None, error=None, detail=None) -> dict | None
                                                  # also appends to job_events; sets finished_at for sent/failed/received
     def get_job(self, job_id) -> dict | None
-    def find_by_filename(self, filename) -> dict | None       # filename = basename in the share
+    def set_state_if(self, job_id, expected_states, state, *, pages=None, error=None, detail=None) -> dict | None
+                                                 # atomic: only when current state is in expected_states, else None
+    def find_by_filename(self, filename) -> dict | None       # newest row, any state; filename = basename in the share
+    def find_active_by_filename(self, filename) -> dict | None  # newest non-terminal row (names are reused)
+    def count_by_state(self, *, direction=None) -> dict[str, int]
+    def connection_count(self) -> int                         # 1 while open (tests)
     def find_by_ast_jobid(self, ast_jobid) -> dict | None
     def list_jobs(self, *, direction=None, states=None, limit=100, since=None) -> list[dict]
     def job_events(self, job_id) -> list[dict]
@@ -120,14 +128,23 @@ class SpoolObserver:
 
 Reconciliation rules for `scan_once`, in order:
 
+Filename matching in rules 1, 2, 3 and 5 uses `find_active_by_filename`: a
+finished (sent/failed/received) row is never re-attached to a new file that
+reuses its name, and a finished row's `ast_jobid`/`pdf_path` are never
+overwritten. `sent/`, `failed/` and `inbox/` are listed once per scan and the
+listings are shared by the rules.
+
 1. `outbox/*.pdf|*.tif|*.tiff` (case-insensitive, skip names starting
-   `ARM-`/`DISARM`, skip dotfiles): if no row `find_by_filename`, create
+   `ARM-`/`DISARM`, skip dotfiles): if no active row by filename, create
    `sh…` row, direction out, state `queued`, origin `share`, `to_number` =
    digits before first `_` (apply the same 10-digit -> `1`-prefix rule as the
    bash script), `pdf_path` = that file.
 2. `outqueue/*.env`: parse `KEY=value` lines (values may be `%q`-quoted by
    bash: strip surrounding quotes and `\ ` escapes). `SRCFILE` basename is the
-   share filename. Match row by filename; if none, create `sh…` row. Set
+   share filename. Match row by `find_by_ast_jobid(JOBID)`, else the active
+   row by filename. `.env` files outlive their job: if the match is finished,
+   skip the file; `SELFTEST.env` never creates a row when any row has its
+   SRCFILE name. If none, create `sh…` row. Set
    `ast_jobid=JOBID`, `to_number=TO`. If `outqueue/<JOBID>.result` does not
    exist and state is `queued`/`converting`, set `dialing`. `SELFTEST.env`
    maps to `to_number="000"`.
@@ -137,9 +154,13 @@ Reconciliation rules for `scan_once`, in order:
    `failed` (error). `pdf_path` = `sent/<filename>` or `failed/<filename>` if
    present. Receipt names are `<ast_jobid>.txt`; match via
    `find_by_ast_jobid`, else by scanning rows whose `filename` sits beside it.
+   A receipt applied to a finished row is remembered by `(mtime, size)` and not
+   re-read until it changes; an ambiguous receipt is warned about once.
 5. `failed/invalid-number-<filename>`, `failed/convert-failed-<filename>`:
-   match by the suffix filename; state `failed`, error `invalid number` /
-   `conversion failed`, `pdf_path` = that file.
+   match the active row by the suffix filename; state `failed`, error
+   `invalid number` / `conversion failed`, `pdf_path` = that file. With no
+   active row, create a failed row unless the newest row of that name already
+   points at this marker or finished at/after the marker's mtime.
 6. `inbox/fax_<YYYYMMDD-HHMMSS>_from_<id>.pdf`: if no row with this filename,
    create `in…` row, direction in, state `received`, origin `inbound`,
    `from_number` = `<id>`, `created_at` from the timestamp in the name (local
@@ -148,13 +169,16 @@ Reconciliation rules for `scan_once`, in order:
    direction in, error from the `Error:` line).
 8. Re-read `ARM-STATUS.txt` when its mtime changes; publish `arm`.
 
-Every state change publishes `job` with the full job dict. Never delete or
+Every state change publishes `job` with the full job dict (spool and AMI alike). Never delete or
 move files; the observer only reads.
 
 ## ami.py
 
 Blocking socket client on its own thread, reconnects with backoff (1 s
-doubling to 30 s).
+doubling to 30 s). The Login response is matched by its ActionID.
+`on_connect` (optional kwarg) runs after every successful login; main wires it
+to `AmiProgress.reset()` so Uniqueid maps from a dead session are dropped.
+`alive()` reports whether the reader thread runs.
 
 ```python
 class AmiClient:
@@ -179,7 +203,12 @@ localhost (a thread with a listening socket) that replays scripted packets.
 class AmiProgress:
     """Maps AMI events to job state. Constructed with (reg, bus, ami)."""
     def handle(self, ev: dict) -> None
+    def reset(self) -> None          # forget all channel maps (AMI reconnect)
 ```
+
+Every change it writes (dialing, sending, pages/detail) goes through
+`Registry.set_state_if` (so a `sent` row never moves back) and publishes `job`
+with the returned row.
 
 Rules (field names confirmed on the server 2026-09-29, Asterisk 20.6,
 `res_fax.conf` has `statusevents=yes`):
@@ -191,7 +220,7 @@ Rules (field names confirmed on the server 2026-09-29, Asterisk 20.6,
   No `Getvar` round-trip is needed.
 - `FAXStatus` (fields: common channel header, `Operation` send|receive|gateway,
   `Status` free text, `LocalStationID`, `FileName`) on a known `Uniqueid`
-  -> state `sending`, `detail` = Status text. It carries **no page number**.
+  -> state `sending` (only from queued/converting/dialing/sending), `detail` = Status text. It carries **no page number**.
   Optional: while any job is `sending`, poll the `FAXSessions` action every
   2 s and use `FAXSessionsEntry`/`FAXSession` (`PageNumber`,
   `PagesTransmitted`) to set `pages` for live progress.
@@ -202,7 +231,8 @@ Rules (field names confirmed on the server 2026-09-29, Asterisk 20.6,
   it carries `FAXOPT(status)`/`error` which AMI events do not.
 - `Hangup` on a known `Uniqueid` -> forget the mapping; no state change.
 - `ReceiveFAX`/`FAXStatus` with `Operation: receive` -> publish `status`
-  with `{"receiving": true, "from": CallerIDNum}`; terminal state comes from
+  with only `{"receiving": true, "from": CallerIDNum}` (a partial status: the
+  web page merges it into its last full status); terminal state comes from
   the inbox file. `OriginateResponse` with `Response: Failure` on a known
   channel -> `detail` "dial attempt failed" (pbx_spool retries up to 2 more
   times, 300 s apart; the job stays `dialing`).
@@ -219,6 +249,7 @@ class ArmController:
     def __init__(self, cfg: Config, bus: EventBus, runner=subprocess.run)
     def state(self) -> dict     # {"armed": bool, "until": iso8601|None, "remaining_min": int, "ext": str, "changed": iso8601|None, "raw": str}
     def arm(self, minutes: int, origin: str) -> dict     # runs: sudo -n <arm_script> <minutes>M "<origin>"
+                                                         # origin sanitized to [A-Za-z0-9 ._:@-], max 80 chars
     def disarm(self, origin: str) -> dict                # runs: sudo -n <arm_script> off "<origin>"
 ```
 
@@ -242,16 +273,29 @@ not from the `~…` text. After `arm`/`disarm` re-read and publish `arm`.
 ```python
 def safe_slug(s: str, maxlen=24) -> str            # [A-Za-z0-9-] only
 def normalize_number(s: str) -> str                # digits only; 10-digit NANP -> "1"+digits; raise ValueError if < 2 digits
+def check_number(number: str, allowed: str) -> str # FAXD_ALLOWED_NUMBERS rules, ValueError naming the rule
 def enqueue_pdf(cfg, reg, bus, pdf_bytes: bytes, to: str, *, subject="", origin="api", client="") -> dict
 ```
 
 Writes `<number>_<slug>-<id>.pdf` where `<id>` is the new `lf…` row id and
-slug is `safe_slug(subject) or "fax"`. Write to `outbox/.<name>.part` then
-`os.replace` to the final name (atomic; the bash script's size-stability
-check then sees a complete file). Write `queue-meta/<name>.json` with
-`{id, to, subject, origin, client, created_at}`. Create the row (state
-`queued`, pdf_path) and publish `job`. Reject bodies that do not start with
-`%PDF` (ValueError). Number `000` is the offline self-test and is allowed.
+slug is `safe_slug(subject) or "fax"`. Order matters (the observer must never
+see a file without its row): write `outbox/.<name>.part` (dotfiles are ignored
+by the observer and the bash glob), write `queue-meta/<name>.json` with
+`{id, to, subject, origin, client, created_at}`, create the row (state
+`queued`, pdf_path), THEN `os.replace` to the final name. A failure before the
+replace removes the part and meta files and raises. After the replace the fax
+is live, so later steps (initial `queued` job_events row, `job` publish) only
+log on failure and the job is still returned. Reject bodies that do not start
+with `%PDF` (ValueError). The body may be `bytes` or `bytearray`.
+
+Number allowlist, `FAXD_ALLOWED_NUMBERS` (comma list, default `nanp,000,ext`),
+applied after `normalize_number`:
+- `000` (offline self-test) is always allowed.
+- `ext`: 2-4 digit internal extensions, except emergency codes: anything
+  starting `911` (911, 9111, ...) and the 3-digit `933`, `988`.
+- `nanp`: 11-digit `1[2-9]XX[2-9]XXXXXX`, except area codes `900` and `976`.
+- Anything else (international, 5-9 digits, malformed NANP) is rejected with a
+  ValueError naming the rule (HTTP 400).
 
 ## testpage.py
 
@@ -270,6 +314,9 @@ have correct xref offsets. Test: bytes start `%PDF-1.4`, end with
 ## api.py
 
 `ThreadingHTTPServer` + `BaseHTTPRequestHandler`, `daemon_threads=True`.
+Handler `timeout = 30` s (socket timeout). At most 32 concurrent connections
+(`max_conns`; SSE streams count); extra connections are closed unanswered.
+Request logs never contain `token=` values (redacted to `token=***`).
 
 ```python
 class Api:
@@ -281,7 +328,10 @@ class Api:
 Auth: every route except `GET /` and `GET /healthz` requires header
 `Authorization: Bearer <cfg.token>`; otherwise 401 JSON `{"error":"unauthorized"}`.
 Compare with `hmac.compare_digest`. All JSON responses `application/json; charset=utf-8`.
-Errors: `{"error": "<message>"}` with 400/404/405/500.
+Errors: `{"error": "<message>"}` with 400/404/405/500; a failing arm script
+(`ArmError`) is 502 with the script's message. A POST without
+`Content-Length` is an empty body (so `/disarm` and `/test/receive` work;
+`/arm` then fails with 400 as before; `POST /jobs` still requires it).
 
 Routes:
 
@@ -293,7 +343,7 @@ Routes:
 | `GET /jobs?direction=out&state=sent,failed&limit=50` | `{"jobs":[…]}` newest first |
 | `GET /jobs/<id>` | job dict + `"events": [...]` |
 | `GET /jobs/<id>/pdf` | streams `pdf_path` as `application/pdf`, `Content-Disposition: inline; filename="<filename>"`; 404 if missing |
-| `POST /jobs` | body is the PDF (`Content-Type: application/pdf`), headers `X-Fax-To` (required), `X-Fax-Subject` (optional). Returns 201 with the job dict. Max body 50 MB. |
+| `POST /jobs` | body is the PDF (`Content-Type: application/pdf`), headers `X-Fax-To` (required), `X-Fax-Subject` (optional). Returns 201 with the job dict. Max body 25 MB (413 before reading; read into one preallocated buffer, no extra copy). |
 | `GET /inbox?limit=50` | inbound jobs newest first |
 | `POST /arm` | JSON `{"minutes": 60}` -> arm state |
 | `POST /disarm` | -> arm state |
@@ -311,8 +361,12 @@ Sections: header with status pill (registrations, daemon ok), arm card
 (state + countdown, buttons 1h / 4h / 8h / 20 min test window / Disarm),
 send card (file picker + number + subject + Send; "Send test page to number"
 + Send test), jobs table (time, to, state, pages, error, open pdf), inbox
-table (time, from, open pdf). Token: prompt once, keep in `localStorage`,
-send as Bearer header on every fetch; open PDFs via fetch -> blob ->
+table (time, from, open pdf). Token: an inline Connect card (password input,
+Connect button, one-line hint) shown when no token is stored or any request
+returns 401 (no `prompt()`: embedded and some mobile browsers refuse it); kept
+in `localStorage`, sent as Bearer header on every fetch; a header
+"Disconnect" link clears it. `status` events are merged into the last known
+status (the AMI `receiving` event is partial); open PDFs via fetch -> blob ->
 `window.open`. Subscribes to `/events` with `EventSource` — note EventSource
 cannot set headers, so `/events` additionally accepts `?token=` **only for
 this route**. Refresh tables on `job`/`received` events; update arm card on
@@ -322,7 +376,8 @@ this route**. Refresh tables on `job`/`received` events; update arm card on
 
 ```python
 def build_status_fn(cfg, reg, ami) -> Callable[[], dict]
-    # {"daemon": {"version", "started_at", "ami_connected"}, "queue": {"queued","dialing","sending"} counts,
+    # {"daemon": {"version", "started_at", "ami_connected"},
+    #  "queue": {"queued","converting","dialing","sending"} counts (one Registry.count_by_state query),
     #  "registrations": [{"name","status"}] from AMI action PJSIPShowRegistrationsOutbound if connected else [],
     #  "last_sent": job|None, "last_received": job|None}
 def main(argv=None) -> int
@@ -330,6 +385,9 @@ def main(argv=None) -> int
 
 Starts: Registry, EventBus, SpoolObserver thread, AmiClient (+AmiProgress),
 ArmController, Api. Logs to stdout via `logging` (journald captures it).
+Watchdog: every 2 s `check_once(daemon)` checks the spool/api/progress/ami
+threads; if one died it logs CRITICAL and `main` returns 3, so systemd
+(`Restart=on-failure`) restarts the daemon.
 Refuses to start with an empty token (exit 2 with a clear message). Handles
 SIGTERM/SIGINT for clean shutdown. `python -m faxd` runs `main()`.
 
@@ -351,7 +409,7 @@ SIGTERM/SIGINT for clean shutdown. `python -m faxd` runs `main()`.
    `asterisk:asterisk`, files inside are 666) and `fax`; `mkdir -p
    /var/lib/faxd` owned by faxd.
 2. `rsync -a --delete` the package dir to `/opt/faxd/faxd` and web files.
-3. Sudoers `/etc/sudoers.d/faxd`: `faxd ALL=(root) NOPASSWD: /usr/local/bin/fax-arm.sh` (mode 0440, validate with `visudo -c`).
+3. Sudoers `/etc/sudoers.d/faxd`: `faxd ALL=(root) NOPASSWD: /usr/local/bin/fax-arm.sh` (mode 0440, validate with `visudo -c`). Abort first unless the script exists, is owned by root and is not group/world writable.
 4. `/etc/asterisk/manager.d/faxd.conf`: `[faxd]` with `secret` (generate once,
    keep if present), `deny=0.0.0.0/0.0.0.0`, `permit=127.0.0.1/255.255.255.255`,
    `read=system,call,user,reporting,dialplan`, `write=system,call,reporting`. The file must be readable by the `asterisk` user (`chown root:asterisk`, mode 0640).
@@ -360,7 +418,7 @@ SIGTERM/SIGINT for clean shutdown. `python -m faxd` runs `main()`.
 5. `FAXD_TOKEN=` in `settings.env`: generate 32 hex if absent. Print it once at the end.
 6. Ensure `/srv/fax/queue-meta` exists and is writable by faxd.
 7. Install unit, `systemctl daemon-reload`, `enable --now faxd`, then
-   `curl -fsS http://127.0.0.1:8080/healthz`.
+   `curl -fsS http://127.0.0.1:<FAXD_HTTP_PORT or 8080>/healthz`.
 8. If `ufw` is installed and active, `ufw allow from 192.168.0.0/16 to any port 8080 proto tcp`. Do not enable ufw here.
 
 ## deploy.ps1

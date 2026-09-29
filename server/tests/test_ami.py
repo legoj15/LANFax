@@ -133,6 +133,25 @@ class TestClient(ClientBase):
         t.join(2)
         self.assertTrue(res and isinstance(res[0], AmiNotConnected))
 
+    def test_login_matched_by_actionid(self):
+        self.server.pre_login = [{"Response": "Error", "ActionID": "someone-else", "Message": "x"}]
+        self.up()
+        self.assertEqual(self.client.action("Ping")["Response"], "Success")
+
+    def test_on_connect_called_each_login(self):
+        calls = []
+        self.client._on_connect = lambda: calls.append(1)
+        self.up()
+        self.assertTrue(wait_until(lambda: len(calls) == 1))
+        self.server.drop_client()
+        self.assertTrue(self.server.wait_logins(2))
+        self.assertTrue(wait_until(lambda: len(calls) == 2))
+
+    def test_alive(self):
+        self.assertFalse(self.client.alive())
+        self.up()
+        self.assertTrue(self.client.alive())
+
     def test_stop_prompt(self):
         self.up()
         t0 = time.monotonic()
@@ -186,6 +205,12 @@ class FakeReg:
         self.calls.append((job_id, state, pages, detail))
         return dict(j)
 
+    def set_state_if(self, job_id, expected, state, **kw):
+        j = self.jobs.get(job_id)
+        if not j or j["state"] not in expected:
+            return None
+        return self.set_state(job_id, state, **kw)
+
 
 class FakeBus:
     def __init__(self):
@@ -228,10 +253,38 @@ class TestProgress(unittest.TestCase):
                        "TransferRate": "14400"})
         self.assertEqual(self.reg.jobs["lf1"]["state"], "sending")
         self.assertEqual(self.reg.jobs["lf1"]["pages"], 1)
+        jobs = [(d["state"], d.get("pages")) for t, d in self.bus.published if t == "job"]
+        self.assertEqual(jobs, [("dialing", None), ("sending", None), ("sending", 1)])
         self.p.handle({"Event": "Hangup", "Uniqueid": "u1"})
         n = len(self.reg.calls)
         self.p.handle({"Event": "FAXStatus", "Uniqueid": "u1", "Operation": "send", "Status": "x"})
         self.assertEqual(len(self.reg.calls), n)
+
+    def test_sent_row_never_moves_back(self):
+        self.reg.add("lf1", "j1")
+        self.p.handle(varset("u1", "j1"))
+        self.reg.jobs["lf1"]["state"] = "sent"   # receipt landed meanwhile
+        self.p.handle({"Event": "FAXStatus", "Uniqueid": "u1", "Operation": "send", "Status": "late"})
+        self.p.handle({"Event": "SendFAX", "Uniqueid": "u1", "PagesTransferred": "1"})
+        self.assertEqual(self.reg.jobs["lf1"]["state"], "sent")
+        self.assertEqual(self.reg.calls, [("lf1", "dialing", None, None)])
+
+    def test_reset_clears_maps(self):
+        self.reg.add("lf1", "j1")
+        self.p.handle(varset("u1", "j1"))
+        self.p.handle(varset("u2", "j404"))
+        self.assertTrue(self.p.active())
+        self.p.reset()
+        self.assertFalse(self.p.active())
+        self.assertEqual((self.p._pending, self.p._chan), ({}, {}))
+
+    def test_poll_publishes_pages(self):
+        self.reg.add("lf1", "j1")
+        self.p.handle(varset("u1", "j1", "PJSIP/a-1"))
+        self.ami.sessions = [{"Event": "FAXSessionsEntry", "Channel": "PJSIP/a-1", "PagesTransmitted": "2"}]
+        self.p.poll_sessions()
+        self.assertEqual(self.bus.published[-1][0], "job")
+        self.assertEqual(self.bus.published[-1][1]["pages"], 2)
 
     def test_row_appears_later(self):
         self.p.handle(varset("u1", "j9"))
@@ -257,6 +310,7 @@ class TestProgress(unittest.TestCase):
                        "Channel": "PJSIP/x-1", "Uniqueid": "u1"})
         self.assertEqual(self.reg.jobs["lf1"]["detail"], "dial attempt failed")
         self.assertEqual(self.reg.jobs["lf1"]["state"], "dialing")
+        self.assertEqual(self.bus.published[-1][0], "job")
 
     def test_poll_sessions(self):
         self.reg.add("lf1", "j1")

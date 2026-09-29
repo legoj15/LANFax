@@ -46,6 +46,10 @@ class FakeBus:
             for q in list(self.subs):
                 q.put(ev)
 
+    def subscribed(self, q):
+        with self._lock:
+            return q in self.subs
+
     def count(self):
         with self._lock:
             return len(self.subs)

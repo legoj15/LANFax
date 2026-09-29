@@ -48,7 +48,6 @@ class SpoolTests(unittest.TestCase):
         self.cfg = Config(
             share_root=os.path.join(r, "fax"),
             outqueue=os.path.join(r, "outqueue"),
-            outgoing_done=os.path.join(r, "done"),
             db_path=os.path.join(r, "db", "f.db"),
         )
         for d in (self.cfg.outbox, self.cfg.sending, self.cfg.sent, self.cfg.failed,
@@ -344,6 +343,90 @@ class SpoolTests(unittest.TestCase):
         _write(os.path.join(self.cfg.sent, "j20260929-100000-1555123000.txt"), "Status: DELIVERED\nPages: 1\n")
         self.obs.scan_once()
         self.assertEqual(len(self.reg.list_jobs(direction="out")), 2)
+
+    # ---- filename reuse -------------------------------------------------
+    def test_14_same_name_redropped_after_sent_gets_new_row(self):
+        name, ja = self._to_dialing()
+        os.replace(os.path.join(self.cfg.sending, name), os.path.join(self.cfg.sent, name))
+        _write(os.path.join(self.cfg.sent, ja + ".txt"), "Status: SUCCESS\r\nTo: 19543216309\r\nPages: 1\r\n")
+        self.obs.scan_once()
+        old = self.only()
+        self.assertEqual(old["state"], "sent")
+        # same file name dropped again; the stale env of the first job stays in outqueue
+        _write(os.path.join(self.cfg.outbox, name), "%PDF")
+        self.obs.scan_once()
+        jb = "j20260929-120000-2"
+        _write(os.path.join(self.cfg.outqueue, jb + ".env"),
+               f"JOBID={jb}\r\nTO=19543216309\r\nSRCFILE={self.cfg.sending}/{name}\r\n")
+        os.replace(os.path.join(self.cfg.outbox, name), os.path.join(self.cfg.sending, name))
+        self.obs.scan_once()
+        os.replace(os.path.join(self.cfg.sending, name), os.path.join(self.cfg.failed, name))
+        _write(os.path.join(self.cfg.failed, jb + ".txt"), "Status: FAILED\r\nTo: 19543216309\r\nError: busy\r\n")
+        self.obs.scan_once()
+        self.obs.scan_once()
+        rows = {r["id"]: r for r in self.reg.list_jobs(direction="out")}
+        self.assertEqual(len(rows), 2, rows)
+        a = rows[old["id"]]
+        self.assertEqual((a["state"], a["ast_jobid"], a["pdf_path"]),
+                         ("sent", ja, os.path.join(self.cfg.sent, name)))
+        (b,) = [r for r in rows.values() if r["id"] != old["id"]]
+        self.assertEqual((b["state"], b["ast_jobid"], b["error"]), ("failed", jb, "busy"))
+
+    def test_15_invalid_marker_redropped_is_not_duplicated(self):
+        name = self._queue("12_bad.pdf")
+        marker = os.path.join(self.cfg.failed, "invalid-number-" + name)
+        os.replace(os.path.join(self.cfg.outbox, name), marker)
+        self.obs.scan_once()
+        self._queue(name)
+        os.replace(os.path.join(self.cfg.outbox, name), marker)
+        st = os.stat(marker).st_mtime + 5
+        os.utime(marker, (st, st))
+        self.obs.scan_once()
+        self.obs.scan_once()
+        rows = self.reg.list_jobs()
+        self.assertEqual(len(rows), 2, rows)
+        self.assertEqual({r["state"] for r in rows}, {"failed"})
+
+    # ---- scan cost ------------------------------------------------------
+    def test_16_unchanged_receipts_not_reread(self):
+        from unittest import mock
+        import faxd.spool as sp
+        name, jobid = self._to_dialing()
+        os.replace(os.path.join(self.cfg.sending, name), os.path.join(self.cfg.sent, name))
+        _write(os.path.join(self.cfg.sent, jobid + ".txt"), "Status: SUCCESS\r\nPages: 1\r\n")
+        _write(os.path.join(self.cfg.failed, "j20260910-221123-0008test1.txt"), "Status: FAILED\r\nTo: 0008\r\n")
+        self.obs.scan_once()
+        with mock.patch.object(sp, "parse_receipt", wraps=sp.parse_receipt) as pr:
+            self.obs.scan_once()
+            self.assertEqual(pr.call_count, 0)
+            # a changed receipt is read again
+            p = os.path.join(self.cfg.sent, jobid + ".txt")
+            st = os.stat(p).st_mtime + 5
+            os.utime(p, (st, st))
+            self.obs.scan_once()
+            self.assertEqual(pr.call_count, 1)
+
+    def test_17_folders_listed_once_per_scan(self):
+        from unittest import mock
+        import faxd.spool as sp
+        with mock.patch.object(sp, "_listdir", wraps=sp._listdir) as ld:
+            self.obs.scan_once()
+        dirs = [c.args[0] for c in ld.call_args_list]
+        for d in (self.cfg.sent, self.cfg.failed, self.cfg.inbox):
+            self.assertEqual(dirs.count(d), 1, (d, dirs))
+
+    def test_18_ambiguous_receipt_warned_once(self):
+        for n in ("15551230001_a-lf1.pdf", "15551230002_b-lf2.pdf"):
+            _write(os.path.join(self.cfg.outbox, n))
+        self.obs.scan_once()
+        for n in ("15551230001_a-lf1.pdf", "15551230002_b-lf2.pdf"):
+            os.replace(os.path.join(self.cfg.outbox, n), os.path.join(self.cfg.sent, n))
+        _write(os.path.join(self.cfg.sent, "jx.txt"), "Status: DELIVERED\r\nPages: 1\r\n")
+        with self.assertLogs("faxd.spool", "WARNING") as cm:
+            self.obs.scan_once()
+            self.obs.scan_once()
+            self.obs.scan_once()
+        self.assertEqual(len([m for m in cm.output if "ambiguous" in m]), 1)
 
     # ---- robustness ---------------------------------------------------
     def test_9_idempotent(self):

@@ -3,9 +3,18 @@ import logging
 import math
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime
+
+from .timeutil import date_cmd_to_utc_iso, to_utc_iso
 
 log = logging.getLogger("faxd.arm")
+
+ORIGIN_MAX = 80
+
+
+def sanitize_origin(s) -> str:
+    """Keep [A-Za-z0-9 ._:@-], at most 80 chars: the origin reaches a root script's argv."""
+    return re.sub(r"[^A-Za-z0-9 ._:@-]", "", str(s or ""))[:ORIGIN_MAX]
 
 
 def parse_status(text: str, *, now=None, default_ext="300") -> dict:
@@ -22,8 +31,7 @@ def parse_status(text: str, *, now=None, default_ext="300") -> dict:
     if m:
         try:
             end = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M")
-            until = end.astimezone().astimezone(timezone.utc).isoformat(
-                timespec="seconds").replace("+00:00", "Z")
+            until = to_utc_iso(end)
             remaining = max(0, math.ceil((end - now).total_seconds() / 60))
         except ValueError:
             pass
@@ -32,15 +40,8 @@ def parse_status(text: str, *, now=None, default_ext="300") -> dict:
         until, remaining = None, 0
     m = re.search(r"on ext (\d+)", first)
     ext = m.group(1) if m else default_ext
-    changed = None
     m = re.search(r"^Last change:\s*(.+?)\s*$", text, re.M)
-    if m:
-        toks = [t for t in m.group(1).split() if not (t.isalpha() and t.isupper())]
-        try:
-            changed = datetime.strptime(" ".join(toks), "%a %b %d %H:%M:%S %Y").astimezone(
-                timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        except ValueError:
-            pass
+    changed = date_cmd_to_utc_iso(m.group(1)) if m else None
     return {"armed": armed, "until": until, "remaining_min": remaining,
             "ext": ext, "changed": changed, "raw": text}
 
@@ -64,7 +65,7 @@ class ArmController:
         return parse_status(raw, default_ext=self.cfg.faxin_ext)
 
     def _run(self, arg: str, origin: str) -> dict:
-        argv = ["sudo", "-n", self.cfg.arm_script, arg, origin]
+        argv = ["sudo", "-n", self.cfg.arm_script, arg, sanitize_origin(origin)]
         res = self.runner(argv, capture_output=True, text=True, timeout=20)
         if res.returncode != 0:
             msg = (res.stderr or res.stdout or "").strip() or f"exit {res.returncode}"
