@@ -1,64 +1,41 @@
+using System.Text.Json;
 using LANFax.Core;
 
 namespace LANFax.Tests;
 
 public class NumbersTests
 {
-    [Theory]
-    [InlineData("+1 (954) 321-6309", "19543216309")]
-    [InlineData("954-321-6309", "19543216309")]
-    [InlineData("1 954 321 6309", "19543216309")]
-    [InlineData("000", "000")]
-    [InlineData("101", "101")]
-    [InlineData("1234567890", "1234567890")] // 10 digits starting with 1: no prefix added
-    [InlineData("ab", "")]
-    public void Normalize(string raw, string expected) => Assert.Equal(expected, Numbers.Normalize(raw));
-
-    [Theory]
-    [InlineData("19543216309")]
-    [InlineData("12125551234")]
-    [InlineData("000")]
-    [InlineData("101")]
-    [InlineData("1234")]
-    [InlineData("99")]
-    [InlineData("110")]
-    [InlineData("932")]
-    [InlineData("989")]
-    [InlineData("19015551234")]
-    public void Allowed(string n)
+    /// <summary>
+    /// Rows of numbers-vectors.json. The same file is server/tests/numbers-vectors.json, run against
+    /// faxd.enqueue.normalize_number/check_number by server/tests/test_numbers_vectors.py.
+    /// </summary>
+    public static IEnumerable<object[]> Vectors()
     {
-        Assert.True(Numbers.IsAllowed(n, out var reason), reason);
-    }
-
-    [Theory]
-    [InlineData("911")]
-    [InlineData("9111")]
-    [InlineData("9119")]
-    [InlineData("933")]
-    [InlineData("988")]
-    [InlineData("19005551234")]
-    [InlineData("19765551234")]
-    [InlineData("11235551234")]   // area code starts with 1
-    [InlineData("12120551234")]   // exchange starts with 0
-    [InlineData("12121551234")]   // exchange starts with 1
-    [InlineData("1")]
-    [InlineData("")]
-    [InlineData("12345")]
-    [InlineData("123456789")]
-    [InlineData("442071234567")]  // international
-    [InlineData("1234567890")]    // 10 digits, leading 1
-    public void Rejected(string n)
-    {
-        Assert.False(Numbers.IsAllowed(n, out var reason));
-        Assert.False(string.IsNullOrWhiteSpace(reason));
+        var path = Path.Combine(AppContext.BaseDirectory, "numbers-vectors.json");
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        foreach (var v in doc.RootElement.GetProperty("vectors").EnumerateArray())
+            yield return new object[]
+            {
+                v.GetProperty("input").GetString()!, v.GetProperty("normalized").GetString()!,
+                v.GetProperty("allowed").GetBoolean(), v.GetProperty("reason").GetString()!,
+            };
     }
 
     [Fact]
-    public void ReasonsAreClear()
+    public void VectorFileIsNotEmpty() => Assert.True(Vectors().Count() >= 20);
+
+    [Theory]
+    [MemberData(nameof(Vectors))]
+    public void SharedVector(string input, string normalized, bool allowed, string reason)
     {
-        Numbers.IsAllowed("911", out var r);
-        Assert.Contains("emergency", r, StringComparison.OrdinalIgnoreCase);
-        Numbers.IsAllowed("19005551234", out r);
-        Assert.Contains("900", r);
+        var n = Numbers.Normalize(input);
+        Assert.Equal(normalized, n);
+        Assert.Equal(allowed, Numbers.IsAllowed(n, out var why));
+        if (allowed) Assert.Equal("", why);
+        else
+        {
+            Assert.False(string.IsNullOrWhiteSpace(why));
+            Assert.Contains(reason, why);
+        }
     }
 }

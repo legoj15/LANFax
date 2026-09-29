@@ -30,12 +30,14 @@ client/
   global.json                       pins SDK 10.0.x
   LANFax.sln
   LANFax.Core/                      net10.0 class library: no UI
-    Config.cs                       %ProgramData%\LANFax\config.json (server url, token via DPAPI machine scope, printer name)
+    ClientConfig.cs                 %ProgramData%\LANFax\config.json (server, port, DPAPI token, printer name, spool dir); Load never throws, sets LoadError
+    Dpapi.cs                        machine-scope DPAPI via crypt32 P/Invoke (no NuGet package)
     FaxApi.cs                       HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download
-    EventStream.cs                  SSE client: GET /events?token=, Last-Event-ID, reconnect with backoff, raises typed events
-    Spool.cs                        watches the port path; stability wait; moves to jobs/<guid>.pdf; raises NewPrintJob
-    PrinterSetup.cs                 detects the printer; launches the elevated install/uninstall script
-    Models.cs                       Job, ArmState, Status records mirroring faxd JSON
+    EventStream.cs                  SSE client: GET /events?token=, Last-Event-ID, stall detection, reconnect with backoff, raises typed events
+    SpoolWatcher.cs                 watches the port path; stability wait; %PDF check; moves to jobs/<guid>.pdf; raises NewPrintJob / Error
+    Numbers.cs                      normalize_number / check_number mirror (shared vectors: LANFax.Tests/numbers-vectors.json)
+    Models.cs                       Job, ArmState, ServerStatus records mirroring faxd JSON
+  (PrinterSetup, which detects the printer and launches the elevated install/uninstall script, lives in LANFax.App)
   LANFax.App/                       net10.0-windows WinForms, single-file self-contained win-x64
     Program.cs                      single-instance mutex; tray icon; no console
     TrayContext.cs                  NotifyIcon + menu: Open, Send a test..., Receive a test (arm 20 min), Settings, Install printer, Exit
@@ -52,14 +54,23 @@ client/
 
 ## Spool path and the printer
 
-- Port name and file: `C:\ProgramData\LANFax\spool\print.pdf`. The directory
-  is created by the installer with Users:Modify so any logged-in user's print
-  job can write it (the spooler writes as the user for Local Ports).
+- Port name and file: `C:\ProgramData\LANFax\spool\print.pdf`. The installer
+  grants BUILTIN\Users Modify, inherited, on `C:\ProgramData\LANFax` itself
+  (not only `spool\`): any logged-in user's print job can write the spool (the
+  spooler writes as the user for Local Ports) and any Windows user can save
+  `config.json`. The Inno Setup `[Dirs]` entry for `{commonappdata}\LANFax`
+  must grant `users-modify` too.
 - Watcher: `FileSystemWatcher` on the spool dir (Created/Changed) plus a 2 s
   polling fallback. A job is complete when the file has existed for at least
   1 s, its size is unchanged across two checks, and it can be opened with
-  `FileShare.None`. Then move it to `spool\jobs\<guid>.pdf` immediately
-  (frees the port path for the next job) and raise `NewPrintJob(guid, path)`.
+  `FileShare.None`. A complete file that is 0 bytes or does not start with
+  `%PDF` is deleted and reported via `Error("... not a PDF ...")`. Otherwise
+  move it to `spool\jobs\<guid>.pdf` immediately (frees the port path for the
+  next job) and raise `NewPrintJob(guid, path)`.
+- A failed move (e.g. `jobs\` unwritable) raises `Error(reason, exception)`
+  at most once per distinct reason per 60 s; the file stays at `print.pdf`.
+  After 5 consecutive failures the watcher retries only on the 2 s poll.
+  `Stop()` cancels a check in progress before it moves or raises.
 - Phase-2 probe (do first, record the result here): print two jobs back to
   back to the disposable printer and record whether the second overwrites,
   appends, or fails while the first is still present. If it fails, the app
@@ -75,9 +86,14 @@ client/
    900/976 area codes client-side too, with a clear message).
 3. Subject optional. "Send test page instead of this document" checkbox
    turns the request into `POST /test/send` and discards the PDF.
-4. `POST /jobs` with `Content-Type: application/pdf`, `X-Fax-To`,
-   `X-Fax-Subject`, `Idempotency-Key: <guid>`. Retry on timeout/5xx with the
-   same key up to 3 times, backoff 2/4/8 s. 201 or 200 both mean accepted.
+4. `POST /jobs` with `Content-Type: application/pdf`, `X-Fax-To` (the
+   normalized digits; `FaxApi` throws `ArgumentException` before sending if
+   the number has non-ASCII characters or no digits), `X-Fax-Subject`,
+   `Idempotency-Key: <guid>`. 3 attempts in total with the same key, backoff
+   2 s then 4 s, only on timeout, connection failure, 502 or 503 (never on
+   500, 401 or other 4xx). 201 or 200 both mean accepted. A 2xx body that is
+   not the expected JSON is a `FaxApiException` with that 2xx status (not
+   retried).
 5. On accept: balloon "Fax to <number> queued", keep `spool\jobs\<guid>.pdf`
    until the job is terminal, then delete (or move to `spool\sent\` if the
    "keep local copies" setting is on). On terminal `failed`: balloon with the
@@ -92,7 +108,13 @@ client/
   grid (time, from, pages), double-click opens the PDF (download to
   `%LocalAppData%\LANFax\cache\<id>.pdf`, then `ShellExecute`).
 - Live updates from `EventStream`; on reconnect reload both grids
-  (`GET /jobs?updated_since=`).
+  (`GET /jobs?updated_since=`, formatted culture-invariant as
+  `yyyy-MM-ddTHH:mm:ssZ` in UTC). If no line (event or the 15 s keepalive)
+  arrives for `StallTimeout` (45 s) the stream is aborted, `Disconnected`
+  gets a `TimeoutException`, and it reconnects with `Last-Event-ID`.
+- `FaxApi`, `EventStream` and `SpoolWatcher` each take an optional
+  `Log` (`Action<string>`) for diagnostics (skipped list rows, malformed
+  events, stalls, spool errors); none of them ever passes the token to it.
 - Balloons: fax received (from), job sent, job failed, arm window expiring in
   5 min.
 - "Send a test..." from the tray: number prompt -> `POST /test/send`.
@@ -107,6 +129,10 @@ client/
 ```
 Default server is the IP, not the hostname, so VPN name resolution never
 matters. Settings dialog has "Test connection" (`GET /status`).
+`ClientConfig.Load` never throws: a blank, corrupt or unreadable file gives
+defaults, and a token that is not base64 or not decryptable on this machine
+is dropped; both set `LoadError` (never contains the token) for the App to
+show.
 
 ## Build and test rules
 
@@ -116,7 +142,11 @@ matters. Settings dialog has "Test connection" (`GET /status`).
   and `Last-Event-ID`, config round trip.
 - `build.ps1` is the one command: `dotnet test`, `dotnet publish -c Release
   -r win-x64 --self-contained -p:PublishSingleFile=true`, then Inno Setup.
-- No third-party NuGet packages in Core or App beyond the BCL
-  (`System.Security.Cryptography.ProtectedData` is part of .NET on Windows).
-  Tests may use xunit.
+- No third-party NuGet packages in Core or App beyond the BCL. DPAPI is a
+  crypt32 P/Invoke in `Dpapi.cs` (`System.Security.Cryptography.ProtectedData`
+  is a NuGet package, not part of the shared framework). Tests may use xunit.
+- Number rules are pinned by one vector file used on both sides:
+  `client/LANFax.Tests/numbers-vectors.json` and its identical copy
+  `server/tests/numbers-vectors.json` (`tests.test_numbers_vectors` checks
+  both copies match). Edit both together.
 - The app never stores the token in plain text and never logs it.

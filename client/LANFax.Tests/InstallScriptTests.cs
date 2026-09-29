@@ -23,6 +23,19 @@ public class InstallScriptTests
     }
 
     [Fact]
+    public void InstallScriptGrantsUsersModifyOnTheDataDirNotOnlySpool()
+    {
+        // config.json lives in %ProgramData%\LANFax, so every Windows user must be able to write there,
+        // inherited to spool\ and to files created later.
+        var t = File.ReadAllText(Path.Combine(Dir(), "Install-LANFaxPrinter.ps1"));
+        Assert.Matches(@"\[string\]\$DataDir\s*=\s*\(Join-Path \$env:ProgramData 'LANFax'\)", t);
+        Assert.Matches(@"Grant-UsersModify\s+-Path\s+\$DataDir", t);
+        Assert.Contains("'ContainerInherit,ObjectInherit'", t);
+        Assert.Contains("'-DataDir'", t); // forwarded through the self-elevation relaunch
+        Assert.DoesNotMatch(@"Set-Acl\s+-Path\s+\$SpoolDir", t);
+    }
+
+    [Fact]
     public void UninstallScriptRemovesPrinterThenPort()
     {
         var t = File.ReadAllText(Path.Combine(Dir(), "Uninstall-LANFaxPrinter.ps1"));

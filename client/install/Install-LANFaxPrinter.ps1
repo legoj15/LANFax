@@ -5,6 +5,7 @@
 #>
 [CmdletBinding()]
 param(
+    [string]$DataDir = (Join-Path $env:ProgramData 'LANFax'),
     [string]$SpoolDir = (Join-Path $env:ProgramData 'LANFax\spool'),
     [string]$PrinterName = 'LAN Fax'
 )
@@ -16,7 +17,8 @@ $isAdmin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.P
 if (-not $isAdmin) {
     $exe = (Get-Process -Id $PID).Path
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath),
-                 '-SpoolDir', ('"{0}"' -f $SpoolDir), '-PrinterName', ('"{0}"' -f $PrinterName))
+                 '-DataDir', ('"{0}"' -f $DataDir), '-SpoolDir', ('"{0}"' -f $SpoolDir),
+                 '-PrinterName', ('"{0}"' -f $PrinterName))
     $p = Start-Process -FilePath $exe -ArgumentList $argList -Verb RunAs -Wait -PassThru
     exit $p.ExitCode
 }
@@ -24,14 +26,26 @@ if (-not $isAdmin) {
 $portName = Join-Path $SpoolDir 'print.pdf'
 $driver = 'Microsoft Print To PDF'
 
-# Spool directory, writable by any logged-in user (the spooler writes as the printing user).
+function Grant-UsersModify([string]$Path) {
+    # Inherited by everything below, including files created later (config.json saved by another user).
+    $acl = Get-Acl -Path $Path
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+        'BUILTIN\Users', 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+    $acl.SetAccessRule($rule)
+    Set-Acl -Path $Path -AclObject $acl
+}
+
+# Data dir (config.json) and spool dir, writable by any logged-in user: any Windows user may save
+# Settings, and the spooler writes print.pdf as the printing user.
+$null = New-Item -ItemType Directory -Force -Path $DataDir
 $null = New-Item -ItemType Directory -Force -Path $SpoolDir
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $SpoolDir 'jobs')
-$acl = Get-Acl -Path $SpoolDir
-$rule = New-Object Security.AccessControl.FileSystemAccessRule(
-    'BUILTIN\Users', 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-$acl.SetAccessRule($rule)
-Set-Acl -Path $SpoolDir -AclObject $acl
+Grant-UsersModify -Path $DataDir
+$dataFull = [IO.Path]::GetFullPath($DataDir).TrimEnd('\') + '\'
+$spoolFull = [IO.Path]::GetFullPath($SpoolDir).TrimEnd('\') + '\'
+if (-not $spoolFull.StartsWith($dataFull, [StringComparison]::OrdinalIgnoreCase)) {
+    Grant-UsersModify -Path $SpoolDir  # custom spool location outside the data dir
+}
 
 $portAdded = $false
 if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {

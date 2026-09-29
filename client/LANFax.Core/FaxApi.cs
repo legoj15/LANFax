@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -5,7 +6,10 @@ using System.Text.Json;
 
 namespace LANFax.Core;
 
-/// <summary>Non-2xx answer from faxd (or a network failure, StatusCode 0). Message is the server's "error" text.</summary>
+/// <summary>
+/// Non-2xx answer from faxd (or a network failure, StatusCode 0), or a 2xx whose body is not the expected JSON
+/// (StatusCode is then that 2xx code). Message is the server's "error" text when it sent one.
+/// </summary>
 public class FaxApiException(int statusCode, string message, Exception? inner = null) : Exception(message, inner)
 {
     public int StatusCode { get; } = statusCode;
@@ -20,17 +24,21 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http)
 
     /// <summary>Waits before attempt 2, 3 (index 0, 1). Tests replace <see cref="Delay"/>.</summary>
     public IReadOnlyList<TimeSpan> Backoffs { get; set; } =
-        new[] { TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(8) };
+        new[] { TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4) };
 
     public Func<TimeSpan, CancellationToken, Task> Delay { get; set; } = (d, ct) => Task.Delay(d, ct);
+
+    /// <summary>Optional diagnostics sink (skipped list rows and the like). Never receives the token.</summary>
+    public Action<string>? Log { get; set; }
 
     // ---- reads ----
 
     public async Task<ServerStatus> GetStatusAsync(CancellationToken ct = default)
     {
-        var (_, body) = await SendAsync(() => Req(HttpMethod.Get, "status"), ct);
-        using var doc = JsonDocument.Parse(body);
-        return ServerStatus.FromJson(doc.RootElement);
+        var (code, body) = await SendAsync(() => Req(HttpMethod.Get, "status"), ct);
+        using var doc = ParseDoc(code, body, "status");
+        try { return ServerStatus.FromJson(doc.RootElement); }
+        catch (Exception e) when (e is JsonException or FormatException) { throw Unreadable(code, "status", e); }
     }
 
     public async Task<IReadOnlyList<Job>> GetJobsAsync(string? direction = null, IEnumerable<string>? states = null,
@@ -40,19 +48,20 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http)
         if (direction != null) q.Add("direction=" + Uri.EscapeDataString(direction));
         var st = states?.ToArray();
         if (st is { Length: > 0 }) q.Add("state=" + string.Join(",", st.Select(Uri.EscapeDataString)));
-        q.Add("limit=" + limit);
+        q.Add("limit=" + limit.ToString(CultureInfo.InvariantCulture));
         if (updatedSince is { } s)
-            q.Add("updated_since=" + Uri.EscapeDataString(s.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")));
+            q.Add("updated_since=" + Uri.EscapeDataString(
+                s.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture)));
         return await ListAsync("jobs?" + string.Join("&", q), ct);
     }
 
     public Task<IReadOnlyList<Job>> GetInboxAsync(int limit = 50, CancellationToken ct = default) =>
-        ListAsync("inbox?limit=" + limit, ct);
+        ListAsync("inbox?limit=" + limit.ToString(CultureInfo.InvariantCulture), ct);
 
     public async Task<Job> GetJobAsync(string id, CancellationToken ct = default)
     {
-        var (_, body) = await SendAsync(() => Req(HttpMethod.Get, "jobs/" + Uri.EscapeDataString(id)), ct);
-        return ParseJob(body);
+        var (code, body) = await SendAsync(() => Req(HttpMethod.Get, "jobs/" + Uri.EscapeDataString(id)), ct);
+        return ParseJob(code, body);
     }
 
     public async Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default)
@@ -82,10 +91,13 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http)
 
     /// <summary>
     /// POST /jobs. Retries only timeout, connection failure, 502 and 503 (same Idempotency-Key), up to
-    /// <see cref="MaxAttempts"/> attempts. 200 and 201 both mean accepted.
+    /// <see cref="MaxAttempts"/> attempts. 200 and 201 both mean accepted. <paramref name="to"/> is sent
+    /// normalized (<see cref="Numbers.Normalize"/>).
     /// </summary>
+    /// <exception cref="ArgumentException"><paramref name="to"/> has non-ASCII characters or no digits; nothing is sent.</exception>
     public async Task<Job> PostJobAsync(Stream pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default)
     {
+        to = WireNumber(to);
         using var buf = new MemoryStream();
         await pdf.CopyToAsync(buf, ct);
         var bytes = buf.ToArray();
@@ -101,14 +113,19 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http)
         }, ct);
     }
 
-    public Task<Job> SendTestPageAsync(string to, string? note, string idempotencyKey, CancellationToken ct = default) =>
-        PostWithRetryAsync(() =>
+    /// <summary>POST /test/send, same retry rules and number handling as <see cref="PostJobAsync"/>.</summary>
+    /// <exception cref="ArgumentException"><paramref name="to"/> has non-ASCII characters or no digits; nothing is sent.</exception>
+    public Task<Job> SendTestPageAsync(string to, string? note, string idempotencyKey, CancellationToken ct = default)
+    {
+        to = WireNumber(to);
+        return PostWithRetryAsync(() =>
         {
             var r = Req(HttpMethod.Post, "test/send");
             r.Content = JsonBody(new { to, note = note ?? "" });
             r.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
             return r;
         }, ct);
+    }
 
     public async Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default) =>
         await PostArmAsync("arm", new { minutes }, ct);
@@ -123,14 +140,13 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http)
 
     private async Task<ArmState> PostArmAsync(string path, object? body, CancellationToken ct)
     {
-        var (_, resp) = await SendAsync(() =>
+        var (code, resp) = await SendAsync(() =>
         {
             var r = Req(HttpMethod.Post, path);
             r.Content = body == null ? new ByteArrayContent(Array.Empty<byte>()) : JsonBody(body);
             return r;
         }, ct);
-        return JsonSerializer.Deserialize<ArmState>(resp, Json.Options)
-               ?? throw new FaxApiException(0, "empty arm response");
+        return Deserialize<ArmState>(code, resp, path);
     }
 
     private async Task<Job> PostWithRetryAsync(Func<HttpRequestMessage> make, CancellationToken ct)
@@ -139,8 +155,8 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http)
         {
             try
             {
-                var (_, body) = await SendAsync(make, ct);
-                return ParseJob(body);
+                var (code, body) = await SendAsync(make, ct);
+                return ParseJob(code, body); // an unreadable 2xx throws with its 2xx code: not retried
             }
             catch (FaxApiException e) when (attempt < MaxAttempts && e.StatusCode is 0 or 502 or 503 && e is not FaxApiUnauthorizedException)
             {
@@ -151,17 +167,69 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http)
 
     private async Task<IReadOnlyList<Job>> ListAsync(string path, CancellationToken ct)
     {
-        var (_, body) = await SendAsync(() => Req(HttpMethod.Get, path), ct);
-        using var doc = JsonDocument.Parse(body);
+        var (code, body) = await SendAsync(() => Req(HttpMethod.Get, path), ct);
+        using var doc = ParseDoc(code, body, path);
         var list = new List<Job>();
-        if (doc.RootElement.TryGetProperty("jobs", out var arr) && arr.ValueKind == JsonValueKind.Array)
+        int skipped = 0;
+        if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+            doc.RootElement.TryGetProperty("jobs", out var arr) && arr.ValueKind == JsonValueKind.Array)
             foreach (var e in arr.EnumerateArray())
-                list.Add(e.Deserialize<Job>(Json.Options)!);
+            {
+                Job? j = null;
+                try { j = e.Deserialize<Job>(Json.Options); }
+                catch (JsonException) { }
+                if (IsUsable(j)) list.Add(j!);
+                else skipped++;
+            }
+        if (skipped > 0) Log?.Invoke($"GET /{PathOnly(path)}: skipped {skipped} unreadable row(s)");
         return list;
     }
 
-    private static Job ParseJob(byte[] body) =>
-        JsonSerializer.Deserialize<Job>(body, Json.Options) ?? throw new FaxApiException(0, "empty job response");
+    // Json.Options does not enforce nullable annotations, so a row without id/state deserializes with nulls.
+    private static bool IsUsable(Job? j) => j is not null && j.Id is not null && j.State is not null;
+
+    private static string PathOnly(string path) => path.Split('?')[0];
+
+    private static Job ParseJob(HttpStatusCode code, byte[] body)
+    {
+        var j = Deserialize<Job>(code, body, "job");
+        if (!IsUsable(j)) throw new FaxApiException((int)code, "faxd returned a job without id or state");
+        return j;
+    }
+
+    /// <summary>A 2xx body that is not the expected JSON becomes a FaxApiException carrying that status, never a raw JsonException.</summary>
+    private static T Deserialize<T>(HttpStatusCode code, byte[] body, string what) where T : class
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<T>(body, Json.Options)
+                   ?? throw new FaxApiException((int)code, $"faxd returned an empty {what} response");
+        }
+        catch (JsonException e) { throw Unreadable(code, what, e); }
+    }
+
+    private static JsonDocument ParseDoc(HttpStatusCode code, byte[] body, string what)
+    {
+        try { return JsonDocument.Parse(body); }
+        catch (JsonException e) { throw Unreadable(code, PathOnly(what), e); }
+    }
+
+    private static FaxApiException Unreadable(HttpStatusCode code, string what, Exception e) =>
+        new((int)code, $"faxd returned an unreadable {what} response (not the expected JSON)", e);
+
+    /// <summary>
+    /// The number as sent: <see cref="Numbers.Normalize"/>d digits. Non-ASCII input is refused outright (faxd's
+    /// <c>\D</c> keeps non-ASCII digits, the client drops them, so the two would disagree).
+    /// </summary>
+    private static string WireNumber(string to)
+    {
+        ArgumentNullException.ThrowIfNull(to);
+        if (to.Any(c => c > '~')) throw new ArgumentException("the fax number may contain only ASCII characters", nameof(to));
+        var n = Numbers.Normalize(to);
+        if (n.Length == 0 || !n.All(c => c is >= '0' and <= '9'))
+            throw new ArgumentException("the fax number has no digits", nameof(to));
+        return n;
+    }
 
     private HttpRequestMessage Req(HttpMethod m, string path)
     {

@@ -25,6 +25,16 @@ public sealed class EventStream(ClientConfig cfg, HttpClient http)
 
     public string? LastEventId { get; private set; }
 
+    /// <summary>
+    /// faxd sends <c>: keepalive</c> every 15 s. If no line at all (event or keepalive) arrives for this long, the
+    /// connection is treated as dead: it is aborted, <see cref="Disconnected"/> gets a <see cref="TimeoutException"/>,
+    /// and the normal reconnect loop runs. Also bounds connect + response headers. Read at each connect.
+    /// </summary>
+    public TimeSpan StallTimeout { get; set; } = TimeSpan.FromSeconds(45);
+
+    /// <summary>Optional diagnostics sink (malformed events and the like). Never receives the token.</summary>
+    public Action<string>? Log { get; set; }
+
     /// <summary>Runs until cancelled (returns normally on cancellation): connect, read, reconnect with backoff.</summary>
     public async Task StartAsync(CancellationToken ct)
     {
@@ -32,21 +42,30 @@ public sealed class EventStream(ClientConfig cfg, HttpClient http)
         while (!ct.IsCancellationRequested)
         {
             Exception? error = null;
+            var stallAfter = StallTimeout;
+            using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
             try
             {
+                stall.CancelAfter(stallAfter);
                 var url = new Uri(cfg.BaseUri, "events?token=" + Uri.EscapeDataString(cfg.Token ?? ""));
                 using var req = new HttpRequestMessage(HttpMethod.Get, url);
                 req.Headers.TryAddWithoutValidation("Accept", "text/event-stream");
                 if (LastEventId != null) req.Headers.TryAddWithoutValidation("Last-Event-ID", LastEventId);
-                using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+                using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, stall.Token);
                 if (!resp.IsSuccessStatusCode)
                     throw new FaxApiException((int)resp.StatusCode, "events: HTTP " + (int)resp.StatusCode);
                 backoff = MinBackoff;
                 Raise(() => Connected?.Invoke());
-                await using var stream = await resp.Content.ReadAsStreamAsync(ct);
-                await ReadAsync(stream, ct);
+                await using var stream = await resp.Content.ReadAsStreamAsync(stall.Token);
+                await ReadAsync(stream, stall, stallAfter);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            catch (Exception e) when (stall.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                error = new TimeoutException(
+                    $"no data from faxd for {stallAfter.TotalSeconds:0.###} s (keepalives are every 15 s); reconnecting", e);
+                Log?.Invoke("events: " + error.Message);
+            }
             catch (Exception e) { error = e; }
 
             if (ct.IsCancellationRequested) break;
@@ -57,7 +76,8 @@ public sealed class EventStream(ClientConfig cfg, HttpClient http)
         }
     }
 
-    private async Task ReadAsync(Stream stream, CancellationToken ct)
+    /// <summary>Reads until the server closes. Every line (keepalive included) re-arms the stall timer.</summary>
+    private async Task ReadAsync(Stream stream, CancellationTokenSource stall, TimeSpan stallAfter)
     {
         using var reader = new StreamReader(stream, Encoding.UTF8);
         string? evType = null, id = null;
@@ -65,7 +85,8 @@ public sealed class EventStream(ClientConfig cfg, HttpClient http)
         bool hasData = false;
         while (true)
         {
-            var line = await reader.ReadLineAsync(ct);
+            stall.CancelAfter(stallAfter);
+            var line = await reader.ReadLineAsync(stall.Token); // ReadLine accepts \n, \r\n and \r
             if (line == null) return; // server closed the stream
             if (line.Length == 0)
             {
@@ -99,10 +120,12 @@ public sealed class EventStream(ClientConfig cfg, HttpClient http)
             switch (type)
             {
                 case "job":
-                    if (el.Deserialize<Job>(Json.Options) is { } j) Raise(() => JobChanged?.Invoke(j));
+                    if (el.Deserialize<Job>(Json.Options) is { Id: not null } j) Raise(() => JobChanged?.Invoke(j));
+                    else Log?.Invoke("events: skipped malformed job event (no id)");
                     break;
                 case "received":
-                    if (el.Deserialize<Job>(Json.Options) is { } r) Raise(() => Received?.Invoke(r));
+                    if (el.Deserialize<Job>(Json.Options) is { Id: not null } r) Raise(() => Received?.Invoke(r));
+                    else Log?.Invoke("events: skipped malformed received event (no id)");
                     break;
                 case "arm":
                     if (el.Deserialize<ArmState>(Json.Options) is { } a) Raise(() => ArmChanged?.Invoke(a));
@@ -113,7 +136,7 @@ public sealed class EventStream(ClientConfig cfg, HttpClient http)
                     break;
             }
         }
-        catch (JsonException) { /* malformed event: skip it */ }
+        catch (JsonException) { Log?.Invoke($"events: skipped malformed {type} event (not the expected JSON)"); }
     }
 
     private static void Raise(Action a)
