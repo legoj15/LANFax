@@ -4,7 +4,8 @@ import logging
 import os
 import re
 import secrets
-from datetime import datetime, timezone
+
+from .events import utcnow_iso
 
 log = logging.getLogger("faxd.enqueue")
 
@@ -28,7 +29,7 @@ def enqueue_pdf(cfg, reg, bus, pdf_bytes: bytes, to: str, *, subject="", origin=
     number = normalize_number(to)
     job_id = "lf" + secrets.token_hex(6)
     name = f"{number}_{safe_slug(subject) or 'fax'}-{job_id}.pdf"
-    now = datetime.now(timezone.utc).isoformat()
+    now = utcnow_iso()
     os.makedirs(cfg.outbox, exist_ok=True)
     os.makedirs(cfg.queue_meta, exist_ok=True)
     final = os.path.join(cfg.outbox, name)

@@ -24,8 +24,9 @@ def make_test_pdf(*, to: str, station: str, when: datetime, note: str = "") -> b
     text(14, f"From: {station}", 20)
     text(14, f"Sent: {when.strftime(fmt).strip()}", 20)
     text(14, note, 30)
-    for size in (8, 10, 12, 16, 24):
+    for size in (8, 10, 12, 16):
         text(size, SENTENCE, size + 10)
+    text(24, "The quick brown fox 0123456789", 34)
     y -= 10
     for size in (6, 8, 12, 18):
         text(size, "||||||||" * 8, size + 12)

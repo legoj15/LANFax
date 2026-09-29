@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
-from faxd.arm import ArmController, ArmError
+from faxd.arm import parse_status, ArmController, ArmError
 
 
 class Bus:
@@ -64,6 +64,16 @@ class ArmTests(unittest.TestCase):
         self.assertFalse(s["armed"])
         self.assertIsNone(s["until"])
         self.assertEqual(s["ext"], "300")
+
+    def test_parse_status_now_param(self):
+        text = ("Fax receiver: ARMED - receiving faxes on ext 301\n"
+                "Window ends: 2026-09-29 12:35 EDT (~1h 00m remaining)\n"
+                "Last change: Tue Sep 29 11:35:12 EDT 2026\n")
+        s = parse_status(text, now=datetime(2026, 9, 29, 11, 35, 0))
+        self.assertEqual((s["armed"], s["remaining_min"], s["ext"]), (True, 60, "301"))
+        self.assertTrue(s["until"].endswith("Z") and s["changed"].endswith("Z"))
+        s = parse_status(text, now=datetime(2026, 9, 29, 13, 0, 0))
+        self.assertEqual((s["armed"], s["until"], s["remaining_min"]), (False, None, 0))
 
     def test_missing(self):
         s = ArmController(self.cfg, self.bus, Runner()).state()

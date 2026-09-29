@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 from faxd.config import Config
 from faxd.db import Registry
 from faxd.events import EventBus
-from faxd.spool import SpoolObserver, parse_env_file, normalize_number
+from faxd.enqueue import normalize_number
+from faxd.spool import SpoolObserver, parse_env_file
 
 
 def _write(path: str, text: str = "x") -> None:
@@ -269,6 +270,80 @@ class SpoolTests(unittest.TestCase):
         self.assertFalse(evs[0]["armed"])
         st = self.obs.arm_state()
         self.assertEqual((st["armed"], st["until"], st["remaining_min"]), (False, None, 0))
+
+    # ---- offline self-test (number 000) -------------------------------
+    def _selftest_setup(self):
+        name = self._queue("000_testpage-lf1.pdf")
+        src = f"{self.cfg.sending}/{name}"
+        _write(os.path.join(self.cfg.outqueue, "j20260929-181336-000testpagelf1.env"),
+               f"JOBID=j20260929-181336-000testpagelf1\nTO=000\nSRCFILE={src}\n")
+        _write(os.path.join(self.cfg.outqueue, "SELFTEST.env"),
+               f"JOBID=SELFTEST\nTO=SELFTEST\nSRCFILE={src}\n")
+        return name
+
+    def test_11_selftest_two_envs_are_stable(self):
+        self._selftest_setup()
+        self.obs.scan_once()
+        self.events()
+        self.obs.scan_once()
+        self.obs.scan_once()
+        self.assertEqual(self.events(), [])  # no flip-flop between the two env files
+        row = self.only()
+        self.assertEqual(row["ast_jobid"], "j20260929-181336-000testpagelf1")
+        self.assertEqual(row["state"], "dialing")
+
+    def test_12_selftest_receipt_completes_the_job(self):
+        name = self._selftest_setup()
+        self.obs.scan_once()
+        os.replace(os.path.join(self.cfg.outbox, name), os.path.join(self.cfg.sent, name))
+        _write(os.path.join(self.cfg.sent, "SELFTEST.txt"),
+               "Status: DELIVERED\nTo: SELFTEST\nPages: 1\nDate: Tue Sep 29 18:13:58 EDT 2026\n")
+        future = os.stat(os.path.join(self.cfg.outqueue, "SELFTEST.env")).st_mtime + 5
+        os.utime(os.path.join(self.cfg.sent, "SELFTEST.txt"), (future, future))
+        self.obs.scan_once()
+        row = self.only()
+        self.assertEqual((row["state"], row["pages"]), ("sent", 1))
+        self.assertEqual(row["pdf_path"], os.path.join(self.cfg.sent, name))
+
+    def test_13_stale_selftest_receipt_ignored(self):
+        self._selftest_setup()
+        _write(os.path.join(self.cfg.sent, "SELFTEST.txt"), "Status: DELIVERED\nPages: 1\n")
+        old = os.stat(os.path.join(self.cfg.outqueue, "SELFTEST.env")).st_mtime - 60
+        os.utime(os.path.join(self.cfg.sent, "SELFTEST.txt"), (old, old))
+        self.obs.scan_once()
+        self.assertEqual(self.only()["state"], "dialing")
+
+    # ---- historical adoption --------------------------------------------
+    def test_orphan_receipts_adopted_with_history_dates(self):
+        _write(os.path.join(self.cfg.failed, "0008_test1.pdf"))
+        _write(os.path.join(self.cfg.failed, "j20260910-221123-0008test1.txt"),
+               "Status: FAILED\nTo: 0008\nError: FAILED (Timed out)\nDate: Thu Sep 10 22:12:58 EDT 2026\n")
+        _write(os.path.join(self.cfg.sent, "j20260911-192520-300test1.txt"),
+               "Status: DELIVERED\nTo: 300\nPages: 1\nDate: Fri Sep 11 19:36:00 EDT 2026\n")
+        self.obs.scan_once()
+        rows = {r["ast_jobid"]: r for r in self.reg.list_jobs(direction="out")}
+        f = rows["j20260910-221123-0008test1"]
+        self.assertEqual((f["state"], f["to_number"], f["origin"]), ("failed", "0008", "share"))
+        self.assertEqual(f["filename"], "0008_test1.pdf")
+        self.assertIn("Timed out", f["error"])
+        self.assertTrue(f["created_at"].startswith("2026-09-1"), f)
+        self.assertTrue(f["finished_at"].startswith("2026-09-1"), f)
+        s = rows["j20260911-192520-300test1"]
+        self.assertEqual((s["state"], s["pages"], s["to_number"]), ("sent", 1, "300"))
+        self.assertIsNone(s["filename"])
+        self.obs.scan_once()
+        self.assertEqual(len(self.reg.list_jobs(direction="out")), 2)
+
+    def test_orphan_not_adopted_while_active_row_beside_it(self):
+        # two live rows with files beside the receipt: ambiguous, so do not invent a third
+        for n in ("15551230001_a-lf1.pdf", "15551230002_b-lf2.pdf"):
+            _write(os.path.join(self.cfg.outbox, n))
+        self.obs.scan_once()
+        for n in ("15551230001_a-lf1.pdf", "15551230002_b-lf2.pdf"):
+            os.replace(os.path.join(self.cfg.outbox, n), os.path.join(self.cfg.sent, n))
+        _write(os.path.join(self.cfg.sent, "j20260929-100000-1555123000.txt"), "Status: DELIVERED\nPages: 1\n")
+        self.obs.scan_once()
+        self.assertEqual(len(self.reg.list_jobs(direction="out")), 2)
 
     # ---- robustness ---------------------------------------------------
     def test_9_idempotent(self):

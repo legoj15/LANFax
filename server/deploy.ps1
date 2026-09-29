@@ -20,9 +20,9 @@ try {
     Invoke-Step "install on server" {
         ssh $HostName "rm -rf ~/lanfax-deploy && mv ~/lanfax-deploy-tmp ~/lanfax-deploy && sudo -n bash ~/lanfax-deploy/install.sh"
     }
-    $token = (ssh $HostName "grep ^FAXD_TOKEN= /etc/faxserver/settings.env | cut -d= -f2").Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $token) { throw "could not read FAXD_TOKEN from server" }
-    Invoke-Step "GET /status" { curl.exe -fsS -H "Authorization: Bearer $token" "http://${HostName}:$Port/status" }
+    # the token is read and used on the server; it never touches this machine
+    $remote = 'curl -fsS -H "Authorization: Bearer $(sudo -n grep ^FAXD_TOKEN= /etc/faxserver/settings.env | cut -d= -f2)" http://127.0.0.1:' + $Port + '/status'
+    Invoke-Step "GET /status" { ssh $HostName $remote }
     Write-Host ""
 }
 catch {

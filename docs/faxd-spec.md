@@ -368,3 +368,16 @@ SIGTERM/SIGINT for clean shutdown. `python -m faxd` runs `main()`.
 `scp -r server/ faxserver:~/lanfax-deploy/` then
 `ssh faxserver 'sudo -n bash ~/lanfax-deploy/install.sh'`, then prints
 `/status` via curl using the token read back from the server. Re-runnable.
+
+## Running on the server
+
+- Service `faxd` (systemd, user `faxd`). Logs: `journalctl -u faxd -f`. Restart: `sudo systemctl restart faxd`.
+- Config lives in `/etc/faxserver/settings.env` (root:faxd 0640): `FAXD_TOKEN`, `FAXD_AMI_SECRET` and the other `FAXD_*` keys above. The AMI user is defined in `/etc/asterisk/manager.d/faxd.conf` (owned by the installer). Database: `/var/lib/faxd/faxd.db` (safe to delete; history is rebuilt from the share on start).
+- Redeploy from Windows: `cd server; .\deploy.ps1` (idempotent; copies, runs `install.sh`, prints `/status`).
+- Listens on `0.0.0.0:8080`; `GET /healthz` needs no token.
+- Facts learned against the real server (first deployment):
+  - The offline self-test (number `000`) writes TWO env files, `<jobid>.env` and `SELFTEST.env` (JOBID=SELFTEST, same SRCFILE), and its receipt is `sent/SELFTEST.txt` (`To: SELFTEST`), not `<jobid>.txt`. The `<jobid>.env` job never gets a `.result`. The observer keeps the pipeline's own id, matches `SELFTEST.txt` through `SELFTEST.env`'s SRCFILE and ignores a receipt older than `SELFTEST.env`.
+  - The self-test emits no `sending` state (no FAXStatus mapping on the Local channel): queued -> dialing -> sent in about 25 s.
+  - Historic receipts (`sent|failed/j<stamp>-<slug>.txt`) with no row are adopted as finished rows, dated from the job id and the receipt `Date:`; the pdf is matched by the alphanumeric prefix of the file name.
+  - `settings.env` is root-only (0600) before install; the installer changes the group to `faxd` and mode to 0640.
+  - AMI registrations are named `reg-in` and `reg-out`.

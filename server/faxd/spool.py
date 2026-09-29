@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 from .config import Config
 from .db import Registry, TERMINAL_STATES, new_id
+from .arm import parse_status
+from .enqueue import normalize_number
 from .events import EventBus, utcnow_iso
 
 log = logging.getLogger("faxd.spool")
@@ -21,14 +23,16 @@ log = logging.getLogger("faxd.spool")
 _OUTBOX_EXTS = (".pdf", ".tif", ".tiff")
 _INBOX_RE = re.compile(r"^fax_(\d{8}-\d{6})_from_(.+)\.pdf$", re.IGNORECASE)
 _RECV_FAIL_RE = re.compile(r"^recv_(\d{8}-\d{6})_from_(.+)\.txt$", re.IGNORECASE)
-_NANP_RE = re.compile(r"^[2-9][0-9]{9}$")
+_JOBID_RE = re.compile(r"^j\d{8}-\d{6}-")
 _ACTIVE = ("queued", "converting", "dialing", "sending")
 
 
-def normalize_number(s: str) -> str:
-    """Digits only; a 10-digit NANP number gets a leading 1."""
-    digits = re.sub(r"\D", "", s or "")
-    return "1" + digits if _NANP_RE.match(digits) else digits
+def _norm(s: str) -> str:
+    """Lenient wrapper over enqueue.normalize_number: never raises (observer input is untrusted)."""
+    try:
+        return normalize_number(s)
+    except ValueError:
+        return re.sub(r"\D", "", s or "")
 
 
 def _unescape(v: str) -> str:
@@ -101,6 +105,16 @@ def _local_stamp_to_utc_iso(stamp: str) -> Optional[str]:
     return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _receipt_date_to_utc_iso(text: str) -> Optional[str]:
+    """`Tue Sep 29 11:46:24 EDT 2026` (server local, zone name dropped) -> UTC ISO with Z."""
+    toks = [t for t in text.split() if not (t.isalpha() and t.isupper())]
+    try:
+        dt = datetime.strptime(" ".join(toks), "%a %b %d %H:%M:%S %Y").astimezone(timezone.utc)
+    except ValueError:
+        return None
+    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def _to_int(s: Optional[str]) -> Optional[int]:
     try:
         return int(str(s).strip())
@@ -164,7 +178,7 @@ class SpoolObserver:
             base = name.split("_", 1)[0] if "_" in name else os.path.splitext(name)[0]
             self._create({
                 "_prefix": "sh", "direction": "out", "state": "queued", "filename": name,
-                "to_number": normalize_number(base), "origin": "share", "pdf_path": path,
+                "to_number": _norm(base), "origin": "share", "pdf_path": path,
             })
 
     def _rule_env(self) -> None:
@@ -176,7 +190,7 @@ class SpoolObserver:
             src = env.get("SRCFILE", "").replace("\\", "/")
             filename = src.rsplit("/", 1)[-1] if src else None
             selftest = name == "SELFTEST.env"
-            to = "000" if selftest else normalize_number(env.get("TO", ""))
+            to = "000" if selftest else _norm(env.get("TO", ""))
             row = self.reg.find_by_ast_jobid(jobid) or self.reg.find_by_filename(filename)
             if row is None:
                 if not filename and not selftest:
@@ -190,7 +204,9 @@ class SpoolObserver:
                     os.path.join(self.cfg.outqueue, jobid + ".result")):
                 state = "dialing"
             sending = os.path.join(self.cfg.sending, filename) if filename else None
-            self._apply(row, state, ast_jobid=jobid, to_number=to or None,
+            # SELFTEST.env duplicates the pipeline's own <jobid>.env; never let it steal the id
+            ast = None if selftest and row.get("ast_jobid") else jobid
+            self._apply(row, state, ast_jobid=ast, to_number=to or None,
                         pdf_path=sending if sending and _isfile(sending) else None)
 
     def _rule_sending(self) -> None:
@@ -206,28 +222,54 @@ class SpoolObserver:
             for name in _listdir(directory):
                 if not name.lower().endswith(".txt") or name.lower().startswith("recv_"):
                     continue
+                if name.startswith(("control-", "invalid-")):
+                    continue  # ARM control files, not receipts
                 jobid = name[:-4]
                 rec = parse_receipt(os.path.join(directory, name))
                 row = self.reg.find_by_ast_jobid(jobid)
+                selftest = jobid == "SELFTEST"
+                if row is None and selftest:
+                    row = self._selftest_row(os.path.join(directory, name))
+                    if row is None:
+                        continue  # stale receipt from an earlier self-test, or no matching job
                 if row is None:
-                    row = self._match_receipt_by_file(directory, rec, jobid)
-                if row is None:
-                    continue
+                    cands = self._receipt_candidates(directory, rec)
+                    if len(cands) == 1:
+                        row = cands[0]
+                    elif cands:
+                        log.warning("receipt %s ambiguous between %d rows; skipped", jobid, len(cands))
+                        continue
+                    else:
+                        if _JOBID_RE.match(jobid):
+                            self._adopt_receipt(directory, target, jobid, rec)
+                        continue
                 if row["state"] in ("sent", "failed") and row["state"] != target:
                     continue
                 pdf = os.path.join(directory, row["filename"]) if row["filename"] else None
                 if target == "sent":
-                    self._apply(row, "sent", pages=_to_int(rec.get("pages")), ast_jobid=jobid,
+                    self._apply(row, "sent", pages=_to_int(rec.get("pages")),
+                                ast_jobid=None if selftest else jobid,
                                 pdf_path=pdf if pdf and _isfile(pdf) else None)
                 else:
                     err = rec.get("error") or rec.get("status") or "failed"
                     self._apply(row, "failed", pages=_to_int(rec.get("pages")), error=err,
-                                ast_jobid=jobid, pdf_path=pdf if pdf and _isfile(pdf) else None)
+                                ast_jobid=None if selftest else jobid,
+                                pdf_path=pdf if pdf and _isfile(pdf) else None)
 
-    def _match_receipt_by_file(self, directory: str, rec: dict[str, str],
-                               jobid: str) -> Optional[dict]:
-        """Fallback: the one unmatched active row whose file sits beside the receipt."""
-        to = normalize_number(rec.get("to", "")) if rec.get("to") else None
+    def _selftest_row(self, receipt_path: str) -> Optional[dict]:
+        """Row for sent|failed/SELFTEST.txt: the job named by SELFTEST.env, if the receipt is newer."""
+        env_path = os.path.join(self.cfg.outqueue, "SELFTEST.env")
+        try:
+            if os.stat(receipt_path).st_mtime < os.stat(env_path).st_mtime:
+                return None
+        except OSError:
+            return None
+        src = parse_env_file(env_path).get("SRCFILE", "").replace("\\", "/")
+        return self.reg.find_by_filename(src.rsplit("/", 1)[-1]) if src else None
+
+    def _receipt_candidates(self, directory: str, rec: dict[str, str]) -> list[dict]:
+        """Unmatched active rows whose file sits beside the receipt (and match its number)."""
+        to = _norm(rec["to"]) if rec.get("to") else None
         cands = []
         for row in self.reg.list_jobs(direction="out", states=_ACTIVE, limit=1000):
             if row["ast_jobid"] or not row["filename"]:
@@ -237,11 +279,34 @@ class SpoolObserver:
             if to and row["to_number"] and row["to_number"] != to:
                 continue
             cands.append(row)
-        if len(cands) == 1:
-            return cands[0]
-        if cands:
-            log.warning("receipt %s ambiguous between %d rows; skipped", jobid, len(cands))
-        return None
+        return cands
+
+    def _adopt_receipt(self, directory: str, target: str, jobid: str, rec: dict[str, str]) -> None:
+        """History: a receipt with no row at all becomes a finished row, dated from its jobid/Date."""
+        suffix = jobid[17:]
+        filename = pdf = None
+        for d in dict.fromkeys((directory, self.cfg.sent, self.cfg.failed)):
+            for fn in _listdir(d):
+                stem, ext = os.path.splitext(fn)
+                if ext.lower() not in _OUTBOX_EXTS or fn.startswith(("control-", "invalid-", "convert-")):
+                    continue
+                if suffix and re.sub(r"[^A-Za-z0-9]", "", stem)[:len(suffix)] == suffix:
+                    filename, pdf = fn, os.path.join(d, fn)
+                    break
+            if filename:
+                break
+        fields: dict[str, Any] = {
+            "_prefix": "sh", "direction": "out", "state": target, "filename": filename,
+            "to_number": _norm(rec["to"]) if rec.get("to") else None, "origin": "share",
+            "ast_jobid": jobid, "pdf_path": pdf, "pages": _to_int(rec.get("pages")),
+            "created_at": _local_stamp_to_utc_iso(jobid[1:16]) or utcnow_iso(),
+        }
+        if target == "failed":
+            fields["error"] = rec.get("error") or rec.get("status") or "failed"
+        row = self._create(fields)
+        done = _receipt_date_to_utc_iso(rec.get("date", ""))
+        if done:
+            self.reg.upsert_job({"id": row["id"], "finished_at": done})
 
     def _rule_failed_markers(self) -> None:
         for prefix, msg in (("invalid-number-", "invalid number"),
@@ -257,7 +322,7 @@ class SpoolObserver:
                 if row is None:
                     self._create({
                         "_prefix": "sh", "direction": "out", "state": "failed", "filename": orig,
-                        "to_number": normalize_number(orig.split("_", 1)[0]) or None,
+                        "to_number": _norm(orig.split("_", 1)[0]) or None,
                         "origin": "share", "error": msg, "pdf_path": path,
                     })
                 elif row["state"] in ("sent", "failed") and row["state"] != "failed":
@@ -279,6 +344,7 @@ class SpoolObserver:
                 "from_number": m.group(2), "origin": "inbound", "pdf_path": path,
                 "created_at": created,
             })
+            row = self.reg.upsert_job({"id": row["id"], "finished_at": created})
             self.bus.publish("received", **row)
 
     def _rule_failed_recv(self) -> None:
@@ -327,36 +393,5 @@ class SpoolObserver:
             stop.wait(self.cfg.poll_interval)
 
     def arm_state(self) -> dict:
-        """Parse ARM-STATUS.txt (ARMED and DISARMED formats)."""
-        state: dict[str, Any] = {"armed": False, "until": None, "remaining_min": 0,
-                                 "ext": self.cfg.faxin_ext, "changed": None, "raw": ""}
-        text = _read_text(self.cfg.arm_status_file)
-        if text is None:
-            return state
-        state["raw"] = text.strip()
-        m = re.search(r"^Fax receiver:\s*(\S+)", text, re.MULTILINE)
-        armed = bool(m and m.group(1).upper().rstrip(":-") == "ARMED")
-        state["armed"] = armed
-        m = re.search(r"\bext\s+(\d+)", text)
-        if m:
-            state["ext"] = m.group(1)
-        m = re.search(r"^Window ends:\s*(\d{4}-\d\d-\d\d)\s+(\d\d:\d\d)", text, re.MULTILINE)
-        if armed and m:
-            try:
-                until = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M").astimezone()
-            except ValueError:
-                until = None
-            if until is not None:
-                secs = (until - datetime.now(timezone.utc)).total_seconds()
-                state["remaining_min"] = max(0, math.ceil(secs / 60))
-                state["until"] = until.astimezone(timezone.utc).isoformat(
-                    timespec="seconds").replace("+00:00", "Z")
-        m = re.search(r"^Last change:\s*(.+)$", text, re.MULTILINE)
-        if m:
-            toks = [t for t in m.group(1).split() if not (t.isalpha() and t.isupper())]
-            try:
-                dt = datetime.strptime(" ".join(toks), "%a %b %d %H:%M:%S %Y").astimezone(timezone.utc)
-                state["changed"] = dt.isoformat(timespec="seconds").replace("+00:00", "Z")
-            except ValueError:
-                pass
-        return state
+        """Parse ARM-STATUS.txt via arm.parse_status (same dict shape as ArmController.state)."""
+        return parse_status(_read_text(self.cfg.arm_status_file) or "", default_ext=self.cfg.faxin_ext)
