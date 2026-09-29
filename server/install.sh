@@ -59,8 +59,12 @@ for g in asterisk fax; do
 done
 install -d -o faxd -g faxd -m 0750 /var/lib/faxd
 
-# 2. code
+# 2. code (the running version is kept as faxd.prev for rollback)
 install -d /opt/faxd
+if [ -d /opt/faxd/faxd ]; then
+    rm -rf /opt/faxd/faxd.prev
+    cp -a /opt/faxd/faxd /opt/faxd/faxd.prev
+fi
 if command -v rsync >/dev/null 2>&1; then
     rsync -a --delete --exclude __pycache__ "$HERE/faxd/" /opt/faxd/faxd/
 else
@@ -69,6 +73,21 @@ else
     find /opt/faxd/faxd -name __pycache__ -type d -prune -exec rm -rf {} +
 fi
 chown -R root:root /opt/faxd
+
+# put faxd.prev back in place of the new code; false when there is no previous version
+rollback_code() {
+    [ -d /opt/faxd/faxd.prev ] || return 1
+    rm -rf /opt/faxd/faxd
+    cp -a /opt/faxd/faxd.prev /opt/faxd/faxd
+}
+
+# smoke import before anything restarts: a package that does not even import never
+# replaces the running service (which keeps the old code loaded until a restart)
+if ! (cd / && PYTHONPATH=/opt/faxd python3 -B -c "import faxd.main"); then
+    echo "ERROR: the new faxd package fails to import; previous code restored, service left running untouched" >&2
+    rollback_code || echo "ERROR: no previous version to restore" >&2
+    exit 1
+fi
 
 # settings.env must exist before we edit it
 install -d /etc/faxserver
@@ -129,14 +148,32 @@ systemctl restart faxd
 
 HTTP_PORT="$(get_env FAXD_HTTP_PORT)"
 HTTP_PORT="${HTTP_PORT:-8080}"
-HEALTH="failed"
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if OUT="$(curl -fsS "http://127.0.0.1:${HTTP_PORT}/healthz" 2>/dev/null)"; then
-        HEALTH="$OUT"
-        break
+health() {
+    local out
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if out="$(curl -fsS "http://127.0.0.1:${HTTP_PORT}/healthz" 2>/dev/null)"; then
+            echo "$out"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "failed"
+    return 1
+}
+HEALTH="$(health || true)"
+
+# rollback: the new version did not come up healthy, so restore faxd.prev and restart it
+if [ "$HEALTH" = "failed" ]; then
+    echo "ERROR: faxd failed its health check after the restart; rolling back" >&2
+    journalctl -u faxd -n 20 --no-pager >&2 || true
+    if rollback_code; then
+        systemctl restart faxd
+        echo "ERROR: rolled back to /opt/faxd/faxd.prev; previous version is $(systemctl is-active faxd || true), healthz: $(health || true). The new version is NOT deployed." >&2
+    else
+        echo "ERROR: no /opt/faxd/faxd.prev to roll back to; faxd is down" >&2
     fi
-    sleep 1
-done
+    exit 1
+fi
 
 # 8. firewall
 UFW_MSG="ufw not installed"

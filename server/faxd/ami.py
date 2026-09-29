@@ -7,7 +7,7 @@ import uuid
 
 _log = logging.getLogger("faxd.ami")
 
-_TERMINAL = ("sent", "failed", "received")
+_TERMINAL = ("sent", "failed", "received", "cancelled")   # db.TERMINAL_STATES
 _ACTIVE = ("queued", "converting", "dialing", "sending")
 
 
@@ -30,6 +30,7 @@ class _Pending:
         self.response = None
         self.list = []
         self.listing = False
+        self.single = False   # DBGet without EventList framing: one event ends the listing
         self.error = None
 
     def finish(self):
@@ -212,11 +213,15 @@ class AmiClient:
         """Called with _plock held."""
         if "Response" in pkt:
             p.response = pkt
-            more = pkt.get("Response") == "Success" and (
-                pkt.get("EventList", "").lower() == "start" or p.name == "DBGet")
-            if more:
-                p.listing = True
-                return
+            if pkt.get("Response") == "Success":
+                if pkt.get("EventList", "").lower() == "start":
+                    p.listing = True
+                    return
+                if p.name == "DBGet":
+                    # Asterisk 20.6 frames DBGet as a list (EventList start, DBGetResponse,
+                    # DBGetComplete); a server without that framing sends one DBGetResponse.
+                    p.listing = p.single = True
+                    return
             del self._pending[aid]
             p.finish()
         elif "Event" in pkt and p.listing:
@@ -225,6 +230,9 @@ class AmiClient:
                 p.finish()
             else:
                 p.list.append(pkt)
+                if p.single:
+                    del self._pending[aid]
+                    p.finish()
 
     def _fail_pending(self):
         with self._plock:

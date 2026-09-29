@@ -7,20 +7,24 @@ import queue
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .arm import ArmError
+from .enqueue import ExistingJob
 
 log = logging.getLogger("faxd.api")
 
 MAX_BODY = 25 * 1024 * 1024   # faxd.service caps the whole daemon at 96 MB
 MAX_CONNS = 32                # concurrent connections, SSE streams included
 REQUEST_TIMEOUT = 30          # seconds; socket timeout for every connection
+MAX_UPLOADS = 2               # concurrent POST /jobs body reads (each may hold MAX_BODY)
+REPLAY_PAGE = 500             # job_events rows per query when replaying Last-Event-ID
 CHUNK = 64 * 1024
 _TOKEN_RE = re.compile(r"(token=)[^&\s]*", re.IGNORECASE)
 _ID = r"([A-Za-z0-9_-]+)"
+_CLIENT_KEY = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")
 
 
@@ -77,17 +81,19 @@ class _Handler(BaseHTTPRequestHandler):
     def api(self):
         return self.server.api
 
-    def _send(self, status, body, ctype):
+    def _send(self, status, body, ctype, headers=None):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, status, obj):
+    def _json(self, status, obj, headers=None):
         body = json.dumps(obj, default=str).encode("utf-8")
-        self._send(status, body, "application/json; charset=utf-8")
+        self._send(status, body, "application/json; charset=utf-8", headers)
 
     def _authorized(self, query, allow_query_token):
         expected = self.api.token
@@ -140,6 +146,26 @@ class _Handler(BaseHTTPRequestHandler):
             if not chunk:
                 break
             left -= len(chunk)
+
+    def _discard_body(self):
+        """Read and drop a body we will not use (a repeated Idempotency-Key) so the client
+        gets the answer instead of a reset. Bodies over the upload limit are not read."""
+        self.close_connection = True
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        self._drain(max(0, n), self.api.max_body)
+
+    def _client_key(self):
+        """The optional Idempotency-Key header: None, or 1-128 chars [A-Za-z0-9._:-]."""
+        raw = self.headers.get("Idempotency-Key")
+        if raw is None:
+            return None
+        key = raw.strip()
+        if not _CLIENT_KEY.fullmatch(key):
+            raise _HttpError(400, "Idempotency-Key must be 1-128 chars of A-Z a-z 0-9 . _ : -")
+        return key
 
     def _json_body(self, required=True):
         body = self._read_body(1024 * 1024, required=False)
@@ -247,9 +273,27 @@ class _Handler(BaseHTTPRequestHandler):
         if raw:
             states = [s for s in (x.strip() for x in raw.split(",")) if s]
         since = (query.get("since") or [None])[0] or None
+        updated_since = (query.get("updated_since") or [None])[0] or None
+        if updated_since:
+            updated_since = self._utc_param(updated_since, "updated_since")
         jobs = self.api.reg.list_jobs(direction=direction, states=states,
-                                      limit=self._limit(query, 100), since=since)
+                                      limit=self._limit(query, 100), since=since,
+                                      updated_since=updated_since)
         self._json(200, {"jobs": jobs})
+
+    @staticmethod
+    def _utc_param(raw, name):
+        """ISO-8601 -> the registry's `YYYY-MM-DDTHH:MM:SSZ` form (naive = UTC). An unescaped
+        `+` in a query string arrives as a space, so that is retried as `+`."""
+        for cand in (raw, raw.replace(" ", "+")):
+            try:
+                dt = datetime.fromisoformat(cand)
+            except ValueError:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        raise _HttpError(400, "%s must be an ISO-8601 timestamp" % name)
 
     def r_inbox(self, query):
         jobs = self.api.reg.list_jobs(direction="in", states=None,
@@ -290,19 +334,39 @@ class _Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
 
+    def _prior(self, key):
+        """The job an earlier request with this Idempotency-Key created, else None."""
+        return self.api.reg.find_by_client_key(key) if key else None
+
     def r_post_job(self, query):
-        body = self._read_body(self.api.max_body)
-        to = (self.headers.get("X-Fax-To") or "").strip()
-        if not to:
-            raise _HttpError(400, "X-Fax-To header required")
-        if not body.startswith(b"%PDF"):
-            raise _HttpError(400, "body is not a PDF")
-        subject = (self.headers.get("X-Fax-Subject") or "").strip()
+        key = self._client_key()
+        prior = self._prior(key)
+        if prior is not None:
+            self._discard_body()
+            return self._json(200, prior)
+        if not self.api.uploads.acquire(blocking=False):
+            # not reading the (up to 25 MB) body is the point: answer and close
+            self.close_connection = True
+            return self._json(503, {"error": "too many uploads in progress; retry"},
+                              {"Retry-After": "2"})
         try:
-            job = self.api.enqueue_fn(body, to, subject=subject, origin="api",
-                                      client=self.client_ip)
-        except ValueError as e:
-            raise _HttpError(400, str(e) or "invalid request")
+            body = self._read_body(self.api.max_body)
+            to = (self.headers.get("X-Fax-To") or "").strip()
+            if not to:
+                raise _HttpError(400, "X-Fax-To header required")
+            if not body.startswith(b"%PDF"):
+                raise _HttpError(400, "body is not a PDF")
+            subject = (self.headers.get("X-Fax-Subject") or "").strip()
+            try:
+                job = self.api.enqueue_fn(body, to, subject=subject, origin="api",
+                                          client=self.client_ip, client_key=key)
+            except ExistingJob as e:
+                return self._json(200, e.job)
+            except ValueError as e:
+                raise _HttpError(400, str(e) or "invalid request")
+            del body
+        finally:
+            self.api.uploads.release()
         self._json(201, job)
 
     @staticmethod
@@ -328,7 +392,11 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(200, self.api.arm.arm(m, self._origin()))
 
     def r_test_send(self, query):
+        key = self._client_key()
         obj = self._json_body()
+        prior = self._prior(key)
+        if prior is not None:
+            return self._json(200, prior)
         to = obj.get("to")
         note = obj.get("note", "")
         if not isinstance(to, str) or not to.strip():
@@ -340,14 +408,62 @@ class _Handler(BaseHTTPRequestHandler):
             pdf = self.api.testpage_fn(to=to, station=self.api.cfg.station_id,
                                        when=datetime.now().astimezone(), note=note)
             job = self.api.enqueue_fn(pdf, to, subject="test page", origin="test",
-                                      client=self.client_ip)
+                                      client=self.client_ip, client_key=key)
+        except ExistingJob as e:
+            return self._json(200, e.job)
         except ValueError as e:
             raise _HttpError(400, str(e) or "invalid request")
         self._json(201, job)
 
+    def _last_event_id(self, query):
+        """Last-Event-ID header (EventSource sends it on reconnect) or ?last_event_id=."""
+        raw = self.headers.get("Last-Event-ID") or (query.get("last_event_id") or [""])[0]
+        try:
+            n = int(str(raw).strip())
+        except ValueError:
+            return None
+        return n if n >= 0 else None
+
+    def _replay(self, after):
+        """[(event_id, job event)] for every job with a job_events row newer than `after`:
+        the job's full current row once, ordered by its newest event, oldest first."""
+        reg = self.api.reg
+        newest = {}
+        while True:
+            rows = reg.job_events_since(after, limit=REPLAY_PAGE)
+            for e in rows:
+                newest[e["job_id"]] = e["id"]
+            if len(rows) < REPLAY_PAGE:
+                break
+            after = rows[-1]["id"]
+        out = []
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        for job_id, eid in sorted(newest.items(), key=lambda kv: kv[1]):
+            row = reg.get_job(job_id)
+            if row:
+                out.append((eid, {"type": "job", "ts": now, **row, "event_id": eid}))
+        return out
+
+    def _event_id(self, ev):
+        """SSE id of a live job/received event: its transition's job_events rowid."""
+        if ev.get("type") not in ("job", "received"):
+            return None
+        if ev.get("event_id") is not None:
+            return ev["event_id"]
+        return self.api.reg.last_event_id(ev["id"]) if ev.get("id") else None
+
     def r_events(self, query):
         api = self.api
-        q = api.bus.subscribe()
+        last_id = self._last_event_id(query)
+        q = api.bus.subscribe()   # before the replay query, so no transition falls in a gap
+        try:
+            # everything that can fail runs before the 200 goes out: a failure here is an
+            # ordinary JSON error response, never a second status line inside the stream
+            status, arm = api.status_fn(), api.arm.state()
+            replay = self._replay(last_id) if last_id is not None else []
+        except BaseException:
+            api.bus.unsubscribe(q)
+            raise
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -356,8 +472,10 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
-            self._sse("status", api.status_fn())
-            self._sse("arm", api.arm.state())
+            self._sse("status", status)
+            self._sse("arm", arm)
+            for eid, ev in replay:
+                self._sse("job", ev, eid)
             last = time.monotonic()
             tick = max(0.05, min(0.5, api.sse_keepalive))
             while not api.stop.is_set():
@@ -371,21 +489,27 @@ class _Handler(BaseHTTPRequestHandler):
                         self.wfile.write(b": keepalive\n\n")
                         last = time.monotonic()
                     continue
-                self._sse(str(ev.get("type", "message")), ev)
+                self._sse(str(ev.get("type", "message")), ev, self._event_id(ev))
                 last = time.monotonic()
         except OSError:
             log.debug("sse client %s gone", self.client_ip)
+        except Exception:  # noqa: BLE001 - the 200 is out: log and end the stream, never a 500
+            log.exception("sse stream to %s failed", self.client_ip)
         finally:
             api.bus.unsubscribe(q)
 
-    def _sse(self, etype, data):
+    def _sse(self, etype, data, eid=None):
         payload = json.dumps(data, default=str)
-        self.wfile.write(("event: %s\ndata: %s\n\n" % (etype, payload)).encode("utf-8"))
+        head = "event: %s\n" % etype
+        if eid is not None:
+            head += "id: %d\n" % int(eid)
+        self.wfile.write((head + "data: %s\n\n" % payload).encode("utf-8"))
 
 
 class Api:
     def __init__(self, cfg, reg, bus, arm, status_fn, enqueue_fn, testpage_fn,
-                 *, sse_keepalive=15.0, max_body=MAX_BODY, max_conns=MAX_CONNS):
+                 *, sse_keepalive=15.0, max_body=MAX_BODY, max_conns=MAX_CONNS,
+                 max_uploads=MAX_UPLOADS):
         self.cfg = cfg
         self.reg = reg
         self.bus = bus
@@ -395,6 +519,7 @@ class Api:
         self.testpage_fn = testpage_fn
         self.sse_keepalive = sse_keepalive
         self.max_body = max_body
+        self.uploads = threading.BoundedSemaphore(max_uploads)
         self.token = cfg.token
         self.stop = threading.Event()
         self._serving = threading.Event()

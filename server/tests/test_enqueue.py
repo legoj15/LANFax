@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from faxd.enqueue import check_number, enqueue_pdf, normalize_number, safe_slug
+from faxd.enqueue import ExistingJob, check_number, enqueue_pdf, normalize_number, safe_slug
 
 
 class Reg:
@@ -19,6 +19,12 @@ class Reg:
     def set_state(self, job_id, state, **kw):
         self.states.append((job_id, state))
         return dict(self.rows[-1], marker=1, state=state)
+
+    def find_by_client_key(self, key):
+        for r in self.rows:
+            if key and r.get("client_key") == key:
+                return dict(r)
+        return None
 
 
 class Bus:
@@ -159,6 +165,42 @@ class EnqueueTests(unittest.TestCase):
             enqueue_pdf(self.cfg, self.reg, self.bus, b"nope", "9543216309")
         self.assertFalse(os.path.exists(self.cfg.outbox) and os.listdir(self.cfg.outbox))
         self.assertEqual(self.reg.rows, [])
+
+
+    # ---- idempotency ----------------------------------------------------
+    def test_client_key_stored_in_row_and_meta(self):
+        row = enqueue_pdf(self.cfg, self.reg, self.bus, b"%PDF-1", "000", client_key="abc:1")
+        self.assertEqual(self.reg.rows[0]["client_key"], "abc:1")
+        with open(os.path.join(self.cfg.queue_meta, row["filename"] + ".json")) as f:
+            self.assertEqual(json.load(f)["client_key"], "abc:1")
+
+    def test_repeat_client_key_writes_nothing(self):
+        first = enqueue_pdf(self.cfg, self.reg, self.bus, b"%PDF-1", "000", client_key="k")
+        n_rows, n_events = len(self.reg.rows), len(self.bus.events)
+        with self.assertRaises(ExistingJob) as cm:
+            enqueue_pdf(self.cfg, self.reg, self.bus, b"%PDF-1", "000", client_key="k")
+        self.assertEqual(cm.exception.job["id"], first["id"])
+        self.assertEqual(os.listdir(self.cfg.outbox), [first["filename"]])
+        self.assertEqual(len(os.listdir(self.cfg.queue_meta)), 1)
+        self.assertEqual((len(self.reg.rows), len(self.bus.events)), (n_rows, n_events))
+
+    def test_client_key_race_at_insert_returns_existing(self):
+        winner = {"id": "lfwinner00001", "client_key": "k", "state": "queued"}
+        calls = []
+
+        def find(key):              # empty on the pre-check, the winner after the collision
+            calls.append(key)
+            return None if len(calls) == 1 else dict(winner)
+
+        def collide(job):
+            raise RuntimeError("UNIQUE constraint failed: jobs.client_key")
+        self.reg.find_by_client_key = find
+        self.reg.upsert_job = collide
+        with self.assertRaises(ExistingJob) as cm:
+            enqueue_pdf(self.cfg, self.reg, self.bus, b"%PDF-1", "000", client_key="k")
+        self.assertEqual(cm.exception.job["id"], "lfwinner00001")
+        self.assertEqual(os.listdir(self.cfg.outbox), [])
+        self.assertEqual(os.listdir(self.cfg.queue_meta), [])
 
 
 if __name__ == "__main__":

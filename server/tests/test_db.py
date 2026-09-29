@@ -4,7 +4,9 @@ import tempfile
 import threading
 import unittest
 
-from faxd.db import Registry, JOB_STATES
+import sqlite3
+
+from faxd.db import Registry, JOB_STATES, TERMINAL_STATES
 
 
 class RegistryTests(unittest.TestCase):
@@ -123,6 +125,81 @@ class RegistryTests(unittest.TestCase):
         self.reg.upsert_job(self._job(9, direction="in", state="received"))
         self.assertEqual(self.reg.count_by_state(direction="out"),
                          {"queued": 2, "converting": 1, "sending": 1, "sent": 1})
+
+
+    # ---- follow-up review items -----------------------------------------
+    def test_cancelled_is_terminal(self):
+        self.assertIn("cancelled", JOB_STATES)
+        self.assertIn("cancelled", TERMINAL_STATES)
+        j = self.reg.upsert_job(self._job(1))["id"]
+        r = self.reg.set_state(j, "cancelled")
+        self.assertEqual(r["state"], "cancelled")
+        self.assertIsNotNone(r["finished_at"])
+        self.assertIsNone(self.reg.find_active_by_filename("f1.pdf"))
+
+    def test_client_key_unique(self):
+        a = self.reg.upsert_job(self._job(1, client_key="k-1"))
+        self.assertEqual(a["client_key"], "k-1")
+        self.assertEqual(self.reg.find_by_client_key("k-1")["id"], a["id"])
+        self.assertIsNone(self.reg.find_by_client_key("nope"))
+        self.assertIsNone(self.reg.find_by_client_key(""))
+        self.reg.upsert_job(self._job(2))          # NULL keys never collide
+        self.reg.upsert_job(self._job(3))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.reg.upsert_job(self._job(4, client_key="k-1"))
+        self.assertIsNone(self.reg.get_job(self._job(4)["id"]))
+
+    def test_migration_adds_client_key_to_existing_db(self):
+        path = os.path.join(self.tmp.name, "old.db")
+        db = sqlite3.connect(path)
+        db.executescript("""
+            CREATE TABLE jobs (id TEXT PRIMARY KEY, direction TEXT NOT NULL DEFAULT 'out',
+              state TEXT NOT NULL DEFAULT 'queued', filename TEXT, to_number TEXT,
+              from_number TEXT, subject TEXT, origin TEXT, client TEXT, ast_jobid TEXT,
+              pages INTEGER, error TEXT, pdf_path TEXT, created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL, finished_at TEXT);
+            CREATE TABLE job_events (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+              ts TEXT NOT NULL, state TEXT, detail TEXT);
+            INSERT INTO jobs (id, created_at, updated_at, subject) VALUES ('shold', 'x', 'x', 'kept');
+        """)
+        db.close()
+        reg = Registry(path)
+        try:
+            self.assertEqual(reg.get_job("shold")["subject"], "kept")
+            self.assertIsNone(reg.get_job("shold")["client_key"])
+            reg.upsert_job(self._job(1, client_key="dup"))
+            with self.assertRaises(sqlite3.IntegrityError):
+                reg.upsert_job(self._job(2, client_key="dup"))
+        finally:
+            reg.close()
+        Registry(path).close()   # re-opening a migrated db is a no-op
+
+    def test_list_jobs_updated_since(self):
+        self.reg.upsert_job(self._job(1))
+        self.reg.upsert_job(self._job(2))
+        with self.reg._lock:
+            self.reg._conn().execute("UPDATE jobs SET updated_at='2026-01-01T00:00:00Z' WHERE id=?",
+                                     (self._job(1)["id"],))
+        got = self.reg.list_jobs(updated_since="2026-06-01T00:00:00Z")
+        self.assertEqual([j["id"] for j in got], [self._job(2)["id"]])
+        self.assertEqual(len(self.reg.list_jobs(updated_since="2025-01-01T00:00:00Z")), 2)
+
+    def test_event_ids_and_replay(self):
+        a = self.reg.upsert_job(self._job(1))["id"]
+        b = self.reg.upsert_job(self._job(2))["id"]
+        r1 = self.reg.set_state(a, "queued")
+        r2 = self.reg.set_state(b, "queued")
+        r3 = self.reg.set_state(a, "dialing")
+        self.assertLess(r1["event_id"], r2["event_id"])
+        self.assertLess(r2["event_id"], r3["event_id"])
+        self.assertNotIn("event_id", self.reg.get_job(a))   # only on the row a transition returns
+        self.assertEqual(self.reg.last_event_id(a), r3["event_id"])
+        self.assertIsNone(self.reg.last_event_id("nope"))
+        since = self.reg.job_events_since(r1["event_id"])
+        self.assertEqual([(e["job_id"], e["id"]) for e in since],
+                         [(b, r2["event_id"]), (a, r3["event_id"])])
+        self.assertEqual(len(self.reg.job_events_since(0, limit=1)), 1)
+        self.assertEqual(self.reg.job_events_since(r3["event_id"]), [])
 
 
 if __name__ == "__main__":

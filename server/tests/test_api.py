@@ -20,10 +20,11 @@ def make_api(reg=None, **kw):
     bus, arm = FakeBus(), FakeArm()
     calls = {"enqueue": [], "testpage": []}
 
-    def enqueue(pdf, to, *, subject="", origin="api", client=""):
+    def enqueue(pdf, to, *, subject="", origin="api", client="", client_key=None):
         if to == "bad":
             raise ValueError("bad number")
-        calls["enqueue"].append(dict(pdf=pdf, to=to, subject=subject, origin=origin, client=client))
+        calls["enqueue"].append(dict(pdf=pdf, to=to, subject=subject, origin=origin, client=client,
+                                     client_key=client_key))
         return {"id": "lf000000000001", "state": "queued", "to_number": to}
 
     def testpage(*, to, station, when, note=""):
@@ -435,6 +436,212 @@ class SseCase(unittest.TestCase):
         self.assertLess(time.time() - t0, 3)
         self.assertFalse(api.thread.is_alive())
         c.close()
+
+
+# ---- follow-up review items -------------------------------------------------
+def read_event_full(resp):
+    """Next real event as (event, data, id); comments are skipped."""
+    ev = data = eid = None
+    while True:
+        line = resp.fp.readline().decode().rstrip("\r\n")
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            ev = line[6:].strip()
+        elif line.startswith("id:"):
+            eid = line[3:].strip()
+        elif line.startswith("data:"):
+            data = json.loads(line[5:].strip())
+        elif line == "" and ev:
+            return ev, data, eid
+
+
+class RealRegCase(unittest.TestCase):
+    """Api against a real Registry, EventBus and enqueue_pdf."""
+
+    def setUp(self):
+        from faxd.db import Registry
+        from faxd.enqueue import enqueue_pdf
+        from faxd.events import EventBus
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        r = self.tmp.name
+        self.cfg = SimpleNamespace(http_bind="127.0.0.1", http_port=0, token=TOKEN, station_id="T",
+                                   outbox=os.path.join(r, "outbox"),
+                                   queue_meta=os.path.join(r, "queue-meta"),
+                                   allowed_numbers="nanp,000,ext")
+        self.reg = Registry(os.path.join(r, "f.db"))
+        self.addCleanup(self.reg.close)
+        self.bus = EventBus()
+
+        def enqueue(pdf, to, **kw):
+            return enqueue_pdf(self.cfg, self.reg, self.bus, pdf, to, **kw)
+
+        self.api = Api(self.cfg, self.reg, self.bus, FakeArm(), lambda: {"daemon": {}}, enqueue,
+                       lambda **kw: PDF, sse_keepalive=0.2)
+        threading.Thread(target=self.api.serve_forever, daemon=True).start()
+        self.addCleanup(self.api.shutdown)
+
+    def post(self, key, to="000"):
+        h = {"Content-Type": "application/pdf", "X-Fax-To": to}
+        if key is not None:
+            h["Idempotency-Key"] = key
+        return jreq(self.api, "POST", "/jobs", PDF, h)
+
+    def test_idempotent_post(self):
+        s1, j1 = self.post("tray-1:abc")
+        s2, j2 = self.post("tray-1:abc")
+        self.assertEqual((s1, s2), (201, 200))
+        self.assertEqual(j1["id"], j2["id"])
+        self.assertEqual(j1["client_key"], "tray-1:abc")
+        self.assertEqual(os.listdir(self.cfg.outbox), [j1["filename"]])
+        self.assertEqual(len(self.reg.list_jobs()), 1)
+        s3, j3 = self.post("tray-1:other")
+        self.assertEqual(s3, 201)
+        self.assertNotEqual(j3["id"], j1["id"])
+
+    def test_idempotent_test_send(self):
+        h = {"Idempotency-Key": "t.1"}
+        s1, j1 = jreq(self.api, "POST", "/test/send", {"to": "000"}, h)
+        s2, j2 = jreq(self.api, "POST", "/test/send", {"to": "000"}, h)
+        self.assertEqual((s1, s2), (201, 200))
+        self.assertEqual(j1["id"], j2["id"])
+        self.assertEqual(len(os.listdir(self.cfg.outbox)), 1)
+
+    def test_bad_idempotency_key(self):
+        for bad in ("has space", "x" * 129, "semi;colon"):
+            self.assertEqual(self.post(bad)[0], 400, bad)
+            self.assertEqual(jreq(self.api, "POST", "/test/send", {"to": "000"},
+                                  {"Idempotency-Key": bad})[0], 400, bad)
+        self.assertFalse(os.path.exists(self.cfg.outbox) and os.listdir(self.cfg.outbox))
+
+    def _history(self):
+        a = self.reg.upsert_job({"id": "lfaaaaaaaaaaaa", "direction": "out", "state": "queued"})["id"]
+        b = self.reg.upsert_job({"id": "lfbbbbbbbbbbbb", "direction": "out", "state": "queued"})["id"]
+        e1 = self.reg.set_state(a, "queued")["event_id"]
+        e2 = self.reg.set_state(a, "dialing")["event_id"]
+        e3 = self.reg.set_state(b, "queued")["event_id"]
+        return a, b, e1, e2, e3
+
+    def _replay(self, path, headers=None):
+        c = http.client.HTTPConnection("127.0.0.1", self.api.port, timeout=5)
+        self.addCleanup(c.close)
+        c.request("GET", path, headers=headers or {})
+        r = c.getresponse()
+        self.assertEqual(r.status, 200)
+        self.assertEqual(read_event_full(r)[0], "status")
+        self.assertEqual(read_event_full(r)[0], "arm")
+        return r
+
+    def test_sse_replays_missed_transitions_from_last_event_id(self):
+        a, b, e1, e2, e3 = self._history()
+        r = self._replay("/events?token=" + TOKEN, {"Last-Event-ID": str(e1)})
+        ev, data, eid = read_event_full(r)
+        self.assertEqual((ev, data["id"], data["state"], eid), ("job", a, "dialing", str(e2)))
+        ev, data, eid = read_event_full(r)
+        self.assertEqual((ev, data["id"], eid), ("job", b, str(e3)))
+        e4 = self.reg.set_state(b, "dialing")
+        self.bus.publish("job", **e4)                     # live event after the replay
+        ev, data, eid = read_event_full(r)
+        self.assertEqual((ev, data["state"], eid), ("job", "dialing", str(e4["event_id"])))
+
+    def test_sse_replay_via_query_and_live_ids(self):
+        a, b, e1, e2, e3 = self._history()
+        r = self._replay("/events?token=%s&last_event_id=%d" % (TOKEN, e2))
+        ev, data, eid = read_event_full(r)
+        self.assertEqual((data["id"], eid), (b, str(e3)))
+        row = self.reg.upsert_job({"id": a, "pages": 3})    # no transition: id is the job's last event
+        self.bus.publish("received", **row)
+        ev, data, eid = read_event_full(r)
+        self.assertEqual((ev, eid), ("received", str(e2)))
+
+    def test_sse_without_last_event_id_does_not_replay(self):
+        self._history()
+        r = self._replay("/events?token=" + TOKEN)
+        self.bus.publish("arm", armed=False)
+        self.assertEqual(read_event_full(r)[0], "arm")
+
+    def test_jobs_updated_since(self):
+        self._history()
+        s, d = jreq(self.api, "GET", "/jobs?updated_since=2000-01-01T00:00:00Z")
+        self.assertEqual((s, len(d["jobs"])), (200, 2))
+        s, d = jreq(self.api, "GET", "/jobs?updated_since=2999-01-01T00:00:00%2B00:00")
+        self.assertEqual((s, d["jobs"]), (200, []))
+        self.assertEqual(jreq(self.api, "GET", "/jobs?updated_since=yesterday")[0], 400)
+
+
+class FollowUpFakeCase(unittest.TestCase):
+    def test_updated_since_normalized_to_utc_z(self):
+        reg = FakeRegistry()
+        api = make_api(reg)
+        try:
+            s, _ = jreq(api, "GET", "/jobs?updated_since=2026-09-29T08:00:00-04:00&since=abc")
+            self.assertEqual(s, 200)
+            self.assertEqual(reg.list_calls[-1]["updated_since"], "2026-09-29T12:00:00Z")
+            self.assertEqual(reg.list_calls[-1]["since"], "abc")
+        finally:
+            api.shutdown()
+
+    def test_events_setup_failure_is_one_clean_500(self):
+        api = make_api()
+        try:
+            api.status_fn = lambda: 1 / 0
+            with self.assertLogs("faxd.api", "ERROR"):
+                out = raw_request(api, ("GET /events?token=%s HTTP/1.1\r\nHost: x\r\n"
+                                        "Connection: close\r\n\r\n" % TOKEN).encode())
+            self.assertIn(b" 500 ", out.split(b"\r\n")[0])
+            self.assertEqual(out.count(b"HTTP/1."), 1, out)
+            self.assertEqual(api.bus_.count(), 0)
+        finally:
+            api.shutdown()
+
+    def test_upload_guard_503_without_reading_body(self):
+        import socket
+        api = make_api(max_uploads=1)
+        try:
+            auth = ("Authorization: Bearer %s\r\n" % TOKEN).encode()
+            head = (b"POST /jobs HTTP/1.1\r\nHost: x\r\n" + auth +
+                    b"Content-Type: application/pdf\r\nX-Fax-To: 000\r\nConnection: close\r\n"
+                    b"Content-Length: %d\r\n\r\n" % len(PDF))
+            a = socket.create_connection(("127.0.0.1", api.port), timeout=5)
+            a.sendall(head + PDF[:4])            # holds the only upload slot mid-body
+            deadline = time.time() + 5
+            out = b""
+            while time.time() < deadline:
+                b = socket.create_connection(("127.0.0.1", api.port), timeout=5)
+                b.sendall(head)                  # headers only: the server must not wait for a body
+                out = b""
+                while True:
+                    chunk = b.recv(65536)
+                    if not chunk:
+                        break
+                    out += chunk
+                b.close()
+                if b" 503 " in out.split(b"\r\n")[0]:
+                    break
+                time.sleep(0.05)
+            self.assertIn(b" 503 ", out.split(b"\r\n")[0], out[:200])
+            self.assertIn(b"Retry-After: 2", out)
+            a.sendall(PDF[4:])
+            resp = b""
+            while True:
+                chunk = a.recv(65536)
+                if not chunk:
+                    break
+                resp += chunk
+            a.close()
+            self.assertIn(b" 201 ", resp.split(b"\r\n")[0])
+            self.assertEqual(jreq(api, "POST", "/jobs", PDF,
+                                  {"Content-Type": "application/pdf", "X-Fax-To": "000"})[0], 201)
+        finally:
+            api.shutdown()
+
+    def test_web_page_handles_cancelled_and_reconnect(self):
+        from faxd import api as api_mod
+        with open(api_mod._WEB, encoding="utf-8") as f:
+            html = f.read()
+        self.assertIn('cancelled: "gray"', html)
+        self.assertIn("reloadOnOpen", html)
 
 
 if __name__ == "__main__":

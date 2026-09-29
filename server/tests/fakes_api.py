@@ -10,8 +10,9 @@ class FakeRegistry:
         self.events = dict(events or {})
         self.list_calls = []
 
-    def list_jobs(self, direction=None, states=None, limit=100, since=None):
-        self.list_calls.append(dict(direction=direction, states=states, limit=limit, since=since))
+    def list_jobs(self, direction=None, states=None, limit=100, since=None, updated_since=None):
+        self.list_calls.append(dict(direction=direction, states=states, limit=limit, since=since,
+                                    updated_since=updated_since))
         out = [j for j in self.jobs.values()
                if (direction is None or j.get("direction") == direction)
                and (not states or j.get("state") in states)]
@@ -22,6 +23,17 @@ class FakeRegistry:
 
     def job_events(self, job_id):
         return list(self.events.get(job_id, []))
+
+    def find_by_client_key(self, key):
+        return None
+
+    def last_event_id(self, job_id):
+        evs = self.events.get(job_id) or []
+        return evs[-1]["id"] if evs else None
+
+    def job_events_since(self, rowid, limit=500):
+        evs = sorted((e for es in self.events.values() for e in es), key=lambda e: e["id"])
+        return [e for e in evs if e["id"] > rowid][:limit]
 
 
 class FakeBus:

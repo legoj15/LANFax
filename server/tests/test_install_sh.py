@@ -45,5 +45,28 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
 
+    def test_rollback_and_smoke_import(self):
+        s = read(SH)
+        self.assertIn("cp -a /opt/faxd/faxd /opt/faxd/faxd.prev", s)
+        i_prev = s.index("faxd.prev")
+        i_sync = s.index("rsync -a --delete")
+        i_smoke = s.index('import faxd.main')
+        i_restart = s.index("systemctl restart faxd")
+        self.assertLess(i_prev, i_sync)
+        self.assertLess(i_sync, i_smoke)
+        self.assertLess(i_smoke, i_restart)
+        self.assertIn("PYTHONPATH=/opt/faxd", s[i_smoke - 200:i_smoke])
+        tail = s[i_restart:]
+        self.assertIn("rollback", tail)
+        self.assertIn("faxd.prev", tail)
+        self.assertIn("exit 1", tail)
+
+    def test_unit_start_limits(self):
+        u = read(os.path.join(SERVER, "faxd.service"))
+        unit = u.split("[Service]")[0]
+        self.assertIn("StartLimitIntervalSec=120", unit)
+        self.assertIn("StartLimitBurst=5", unit)
+
+
 if __name__ == "__main__":
     unittest.main()

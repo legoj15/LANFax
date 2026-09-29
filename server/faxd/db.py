@@ -12,13 +12,14 @@ from .events import utcnow_iso
 
 log = logging.getLogger("faxd.db")
 
-JOB_STATES = ("queued", "converting", "dialing", "sending", "sent", "failed", "received")
-TERMINAL_STATES = ("sent", "failed", "received")
+JOB_STATES = ("queued", "converting", "dialing", "sending", "sent", "failed", "received",
+              "cancelled")
+TERMINAL_STATES = ("sent", "failed", "received", "cancelled")
 
 COLUMNS = (
     "id", "direction", "state", "filename", "to_number", "from_number", "subject",
     "origin", "client", "ast_jobid", "pages", "error", "pdf_path",
-    "created_at", "updated_at", "finished_at",
+    "created_at", "updated_at", "finished_at", "client_key",
 )
 
 _SCHEMA = """
@@ -38,7 +39,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     pdf_path TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    finished_at TEXT
+    finished_at TEXT,
+    client_key TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_filename ON jobs(filename);
 CREATE INDEX IF NOT EXISTS jobs_ast ON jobs(ast_jobid);
@@ -52,6 +54,16 @@ CREATE TABLE IF NOT EXISTS job_events (
 );
 CREATE INDEX IF NOT EXISTS job_events_job ON job_events(job_id);
 """
+
+# Run after the column migration: an existing db gains the columns first.
+_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_client_key ON jobs(client_key);
+CREATE INDEX IF NOT EXISTS jobs_updated ON jobs(updated_at);
+"""
+
+# Columns added after the first deployment: (name, type). SQLite cannot ADD a UNIQUE
+# column, so uniqueness comes from the jobs_client_key index (NULLs never collide).
+_ADDED_COLUMNS = (("client_key", "TEXT"),)
 
 _NOT_TERMINAL_SQL = "state NOT IN (%s)" % ",".join("?" * len(TERMINAL_STATES))
 
@@ -80,6 +92,12 @@ class Registry:
         db.execute("PRAGMA synchronous=NORMAL")
         db.execute("PRAGMA busy_timeout=30000")
         db.executescript(_SCHEMA)
+        have = {r["name"] for r in db.execute("PRAGMA table_info(jobs)")}
+        for name, typ in _ADDED_COLUMNS:
+            if name not in have:
+                db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {typ}")
+                log.info("migrated jobs table: added column %s", name)
+        db.executescript(_INDEXES)
         self._db: Optional[sqlite3.Connection] = db
 
     def _conn(self) -> sqlite3.Connection:
@@ -140,7 +158,8 @@ class Registry:
                      detail: Optional[str] = None) -> Optional[dict]:
         """set_state only when the current state is in `expected_states` (None = any).
 
-        Returns the new row, or None when the job is missing or in another state.
+        Returns the new row plus `event_id` (the job_events rowid of this transition, used
+        as the SSE event id), or None when the job is missing or in another state.
         Check and write happen in one transaction, so a concurrent `sent` wins.
         """
         if state not in JOB_STATES:
@@ -167,13 +186,17 @@ class Registry:
                     sets.append("finished_at=?")
                     vals.append(now)
                 conn.execute(f"UPDATE jobs SET {','.join(sets)} WHERE id=?", [*vals, job_id])
-                conn.execute("INSERT INTO job_events (job_id, ts, state, detail) VALUES (?,?,?,?)",
-                             (job_id, now, state, detail))
+                event_id = conn.execute(
+                    "INSERT INTO job_events (job_id, ts, state, detail) VALUES (?,?,?,?)",
+                    (job_id, now, state, detail)).lastrowid
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
-            return self.get_job(job_id)
+            row = self.get_job(job_id)
+        if row is not None:
+            row["event_id"] = event_id
+        return row
 
     def find_by_filename(self, filename: Optional[str]) -> Optional[dict]:
         """Newest row with this share filename, in any state."""
@@ -191,6 +214,12 @@ class Registry:
             f"SELECT * FROM jobs WHERE filename=? AND {_NOT_TERMINAL_SQL} "
             "ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (filename, *TERMINAL_STATES))
+
+    def find_by_client_key(self, client_key: Optional[str]) -> Optional[dict]:
+        """The row created with this Idempotency-Key, if any."""
+        if not client_key:
+            return None
+        return self._one("SELECT * FROM jobs WHERE client_key=?", (client_key,))
 
     def find_by_ast_jobid(self, ast_jobid: Optional[str]) -> Optional[dict]:
         if not ast_jobid:
@@ -210,8 +239,12 @@ class Registry:
 
     def list_jobs(self, *, direction: Optional[str] = None,
                   states: Optional[Iterable[str]] = None, limit: int = 100,
-                  since: Optional[str] = None) -> list[dict]:
-        """Newest first. `states=[]` matches nothing; None means any."""
+                  since: Optional[str] = None,
+                  updated_since: Optional[str] = None) -> list[dict]:
+        """Newest first. `states=[]` matches nothing; None means any.
+
+        `since` filters on created_at, `updated_since` on updated_at (both inclusive,
+        ISO-8601 UTC strings compared as text)."""
         where: list[str] = []
         vals: list[Any] = []
         if direction:
@@ -226,6 +259,9 @@ class Registry:
         if since:
             where.append("created_at>=?")
             vals.append(since)
+        if updated_since:
+            where.append("updated_at>=?")
+            vals.append(updated_since)
         sql = "SELECT * FROM jobs"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -238,6 +274,21 @@ class Registry:
         with self._lock:
             rows = self._conn().execute(
                 "SELECT * FROM job_events WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def last_event_id(self, job_id: str) -> Optional[int]:
+        """Rowid of the job's newest job_events row (None if it has none)."""
+        with self._lock:
+            r = self._conn().execute("SELECT MAX(id) AS m FROM job_events WHERE job_id=?",
+                                     (job_id,)).fetchone()
+        return r["m"] if r is not None else None
+
+    def job_events_since(self, rowid: int, limit: int = 500) -> list[dict]:
+        """job_events rows with id > rowid, oldest first (SSE Last-Event-ID replay)."""
+        with self._lock:
+            rows = self._conn().execute(
+                "SELECT * FROM job_events WHERE id>? ORDER BY id LIMIT ?",
+                (int(rowid), int(limit))).fetchall()
         return [dict(r) for r in rows]
 
     def close(self) -> None:

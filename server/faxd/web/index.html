@@ -141,7 +141,7 @@ function fmtTime(s) {
   const d = new Date(s);
   return isNaN(d) ? esc(s) : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
-const BADGE = { queued: "amber", converting: "amber", dialing: "amber", sending: "amber", sent: "green", failed: "red", received: "blue" };
+const BADGE = { queued: "amber", converting: "amber", dialing: "amber", sending: "amber", sent: "green", failed: "red", received: "blue", cancelled: "gray" };
 function badge(st) { return '<span class="badge b-' + (BADGE[st] || "gray") + '">' + esc(st) + "</span>"; }
 function pdfLink(j) { return j.pdf_path ? '<a class="lnk" data-pdf="' + esc(j.id) + '">open</a>' : ""; }
 
@@ -207,7 +207,14 @@ function connectEvents() {
     setPill("bad", "reconnecting");
     if (es.readyState === 2) { es.close(); es = null; setTimeout(start, 5000); }   // closed for good (e.g. 401)
   };
-  es.onopen = () => setPill("ok", "connected");
+  // EventSource reconnects by itself and sends Last-Event-ID (the server replays missed job
+  // events); reloading the tables on every re-open also covers anything older than that.
+  let reloadOnOpen = false;
+  es.onopen = () => {
+    setPill("ok", "connected");
+    if (reloadOnOpen) { loadJobs(); loadInbox(); }
+    reloadOnOpen = true;
+  };
 }
 
 async function openPdf(id) {

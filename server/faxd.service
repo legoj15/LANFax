@@ -2,6 +2,9 @@
 Description=LANFax daemon (API, spool observer, AMI progress)
 After=network-online.target asterisk.service
 Wants=network-online.target
+# a crash loop stops after 5 starts in 120 s instead of restarting forever
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple

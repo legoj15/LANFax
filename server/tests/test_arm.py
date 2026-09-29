@@ -116,5 +116,19 @@ class ArmTests(unittest.TestCase):
         self.assertEqual(self.bus.events, [])
 
 
+    def test_runner_timeout_and_spawn_errors_are_arm_errors(self):
+        import subprocess
+
+        def timeout(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, 20)
+
+        def missing(argv, **kw):
+            raise FileNotFoundError("sudo")
+        for runner in (timeout, missing):
+            with self.assertRaises(ArmError):
+                ArmController(self.cfg, self.bus, runner).arm(5, "x")
+        self.assertEqual(self.bus.events, [])
+
+
 if __name__ == "__main__":
     unittest.main()

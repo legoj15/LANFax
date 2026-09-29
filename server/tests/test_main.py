@@ -209,5 +209,12 @@ class E2ETests(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
+    def test_stop_leaves_registry_usable_for_straggling_requests(self):
+        self.stopped = True
+        self.d.stop()
+        self.addCleanup(self.d.reg.close)
+        self.assertEqual(self.d.reg.list_jobs(), [])   # a late request thread must not hit a closed db
+
+
 if __name__ == "__main__":
     unittest.main()

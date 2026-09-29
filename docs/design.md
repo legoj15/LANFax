@@ -1,6 +1,6 @@
 # LANFax design assessment (2026-09-29)
 
-Status: proposal, not started. Written after surveying the live server.
+Status: phase 1 (faxd) is deployed; progress is in `handoff.md`. Written after surveying the live server.
 
 ## What exists today (server `faxserver`, 192.0.2.10)
 
@@ -72,14 +72,20 @@ receipts.
 - **Arming**: same AstDB key, exposed as arm/disarm/extend with a countdown.
 - **HTTP API** (single port, e.g. 8080, LAN + VPN, bearer token from
   `/etc/faxserver/settings.env`):
+  The implemented contract is `faxd-spec.md` (api.py section); this is the outline.
   - `GET /status` registrations, arm state, queue depth, daemon health
-  - `POST /jobs` multipart: pdf, to, subject, cover(bool) -> job id
-  - `GET /jobs`, `GET /jobs/{id}`, `GET /jobs/{id}/pdf`
-  - `GET /inbox`, `GET /inbox/{id}/pdf`
+  - `POST /jobs` raw PDF body (`Content-Type: application/pdf`), headers
+    `X-Fax-To` (required), `X-Fax-Subject`, `Idempotency-Key` -> job
+    (201; 200 with the original job when the key repeats). Cover pages are v2.
+  - `GET /jobs` (`direction`, `state`, `since`, `updated_since`, `limit`),
+    `GET /jobs/{id}`, `GET /jobs/{id}/pdf`
+  - `GET /inbox`: inbound faxes are job rows with direction `in`, so their
+    PDFs are `GET /jobs/{id}/pdf` too (there is no `/inbox/{id}/pdf`)
   - `POST /arm {minutes}`, `POST /disarm`
   - `POST /test/send {to}` canned test page to a number
-  - `POST /test/receive {minutes}` arm and return a watch token
-  - `GET /events` server-sent events: job state changes, fax received, arm changes
+  - `POST /test/receive {minutes}` arm for a test window, returns the arm state
+  - `GET /events` server-sent events: job state changes, fax received, arm
+    changes; event ids plus `Last-Event-ID` replay for reconnecting clients
 - **Web page** served by the same daemon: status, arm buttons, inbox, send
   test. Works from a phone over VPN, which the SMB share never could. Likely
   higher value than the Windows client for the *monitoring* half.
@@ -95,8 +101,8 @@ receipts.
   path port. Install is two PowerShell cmdlets (`Add-PrinterPort`,
   `Add-Printer`); no driver signing, no port monitor DLL.
 - **Print flow**: tray app watches the spool path; new file -> dialog for
-  number, subject, "send test page instead" -> `POST /jobs` -> toast on
-  sent/failed.
+  number, subject, "send test page instead" -> `POST /jobs` (raw PDF body,
+  `Idempotency-Key` so a retry never sends twice) -> toast on sent/failed.
 - **Monitor**: window with status, arm countdown + arm/disarm buttons, jobs
   (sending/sent/failed) and inbox with open-in-viewer, "Send a test" and
   "Receive a test (arm 20 min)" buttons. Subscribes to `/events`.

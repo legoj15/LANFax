@@ -16,10 +16,15 @@ def wait_until(pred, timeout=3.0):
 
 
 def dbget(p):
+    # the framing observed on the real server (Asterisk 20.6, 2026-09-29)
     if p.get("Key") == "here":
-        return [{"Response": "Success", "Message": "Result will follow"},
+        return [{"Response": "Success", "EventList": "start", "Message": "Result will follow"},
                 {"Event": "DBGetResponse", "Family": p["Family"], "Key": "here", "Val": "hello"},
-                {"Event": "DBGetComplete", "EventList": "Complete"}]
+                {"Event": "DBGetComplete", "EventList": "Complete", "ListItems": "1"}]
+    if p.get("Key") == "bare":
+        # variant without EventList framing: one DBGetResponse and nothing after it
+        return [{"Response": "Success", "Message": "Result will follow"},
+                {"Event": "DBGetResponse", "Family": p["Family"], "Key": "bare", "Val": "solo"}]
     return [{"Response": "Error", "Message": "Database entry not found"}]
 
 
@@ -77,6 +82,10 @@ class TestClient(ClientBase):
     def test_db(self):
         self.up()
         self.assertEqual(self.client.db_get("fax", "here"), "hello")
+        t0 = time.monotonic()
+        self.assertEqual(self.client.db_get("fax", "bare"), "solo")   # no Complete marker: no wait
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertEqual(self.client.db_get("fax", "here"), "hello")   # stream still in sync
         self.assertIsNone(self.client.db_get("fax", "gone"))
         self.assertTrue(self.client.db_put("fax", "k", "v"))
         self.assertTrue(self.client.db_del("fax", "k"))
@@ -267,6 +276,13 @@ class TestProgress(unittest.TestCase):
         self.p.handle({"Event": "FAXStatus", "Uniqueid": "u1", "Operation": "send", "Status": "late"})
         self.p.handle({"Event": "SendFAX", "Uniqueid": "u1", "PagesTransferred": "1"})
         self.assertEqual(self.reg.jobs["lf1"]["state"], "sent")
+        self.assertEqual(self.reg.calls, [("lf1", "dialing", None, None)])
+
+    def test_cancelled_row_not_annotated(self):
+        self.reg.add("lf1", "j1")
+        self.p.handle(varset("u1", "j1"))
+        self.reg.jobs["lf1"]["state"] = "cancelled"
+        self.p.handle({"Event": "SendFAX", "Uniqueid": "u1", "PagesTransferred": "1"})
         self.assertEqual(self.reg.calls, [("lf1", "dialing", None, None)])
 
     def test_reset_clears_maps(self):

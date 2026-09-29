@@ -88,9 +88,9 @@ class Daemon:
         self.progress = AmiProgress(self.reg, self.bus, self.ami)
         self.status_fn = build_status_fn(cfg, self.reg, self.ami)
 
-        def enqueue(pdf, to, *, subject="", origin="api", client=""):
-            return enqueue_pdf(cfg, self.reg, self.bus, pdf, to,
-                               subject=subject, origin=origin, client=client)
+        def enqueue(pdf, to, *, subject="", origin="api", client="", client_key=None):
+            return enqueue_pdf(cfg, self.reg, self.bus, pdf, to, subject=subject,
+                               origin=origin, client=client, client_key=client_key)
 
         self.api = Api(cfg, self.reg, self.bus, self.arm, self.status_fn, enqueue, make_test_pdf)
         self.port = self.api.port
@@ -128,7 +128,8 @@ class Daemon:
         self.api.shutdown()
         for t in self._threads:
             t.join(2.0)
-        self.reg.close()
+        # The Registry stays open: HTTP request threads are daemon threads that may still be
+        # finishing, and the process exits right after stop() anyway.
 
 
 def _setup_logging() -> None:

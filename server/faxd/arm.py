@@ -66,7 +66,14 @@ class ArmController:
 
     def _run(self, arg: str, origin: str) -> dict:
         argv = ["sudo", "-n", self.cfg.arm_script, arg, sanitize_origin(origin)]
-        res = self.runner(argv, capture_output=True, text=True, timeout=20)
+        try:
+            res = self.runner(argv, capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            log.warning("arm script timed out")
+            raise ArmError("arm script timed out after 20 s") from None
+        except (subprocess.SubprocessError, OSError) as e:
+            log.warning("arm script could not run: %s", e)
+            raise ArmError("arm script could not run: %s" % e) from None
         if res.returncode != 0:
             msg = (res.stderr or res.stdout or "").strip() or f"exit {res.returncode}"
             log.warning("arm script failed: %s", msg)

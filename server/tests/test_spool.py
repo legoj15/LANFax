@@ -481,5 +481,56 @@ class SpoolTests(unittest.TestCase):
         self.assertEqual(len(self.reg.list_jobs()), 1)
 
 
+    # ---- follow-up review items -----------------------------------------
+    def test_19_stale_view_never_regresses_sending(self):
+        name = self._queue()
+        real = self.reg.find_active_by_filename("9543216309_hello.pdf")
+        self.reg.set_state(real["id"], "sending")          # AMI moved it meanwhile
+        stale = dict(real, state="queued")
+        self.reg.find_active_by_filename = lambda fn: dict(stale) if fn == name else None
+        self.reg.find_by_ast_jobid = lambda j: None
+        _write(os.path.join(self.cfg.outqueue, "j20260929-113512-1.env"),
+               "JOBID=j20260929-113512-1\nTO=19543216309\n"
+               f"SRCFILE={self.cfg.sending}/{name}\n")
+        os.replace(os.path.join(self.cfg.outbox, name), os.path.join(self.cfg.sending, name))
+        self.events()
+        self.obs.scan_once()
+        row = self.reg.get_job(real["id"])
+        self.assertEqual(row["state"], "sending")
+        self.assertEqual([e["state"] for e in self.reg.job_events(real["id"])], ["queued", "sending"])
+        self.assertNotIn(("job", "dialing"), self.job_events())
+
+    def test_20_marker_does_not_fail_a_cancelled_row(self):
+        name = self._queue()
+        row = self.reg.find_active_by_filename(name)
+        self.reg.find_active_by_filename = lambda fn: dict(row) if fn == name else None
+        self.reg.set_state(row["id"], "cancelled")
+        _write(os.path.join(self.cfg.failed, "invalid-number-" + name))
+        self.obs.scan_once()
+        self.assertEqual(self.reg.get_job(row["id"])["state"], "cancelled")
+
+    def test_21_queue_meta_restores_api_identity_on_rebuild(self):
+        from faxd.enqueue import enqueue_pdf
+        self.cfg.allowed_numbers = "nanp,000,ext"
+        job = enqueue_pdf(self.cfg, self.reg, self.bus, b"%PDF-1.4", "9543216309",
+                          subject="Quarterly report", client="10.0.0.5", client_key="tray:1")
+        self.reg.close()
+        os.remove(self.cfg.db_path)
+        self.reg = Registry(self.cfg.db_path)
+        self.obs = SpoolObserver(self.cfg, self.reg, self.bus)
+        self.obs.scan_once()
+        row = self.only()
+        self.assertEqual(row["id"], job["id"])
+        self.assertEqual((row["subject"], row["origin"], row["client"], row["client_key"]),
+                         ("Quarterly report", "api", "10.0.0.5", "tray:1"))
+        self.assertEqual(row["created_at"], job["created_at"])
+        self.assertEqual(row["state"], "queued")
+
+    def test_22_no_digits_means_no_number(self):
+        _write(os.path.join(self.cfg.outbox, "report.pdf"))
+        self.obs.scan_once()
+        self.assertIsNone(self.only()["to_number"])
+
+
 if __name__ == "__main__":
     unittest.main()

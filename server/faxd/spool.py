@@ -4,6 +4,7 @@ Never writes, moves or deletes anything under the share or the outqueue.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -24,6 +25,7 @@ _OUTBOX_EXTS = (".pdf", ".tif", ".tiff")
 _INBOX_RE = re.compile(r"^fax_(\d{8}-\d{6})_from_(.+)\.pdf$", re.IGNORECASE)
 _RECV_FAIL_RE = re.compile(r"^recv_(\d{8}-\d{6})_from_(.+)\.txt$", re.IGNORECASE)
 _JOBID_RE = re.compile(r"^j\d{8}-\d{6}-")
+_API_ID_RE = re.compile(r"^lf[0-9a-f]{12}$")
 _ACTIVE = ("queued", "converting", "dialing", "sending")
 _STAMP = "%Y%m%d-%H%M%S"
 
@@ -132,35 +134,71 @@ class SpoolObserver:
         self._warned: set[str] = set()                        # ambiguous receipts already logged
 
     # ---- helpers ------------------------------------------------------
+    def _queue_meta(self, filename: Optional[str]) -> dict[str, Any]:
+        """Identity of an API job from queue-meta/<filename>.json (written by enqueue), so a
+        rebuilt registry keeps the original id, subject, origin, client and client_key.
+        Empty when there is no meta file or its id/key is already taken by another row."""
+        if not filename:
+            return {}
+        path = os.path.join(self.cfg.queue_meta, filename + ".json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                meta = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as e:
+            log.warning("unreadable queue-meta %s: %s", path, e)
+            return {}
+        mid = meta.get("id") if isinstance(meta, dict) else None
+        if not isinstance(mid, str) or not _API_ID_RE.match(mid) or self.reg.get_job(mid):
+            return {}
+        out: dict[str, Any] = {"id": mid}
+        for key in ("subject", "origin", "client", "client_key", "created_at"):
+            if isinstance(meta.get(key), str) and meta[key]:
+                out[key] = meta[key]
+        if out.get("client_key") and self.reg.find_by_client_key(out["client_key"]):
+            del out["client_key"]
+        return out
+
     def _create(self, fields: dict[str, Any]) -> dict:
-        """Insert a row, log its first state, publish `job`."""
-        row = self.reg.upsert_job({"id": new_id(fields.pop("_prefix")), **fields})
-        row = self.reg.set_state(row["id"], row["state"]) or row
+        """Insert a row, log its first state, publish `job`. An outbound share row whose
+        file has queue-meta takes its API identity (id, subject, ...) from it."""
+        prefix = fields.pop("_prefix")
+        meta = self._queue_meta(fields.get("filename")) if prefix == "sh" else {}
+        row = self.reg.upsert_job({"id": new_id(prefix), **fields, **meta})
+        row = self.reg.set_state_if(row["id"], (row["state"],), row["state"]) or row
         self.bus.publish("job", **row)
         return row
 
-    def _apply(self, row: dict, state: Optional[str] = None, *, pages: Optional[int] = None,
+    def _apply(self, row: dict, state: Optional[str] = None, *,
+               expected: tuple[str, ...] = _ACTIVE, pages: Optional[int] = None,
                error: Optional[str] = None, **fields: Any) -> dict:
-        """Apply only the differences; publish `job` once if anything changed."""
+        """Apply only the differences; publish `job` once if anything changed.
+
+        A state change is conditional on the row still being in one of `expected` (the
+        observer's `row` may be stale: AMI moves rows concurrently). If it moved on,
+        nothing at all is written and the current row is returned.
+        """
         changed = False
+        event_id = None
+        if state is not None and row["state"] != state:
+            new = self.reg.set_state_if(row["id"], expected, state, pages=pages, error=error)
+            if new is None:
+                log.debug("job %s already moved on; not setting %s", row["id"], state)
+                return self.reg.get_job(row["id"]) or row
+            row, changed, event_id = new, True, new.get("event_id")
+            pages = error = None
         diff = {k: v for k, v in fields.items() if v is not None and row.get(k) != v}
+        if pages is not None and row.get("pages") != pages:
+            diff["pages"] = pages
+        if error is not None and row.get("error") != error:
+            diff["error"] = error
         if diff:
             row = self.reg.upsert_job({"id": row["id"], **diff})
             changed = True
-        if state is not None and row["state"] != state:
-            new = self.reg.set_state(row["id"], state, pages=pages, error=error)
-            row = new or row
-            changed = True
-        else:
-            extra = {}
-            if pages is not None and row.get("pages") != pages:
-                extra["pages"] = pages
-            if error is not None and row.get("error") != error:
-                extra["error"] = error
-            if extra:
-                row = self.reg.upsert_job({"id": row["id"], **extra})
-                changed = True
         if changed:
+            if event_id is not None:
+                row = dict(row, event_id=event_id)   # the SSE id of this transition
             self.bus.publish("job", **row)
         return row
 
@@ -179,7 +217,7 @@ class SpoolObserver:
             base = name.split("_", 1)[0] if "_" in name else os.path.splitext(name)[0]
             self._create({
                 "_prefix": "sh", "direction": "out", "state": "queued", "filename": name,
-                "to_number": _norm(base), "origin": "share", "pdf_path": path,
+                "to_number": _norm(base) or None, "origin": "share", "pdf_path": path,
             })
 
     def _rule_env(self) -> None:
@@ -211,7 +249,8 @@ class SpoolObserver:
             sending = os.path.join(self.cfg.sending, filename) if filename else None
             # SELFTEST.env duplicates the pipeline's own <jobid>.env; never let it steal the id
             ast = None if selftest and row.get("ast_jobid") else jobid
-            self._apply(row, state, ast_jobid=ast, to_number=to or None,
+            self._apply(row, state, expected=("queued", "converting"), ast_jobid=ast,
+                        to_number=to or None,
                         pdf_path=sending if sending and _isfile(sending) else None)
 
     def _rule_sending(self) -> None:
@@ -220,7 +259,8 @@ class SpoolObserver:
             row = self.reg.find_active_by_filename(name)
             if row is None or not _isfile(path):
                 continue
-            self._apply(row, "dialing" if row["state"] == "queued" else None, pdf_path=path)
+            self._apply(row, "dialing" if row["state"] == "queued" else None,
+                        expected=("queued",), pdf_path=path)
 
     def _rule_receipts(self, ls: dict[str, list[str]]) -> None:
         live: set[str] = set()
@@ -274,12 +314,12 @@ class SpoolObserver:
         keep_ast = selftest or (row["state"] in TERMINAL_STATES and row.get("ast_jobid"))
         ast = None if keep_ast else jobid
         if target == "sent":
-            row = self._apply(row, "sent", pages=_to_int(rec.get("pages")), ast_jobid=ast,
-                              pdf_path=pdf)
+            row = self._apply(row, "sent", expected=_ACTIVE, pages=_to_int(rec.get("pages")),
+                              ast_jobid=ast, pdf_path=pdf)
         else:
             err = rec.get("error") or rec.get("status") or "failed"
-            row = self._apply(row, "failed", pages=_to_int(rec.get("pages")), error=err,
-                              ast_jobid=ast, pdf_path=pdf)
+            row = self._apply(row, "failed", expected=_ACTIVE, pages=_to_int(rec.get("pages")),
+                              error=err, ast_jobid=ast, pdf_path=pdf)
         return row["state"] in TERMINAL_STATES
 
     def _selftest_row(self, receipt_path: str) -> Optional[dict]:
@@ -347,7 +387,7 @@ class SpoolObserver:
                     continue
                 row = self.reg.find_active_by_filename(orig)
                 if row is not None:
-                    self._apply(row, "failed", error=msg, pdf_path=path)
+                    self._apply(row, "failed", expected=_ACTIVE, error=msg, pdf_path=path)
                     continue
                 last = self.reg.find_by_filename(orig)
                 if last is not None:
