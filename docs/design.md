@@ -62,7 +62,7 @@ Owns the state that today is scattered across filenames, AstDB and `.txt`
 receipts.
 
 - **Job registry**: sqlite at `/var/lib/faxd/faxd.db`. States:
-  `queued -> converting -> dialing -> sending(page n/m) -> sent | failed`.
+  `queued -> dialing -> sending(page n/m) -> sent | failed | cancelled` (phase 4 adds `converting` once faxd does the conversion itself).
   Inbound faxes are rows too (`received`).
 - **Ingress**: HTTP API and the existing outbox folder both call the same
   enqueue function. The SMB drop-a-file path stays as the zero-client fallback.
