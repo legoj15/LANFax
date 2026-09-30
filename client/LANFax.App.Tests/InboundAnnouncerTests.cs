@@ -94,10 +94,24 @@ public sealed class InboundAnnouncerTests : IDisposable
     }
 
     [Fact]
-    public void A_live_fax_before_the_first_catch_up_does_not_end_the_baseline()
+    public void A_live_fax_ends_the_baseline()
     {
+        // The balloon showed and LastSeen moved to it: a later catch-up from there is news, even after a restart
+        // (a baseline then would silently swallow faxes received while the app was down).
         var a = new InboundAnnouncer(State);
         Assert.True(a.TryAnnounce(In("live", 5)));
+        Assert.False(a.NeedsBaseline);
+        Assert.NotNull(a.BaselineAt);
+        var b = new InboundAnnouncer(State);
+        Assert.False(b.NeedsBaseline);
+        Assert.Equal(new[] { "later" }, b.Absorb([In("live", 5), In("later", 9)], asBaseline: b.NeedsBaseline).Select(j => j.Id));
+    }
+
+    [Fact]
+    public void A_live_event_that_is_not_announced_leaves_the_baseline_pending()
+    {
+        var a = new InboundAnnouncer(State);
+        Assert.False(a.TryAnnounce(In("lf1", 5, "sent", "out")));
         Assert.True(a.NeedsBaseline);
     }
 
@@ -243,6 +257,26 @@ public sealed class InboundAnnouncerTests : IDisposable
     }
 
     [Fact]
+    public async Task A_queued_reconnect_with_nothing_seen_yet_wins_over_a_queued_resync()
+    {
+        // No fax seen yet: "since the newest seen" means everything, which reaches further back than any resync time.
+        var inbox = new FakeInbox();
+        var a = Established();
+        Assert.Null(a.LastSeen);
+        var release = new TaskCompletionSource();
+        inbox.Gate = () => release.Task;
+        var c = new InboundCatchUp(a, inbox.Fetch, _ => { });
+        var first = c.RunAsync(null);
+        _ = c.RunAsync(T0);
+        _ = c.RunAsync(null);
+        inbox.Gate = null;
+        release.SetResult();
+        await first;
+        Assert.Equal(2, inbox.Calls.Count);
+        Assert.Null(inbox.Calls[1].Since);
+    }
+
+    [Fact]
     public async Task A_failed_catch_up_is_reported_and_leaves_the_baseline_pending()
     {
         var a = new InboundAnnouncer(State);
@@ -311,6 +345,42 @@ public class InstanceGuardTests
             Assert.Equal(InstanceRole.ShowRunningHere, role);
             Assert.Equal(3, tries);
         }
+    }
+
+    [Fact]
+    public void A_second_start_during_the_owners_shutdown_becomes_the_owner()
+    {
+        // The owner's signal is already gone and its mutex is released on the third try: the second start takes the
+        // mutex inside its patience instead of exiting with "another session".
+        int owns = 0, sleeps = 0;
+        var role = InstanceGuard.Resolve(tryOwn: () => ++owns == 3, trySignal: () => false,
+            patience: TimeSpan.FromSeconds(2), sleep: _ => sleeps++);
+        Assert.Equal(InstanceRole.Run, role);
+        Assert.Equal(3, owns);
+        Assert.Equal(2, sleeps);
+    }
+
+    [Fact]
+    public void A_mutex_that_stays_owned_elsewhere_is_another_session_after_the_patience()
+    {
+        int owns = 0;
+        var slept = TimeSpan.Zero;
+        var role = InstanceGuard.Resolve(tryOwn: () => { owns++; return false; }, trySignal: () => false,
+            patience: TimeSpan.FromSeconds(2), sleep: d => slept += d);
+        Assert.Equal(InstanceRole.RunningInAnotherSession, role);
+        Assert.True(owns > 1);
+        Assert.Equal(TimeSpan.FromSeconds(2), slept);
+    }
+
+    [Fact]
+    public void A_mutex_released_by_its_owner_is_taken_by_the_next_acquire()
+    {
+        var (m, e) = Names();
+        var owner = InstanceGuard.Acquire(m, e, TimeSpan.Zero);
+        Assert.Equal(InstanceRole.Run, owner.Role);
+        owner.Dispose();
+        using var next = InstanceGuard.Acquire(m, e, TimeSpan.Zero);
+        Assert.Equal(InstanceRole.Run, next.Role);
     }
 
     [Fact]

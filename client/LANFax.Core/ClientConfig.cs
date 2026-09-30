@@ -152,8 +152,9 @@ public sealed class ClientConfig
 
     /// <summary>
     /// The user's own <c>token.bin</c> first; when it is missing or does not decrypt for this user, a machine-scope
-    /// token still in the shared file (older versions) is migrated into it. The shared token is removed only once a
-    /// token decrypted here AND sits in this user's file: an undecryptable user file never costs the only copy.
+    /// token still in the shared file (older versions) is migrated into it; so is one whose token cannot be sent
+    /// (<see cref="TokenError"/>). The shared token is removed only once a usable token decrypted here AND sits in
+    /// this user's file: an undecryptable or unusable user file never costs the only copy.
     /// </summary>
     private void LoadToken(string path, FileModel? m, string tokenPath, List<string> errors)
     {
@@ -168,7 +169,13 @@ public sealed class ClientConfig
         string? userError = null;
         if (userBlob != null)
         {
-            try { token = Encoding.UTF8.GetString(Dpapi.Unprotect(userBlob)); inUserFile = true; }
+            try
+            {
+                var own = Encoding.UTF8.GetString(Dpapi.Unprotect(userBlob)).Trim();
+                // A token that cannot be sent is no better than none: fall through to the shared file's, if any.
+                if (TokenError(own) is { } bad) userError = $"the saved token cannot be used ({bad}); enter it again in Settings";
+                else { token = own; inUserFile = true; }
+            }
             catch (CryptographicException)
             {
                 userError = "the saved token could not be decrypted for this Windows user; enter it again in Settings";
@@ -195,7 +202,7 @@ public sealed class ClientConfig
             else Token = token.Length == 0 ? null : token;
         }
         // Once this user's own file holds a working token, the shared file must not keep one any local user could decrypt.
-        if (token != null && inUserFile && m is { Token.Length: > 0 })
+        if (token != null && inUserFile && TokenError(token) == null && m is { Token.Length: > 0 })
         {
             m.Token = null;
             try { WriteShared(path, m); }

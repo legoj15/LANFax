@@ -226,6 +226,33 @@ public class ConfigHardeningTests : IDisposable
     }
 
     [Fact]
+    public void An_unusable_user_token_falls_back_to_migrating_the_shared_token()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(Tok)!);
+        File.WriteAllBytes(Tok, Dpapi.Protect(Encoding.UTF8.GetBytes("two words"), DpapiScope.CurrentUser));
+        var blob = Convert.ToBase64String(Dpapi.Protect(Encoding.UTF8.GetBytes("machine-token"), DpapiScope.LocalMachine));
+        Write($"{{\"server\":\"h\",\"token\":\"{blob}\"}}");
+        var c = ClientConfig.Load(Cfg, Tok);
+        Assert.Equal("machine-token", c.Token);
+        Assert.Null(c.LoadError);
+        Assert.DoesNotContain(blob, File.ReadAllText(Cfg));
+        Assert.Equal("machine-token", ClientConfig.Load(Cfg, Tok).Token); // now from the rewritten user file
+    }
+
+    [Fact]
+    public void An_unusable_user_token_never_removes_the_shared_token()
+    {
+        // The user file decrypts but cannot be sent, and the shared token is unreadable: the shared copy stays.
+        Directory.CreateDirectory(Path.GetDirectoryName(Tok)!);
+        File.WriteAllBytes(Tok, Dpapi.Protect(Encoding.UTF8.GetBytes("two words"), DpapiScope.CurrentUser));
+        Write("{\"server\":\"h\",\"token\":\"AAAAAAAA\"}");
+        var c = ClientConfig.Load(Cfg, Tok);
+        Assert.Null(c.Token);
+        Assert.Contains(ClientConfig.TokenRule, c.LoadError);
+        Assert.Contains("AAAAAAAA", File.ReadAllText(Cfg));
+    }
+
+    [Fact]
     public void A_shared_token_is_kept_when_the_user_copy_cannot_be_written()
     {
         // tokenPath's directory is a file, so the user copy cannot be written: the token is only in memory.

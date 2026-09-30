@@ -42,7 +42,8 @@ public sealed class InboundAnnouncer
     public DateTimeOffset? LastSeen { get; private set; }
 
     /// <summary>
-    /// True until a catch-up has completed once: that one's list is the inbox as it stood, not news. Read it before
+    /// True until a catch-up has completed once or a live fax was announced: that first catch-up's list is the inbox as
+    /// it stood, not news. Read it before
     /// the catch-up request goes out (see <see cref="InboundCatchUp"/>), so a live fax meanwhile cannot change it.
     /// </summary>
     public bool NeedsBaseline { get; private set; } = true;
@@ -57,11 +58,20 @@ public sealed class InboundAnnouncer
 
     private static bool IsReceived(Job j) => j.Direction == "in" && j.State == "received";
 
-    /// <summary>A live <c>received</c> event: true when its balloon should show (not announced before).</summary>
+    /// <summary>
+    /// A live <c>received</c> event: true when its balloon should show (not announced before). An announced fax ends
+    /// the baseline: its balloon showed and <see cref="LastSeen"/> moved to it, so a later catch-up (even after a
+    /// restart) is news from there, not an inbox to swallow silently.
+    /// </summary>
     public bool TryAnnounce(Job j)
     {
         if (!IsReceived(j)) return false;
         bool fresh = Add(j);
+        if (fresh && NeedsBaseline)
+        {
+            NeedsBaseline = false;
+            BaselineAt = _now();
+        }
         Save();
         return fresh;
     }
@@ -175,8 +185,9 @@ public sealed class InboundCatchUp(InboundAnnouncer announcer, Func<DateTimeOffs
             while (_again)
             {
                 var next = _againSince;
-                // A plain reconnect merged with a resync: use whichever reaches further back.
-                if (next is { } s && _againDefault && announcer.LastSeen is { } seen && seen < s) next = null;
+                // A plain reconnect merged with a resync: use whichever reaches further back. No fax seen yet means
+                // the reconnect asks for everything, which always does.
+                if (next is { } s && _againDefault && (announcer.LastSeen is not { } seen || seen < s)) next = null;
                 _again = false; _againDefault = false; _againSince = null;
                 await RunOnceAsync(next);
             }

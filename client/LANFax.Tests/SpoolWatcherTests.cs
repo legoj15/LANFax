@@ -114,10 +114,11 @@ public class SpoolWatcherTests : IDisposable
     public async Task FileDeletedMidCheckIsTolerated()
     {
         using var w = Make();
+        w.MinAge = TimeSpan.FromSeconds(1); // its own wide window: a 250 ms stall must not let the file age out first
         w.Start();
         var src = Path.Combine(_dir, "print.pdf");
         File.WriteAllBytes(src, Pdf());
-        await Task.Delay(50); // inside the 200 ms age wait
+        await Task.Delay(50); // inside the 1 s age wait
         File.Delete(src);
         await Task.Delay(1000);
         Assert.Equal(0, Count);

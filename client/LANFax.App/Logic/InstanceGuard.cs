@@ -48,8 +48,9 @@ public static class InstanceGuard
     /// <summary>
     /// Takes the machine-wide mutex and, the moment it is owned, creates the per-session show signal, so a second start
     /// in this session finds it. A non-owner signals the owner, retrying for <paramref name="patience"/> to cover the
-    /// instant between the owner's mutex and its signal; only then is it "another session". Another user's mutex with
-    /// a DACL this user may not open is "not first" too, never a crash.
+    /// instant between the owner's mutex and its signal, and takes the mutex itself if the owner releases it meanwhile
+    /// (a start during the owner's shutdown); only then is it "another session". Another user's mutex with a DACL this
+    /// user may not open is "not first" too, never a crash.
     /// </summary>
     public static InstanceClaim Acquire(string mutexName, string showEventName, TimeSpan patience)
     {
@@ -57,18 +58,41 @@ public static class InstanceGuard
         bool first;
         try { mutex = new Mutex(true, mutexName, out first); }
         catch (UnauthorizedAccessException) { mutex = null; first = false; }
-        if (first) return new InstanceClaim(InstanceRole.Run, mutex, new EventWaitHandle(false, EventResetMode.AutoReset, showEventName));
+        if (first) return Owner(mutex, showEventName);
+        bool TryOwn()
+        {
+            try
+            {
+                mutex ??= new Mutex(false, mutexName);
+                try { return mutex.WaitOne(0); }
+                catch (AbandonedMutexException) { return true; } // the owner went without releasing it: ours now
+            }
+            catch (UnauthorizedAccessException) { return false; } // another user's mutex: not ours to take
+        }
+        var role = Resolve(TryOwn, () => TrySignal(showEventName), patience, Thread.Sleep);
+        if (role == InstanceRole.Run) return Owner(mutex, showEventName);
         mutex?.Dispose();
-        return new InstanceClaim(Resolve(false, () => TrySignal(showEventName), patience, Thread.Sleep), null, null);
+        return new InstanceClaim(role, null, null);
     }
 
+    private static InstanceClaim Owner(Mutex? mutex, string showEventName) =>
+        new(InstanceRole.Run, mutex, new EventWaitHandle(false, EventResetMode.AutoReset, showEventName));
+
     /// <summary><see cref="Decide"/>, giving the owner's signal up to <paramref name="patience"/> to appear.</summary>
-    public static InstanceRole Resolve(bool ownsMutex, Func<bool> trySignal, TimeSpan patience, Action<TimeSpan> sleep)
+    public static InstanceRole Resolve(bool ownsMutex, Func<bool> trySignal, TimeSpan patience, Action<TimeSpan> sleep) =>
+        ownsMutex ? InstanceRole.Run : Resolve(() => false, trySignal, patience, sleep);
+
+    /// <summary>
+    /// A start that did not get the mutex: within <paramref name="patience"/> it either signals the owner in this
+    /// session or, when the owner is shutting down and releases the mutex, takes it and becomes the owner. Only a
+    /// mutex still held elsewhere with no signal here at the end is "another session".
+    /// </summary>
+    public static InstanceRole Resolve(Func<bool> tryOwn, Func<bool> trySignal, TimeSpan patience, Action<TimeSpan> sleep)
     {
-        if (ownsMutex) return InstanceRole.Run;
         for (var waited = TimeSpan.Zero; ; waited += SignalRetry)
         {
             if (trySignal()) return InstanceRole.ShowRunningHere;
+            if (tryOwn()) return InstanceRole.Run;
             if (waited >= patience) return InstanceRole.RunningInAnotherSession;
             sleep(SignalRetry);
         }

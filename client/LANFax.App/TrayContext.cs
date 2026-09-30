@@ -194,10 +194,11 @@ internal sealed class TrayContext : ApplicationContext
         item.Text = OfferBook.MenuText(category, n);
     }
 
+    /// <summary>Opens every waiting offer of a menu category, each rebuilt from its record as it stands now.</summary>
     private void OpenOffers(OfferCategory category)
     {
         foreach (var r in _offers.TakeAll(category))
-            if (r.PdfPath == null || File.Exists(r.PdfPath)) EnqueueSend(r);
+            if (r.PdfPath == null || File.Exists(r.PdfPath)) EnqueueSend(_tracker.Reoffer(r));
     }
 
     private void UpdateConnectionState(bool connected)
@@ -307,7 +308,7 @@ internal sealed class TrayContext : ApplicationContext
     /// <summary>A balloon's click: opens the offer unless it was already opened (e.g. from the tray menu).</summary>
     private void OpenOffer(SendRequest req)
     {
-        if (_offers.Take(req.SpoolId) && req.PdfPath != null && File.Exists(req.PdfPath)) EnqueueSend(req);
+        if (_offers.Take(req.SpoolId) && req.PdfPath != null && File.Exists(req.PdfPath)) EnqueueSend(_tracker.Reoffer(req));
     }
 
     /// <summary>Fallback for missed events: asks the server about every job still waiting for a terminal state.</summary>
@@ -425,8 +426,10 @@ internal sealed class TrayContext : ApplicationContext
                     FileLog.Info($"send cancelled (spool {req.SpoolId}, attempts {s.Attempts})");
                     break;
                 case DialogOutcome.Kept when !_exiting:
-                    _offers.Add(OfferCategory.Unsent, req);
-                    FileLog.Info($"resumed send postponed (spool {req.SpoolId}); kept for the next start");
+                    // What the dialog learnt (lock, key, server pin) is in the record, not in the request it opened with.
+                    var again = _tracker.Reoffer(req, s);
+                    _offers.Add(OfferCategory.Unsent, again);
+                    FileLog.Info($"send postponed (spool {req.SpoolId}, offered again as {again.Kind}); kept for the next start");
                     break;
                 default:
                     FileLog.Info($"send dialog closed ({dlg.Outcome}, spool {req.SpoolId}); the document stays for the next start");

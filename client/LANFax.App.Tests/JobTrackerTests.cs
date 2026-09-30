@@ -174,6 +174,115 @@ public sealed class JobTrackerTests : IDisposable
         Assert.Equal("subj", req.Subject);
     }
 
+    // ---- re-offering a kept dialog (tray menu): the record, not the original request ----
+
+    static readonly Uri ServerA = new("http://10.0.0.5:9090/");
+    static readonly Uri ServerB = new("http://10.0.0.6:9090/");
+
+    [Fact]
+    public void Uncertain_in_this_run_then_cancel_reopens_locked_with_the_same_key_and_server()
+    {
+        var t = new JobTracker(_dir);
+        var (id, pdf) = Spooled();
+        var original = new SendRequest(id, pdf); // a fresh print job: kind New, no lock, no key, no server
+        var keys = 0;
+        var s = new SendSession(id, pdf, () => { keys++; return Guid.NewGuid(); });
+        var p = s.Build("5552345678", "subj", false, false);
+        t.BeginSend(p, ServerA); s.Started(p, ServerA); s.Failed(AttemptOutcome.Uncertain); t.RecordFailure(s, p);
+        Assert.True(s.CancelKeepsDocumentFor(original.Kind)); // Cancel -> Kept
+
+        var again = t.Reoffer(original, s);
+        Assert.Equal(SendKind.Resume, again.Kind);
+        Assert.Equal(p, again.LockedPlan);
+        Assert.Equal("10.0.0.5:9090", again.Server);
+        var reopened = SendSession.For(again);
+        Assert.True(reopened.FieldsLocked);
+        Assert.Equal(p.IdempotencyKey, reopened.IdempotencyKey);
+        Assert.Equal("10.0.0.5:9090", reopened.LockedServer!.Authority);
+        Assert.Equal(1, keys); // only the first session's key: none minted for the re-offer
+    }
+
+    [Fact]
+    public void Old_version_record_pinned_during_this_run_stays_pinned_when_reopened()
+    {
+        var (id, pdf) = Spooled();
+        var plan = Plan(id, pdf, keep: false, key: "K-old");
+        new JobTracker(_dir).BeginSend(plan); // written without a server, like an older version's record
+        var t = new JobTracker(_dir);
+        var req = Assert.Single(t.Scan());
+        var s = SendSession.For(req);
+        Assert.True(s.ServerNotRecorded);
+        t.BeginSend(plan, ServerA); s.Started(plan, ServerA); s.Failed(AttemptOutcome.Uncertain); t.RecordFailure(s, plan);
+
+        var again = t.Reoffer(req, s);
+        var reopened = SendSession.For(again);
+        Assert.Equal("K-old", reopened.IdempotencyKey);
+        Assert.False(reopened.ServerNotRecorded);
+        Assert.Equal("10.0.0.5:9090", reopened.LockedServer!.Authority);
+    }
+
+    [Fact]
+    public void Suspect_sent_anyway_then_uncertain_reopens_locked_with_its_key()
+    {
+        var t = new JobTracker(_dir);
+        var (id, pdf) = Spooled();
+        t.Track(Plan(id, pdf, false), J("lf1", "queued"));
+        var suspect = t.RequestFor(t.MarkUnknown("lf1")!);
+        Assert.Equal(SendKind.Suspect, suspect.Kind);
+        var s = SendSession.For(suspect);
+        var p = s.Build("5552345678", null, false, false);
+        t.BeginSend(p, ServerB); s.Started(p, ServerB); s.Failed(AttemptOutcome.Uncertain); t.RecordFailure(s, p);
+
+        var reopened = SendSession.For(t.Reoffer(suspect, s));
+        Assert.True(reopened.FieldsLocked);
+        Assert.Equal(p.IdempotencyKey, reopened.IdempotencyKey);
+        Assert.Equal("10.0.0.6:9090", reopened.LockedServer!.Authority);
+    }
+
+    [Fact]
+    public void Suspect_rejected_then_cancel_keeps_the_warning()
+    {
+        // A 4xx for the new key proves nothing about the job the server lost: the document may still have been sent.
+        var t = new JobTracker(_dir);
+        var (id, pdf) = Spooled();
+        t.Track(Plan(id, pdf, false), J("lf1", "queued"));
+        var suspect = t.RequestFor(t.MarkUnknown("lf1")!);
+        var s = SendSession.For(suspect);
+        var p = s.Build("5552345678", null, false, false);
+        t.BeginSend(p, ServerA); s.Started(p, ServerA); s.Failed(AttemptOutcome.Rejected); t.RecordFailure(s, p);
+
+        var again = t.Reoffer(suspect, s);
+        Assert.Equal(SendKind.Suspect, again.Kind);
+        Assert.Null(again.LockedPlan);
+        Assert.Equal("15552345678", again.Number);
+    }
+
+    [Fact]
+    public void Reoffer_without_a_readable_record_falls_back_to_the_locked_session()
+    {
+        var t = new JobTracker(_dir);
+        var (id, pdf) = Spooled();
+        var original = new SendRequest(id, pdf);
+        var s = new SendSession(id, pdf);
+        var p = s.Build("5552345678", null, false, false);
+        s.Started(p, ServerA); s.Failed(AttemptOutcome.Uncertain); // the record write failed, say
+        Assert.False(File.Exists(JsonOf(id)));
+
+        var again = t.Reoffer(original, s);
+        Assert.Equal(SendKind.Resume, again.Kind);
+        Assert.Equal(p, again.LockedPlan);
+        Assert.Equal("10.0.0.5:9090", again.Server);
+    }
+
+    [Fact]
+    public void Reoffer_of_an_untouched_request_is_that_request()
+    {
+        var t = new JobTracker(_dir);
+        var (id, pdf) = Spooled();
+        var original = new SendRequest(id, pdf, "15552345678", null, SendKind.Retry);
+        Assert.Equal(original, t.Reoffer(original));
+    }
+
     [Fact]
     public void Sending_record_whose_pdf_is_gone_is_removed()
     {

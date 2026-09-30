@@ -131,6 +131,45 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
     public SendRequest RequestFor(TrackedJob t) => new(t.SpoolId, PdfPath(t.SpoolId), t.Number, t.Subject,
         t.State == "failed" ? SendKind.Retry : SendKind.Suspect);
 
+    /// <summary>
+    /// The request that offers a kept document again (tray menu, balloon): rebuilt from its record, which knows what
+    /// the dialog learnt (a lock, its key, the server it is pinned to), never the request the dialog opened with. A
+    /// record that does not need the user (or cannot be read) falls back to <paramref name="session"/>'s lock, then to
+    /// <paramref name="original"/>. A suspect document stays suspect unless its record is locked: a definite rejection
+    /// of a new key proves nothing about the job the server lost.
+    /// </summary>
+    public SendRequest Reoffer(SendRequest original, SendSession? session = null)
+    {
+        if (original.PdfPath == null) return original; // a test page: no document, no record
+        var pdf = original.PdfPath;
+        var (t, status) = Load(JsonPath(original.SpoolId));
+        var offer = status == LoadStatus.Ok && t != null ? OfferFor(original.SpoolId, t, pdf) : null;
+        if (offer == null && session?.LockedPlan is { } locked)
+            offer = new SendRequest(original.SpoolId, pdf, locked.Number, locked.Subject, SendKind.Resume, locked,
+                session.LockedServer?.Authority);
+        offer ??= original;
+        if (original.Kind == SendKind.Suspect && offer.LockedPlan == null && offer.Kind != SendKind.Suspect)
+            offer = offer with { Kind = SendKind.Suspect };
+        return offer;
+    }
+
+    /// <summary>
+    /// What a record asks of the user: the dialog request for spool file <paramref name="id"/> (the file name's id,
+    /// not the record's), or null when it needs none (accepted, terminal).
+    /// </summary>
+    private static SendRequest? OfferFor(Guid id, TrackedJob t, string pdf) => t.State switch
+    {
+        _ when t.IsTerminal && t.State != "failed" => null,
+        SendState.Sending or SendState.Uncertain when !string.IsNullOrEmpty(t.IdempotencyKey) =>
+            new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Resume, ToPlan(t, pdf), t.Server),
+        SendState.Draft => new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Draft),
+        "failed" => new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Retry),
+        SendState.Accepted when t.IsPollable => null,
+        // unknown, a sending record without a key, an accepted one without a server id, or a state this version
+        // does not know: it may have been sent, so the user decides.
+        _ => new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Suspect),
+    };
+
     /// <summary>The user cancelled a dialog: the PDF and its record go.</summary>
     public void Discard(Guid spoolId)
     {
@@ -191,26 +230,8 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
                 }
                 continue;
             }
-            switch (t.State)
-            {
-                case SendState.Sending or SendState.Uncertain when !string.IsNullOrEmpty(t.IdempotencyKey):
-                    offers.Add(new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Resume, ToPlan(t, pdf), t.Server));
-                    break;
-                case SendState.Draft:
-                    offers.Add(new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Draft));
-                    break;
-                case "failed":
-                    offers.Add(new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Retry));
-                    break;
-                case SendState.Accepted when t.IsPollable:
-                    _byServerId[t.ServerId!] = t;
-                    break;
-                default:
-                    // unknown, a sending record without a key, an accepted one without a server id, or a state this
-                    // version does not know: it may have been sent, so the user decides.
-                    offers.Add(new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Suspect));
-                    break;
-            }
+            if (OfferFor(id, t, pdf) is { } offer) offers.Add(offer);
+            else if (t.IsPollable) _byServerId[t.ServerId!] = t;
         }
         foreach (var pdf in Directory.EnumerateFiles(JobsDir, "*.pdf"))
         {

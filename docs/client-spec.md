@@ -122,7 +122,11 @@ client/
    `/Type /Page` objects), computed on the thread pool after the dialog opens.
    Shared PC: when the spooled file's NTFS owner is another Windows user (not
    this user, a group this user is in, or SYSTEM/LOCAL/NETWORK SERVICE) the
-   line ends ". Printed by <DOMAIN\user>" (`PrintedBy`).
+   line ends ". Printed by <DOMAIN\user>" (`PrintedBy`). A file owned by
+   BUILTIN\Administrators (what an elevated process's files often get) is
+   inherently ambiguous: it says nothing about which user printed it, so it
+   may be labelled either way depending on whether this user is an
+   administrator.
 3. Subject optional. "Send test page instead of this document" checkbox
    turns the request into `POST /test/send` and discards the PDF.
 4. `POST /jobs` with `Content-Type: application/pdf`, `X-Fax-To` (the
@@ -211,7 +215,15 @@ client/
    have been sent") is kept on Cancel too. A locked dialog that a definite 4xx
    unlocked is a draft again: Cancel deletes. The tray's test page has no
    document, so its Cancel keeps nothing. App exit or shutdown with a dialog
-   open keeps the PDF.
+   open keeps the PDF. Re-offers from the tray menu ("Unsent documents",
+   "Retry failed fax") and from a failed-fax balloon are rebuilt from the
+   record on disk when opened (`JobTracker.Reoffer`), never from the request
+   the dialog first opened with: a document locked in this run reopens locked
+   with the same key, plan and server pin (no new key, no editable fields),
+   one pinned during this run stays pinned, and a draft reopens prefilled.
+   With no readable record the dialog's own lock is used. A Suspect document
+   stays Suspect unless its record is locked (a rejection of a new key proves
+   nothing about the job the server lost).
 8. Startup, before the watcher starts, `JobTracker.Scan` returns a
    `SendRequest` per document that needs the user, and each opens straight
    into the dialog queue (no balloon to miss):
@@ -281,13 +293,16 @@ client/
   catch-up is a silent baseline: `announced.json` keeps an explicit
   `baselineTaken` flag and `baselineAt` (this machine's UTC time), so an empty
   inbox on the first run still ends it; an older file with ids or a time
-  counts as taken. `InboundCatchUp` reads "baseline or not" BEFORE the request
+  counts as taken. A live `received` event that is announced also ends the
+  baseline (its balloon showed and the newest seen moved to it, so a later
+  catch-up, even after a restart, is news). `InboundCatchUp` reads "baseline or not" BEFORE the request
   goes out, so a live `received` event during the first request cannot turn
   the whole inbox into a summary balloon. faxd lists newest first with no
   cursor, so a full page (100) is asked again with `limit=1000` (faxd's cap)
   rather than paged; beyond 1000 only the newest are checked and the skip is
   logged. A catch-up requested while one runs queues exactly one more run
-  (with the earliest requested `since`), never dropped. Failures, a
+  (with the earliest requested `since`; a queued reconnect with no fax seen
+  yet asks for everything and so wins over a queued resync time), never dropped. Failures, a
   `FaxApiConfigException` included, are logged; the baseline stays pending.
 
 ## One active session
@@ -300,7 +315,9 @@ client/
   another session" and exits. `InstanceGuard.Acquire` creates the show event
   the moment it owns the mutex (before the tray is built), and a second start
   retries the signal for up to 2 s before concluding "another session", so a
-  second launch during startup is not misreported. Print jobs from the other session still land in
+  second launch during startup is not misreported. Within the same 2 s it also
+  retries the mutex, so a start during the owner's shutdown becomes the new
+  owner instead of exiting. Print jobs from the other session still land in
   the spool and are offered on the active instance's desktop: on a shared PC
   only one user at a time should be signed in with LANFax.
 
