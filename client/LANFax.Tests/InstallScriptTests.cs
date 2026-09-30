@@ -119,4 +119,15 @@ public class InstallScriptTests
         Assert.Contains("RunAs", t);
         Assert.DoesNotContain(@"C:\Program Files (x86)", t);
     }
+
+    [Fact]
+    public void InstallScriptRebindsAnExistingPrinterOnAnotherPort()
+    {
+        // A "LAN Fax" queue left on another port would print to a path nobody watches.
+        var t = File.ReadAllText(Path.Combine(Dir(), "Install-LANFaxPrinter.ps1"));
+        Assert.Matches(@"\.PortName\s+-ne\s+\$portName", t);
+        Assert.Matches(@"Set-Printer\s+-Name\s+\$PrinterName\s+-PortName\s+\$portName", t);
+        Assert.True(t.IndexOf("Set-Printer", StringComparison.Ordinal) > t.IndexOf("Add-PrinterPort", StringComparison.Ordinal),
+            "the port must exist before the printer is moved onto it");
+    }
 }

@@ -369,4 +369,62 @@ public class FaxApiTests : IDisposable
         Assert.Equal(3, merged.Queue["queued"]);
         Assert.Single(merged.Registrations);
     }
+
+    // ---- review finding 1: a config that cannot form a URI is "not sent", with no request ----
+
+    [Theory]
+    [InlineData("127.0.0.1:1", 8080)]
+    [InlineData("127.0.0.1", 0)]
+    public async Task UnusableServerOrPortThrowsConfigErrorWithoutARequest(string server, int port)
+    {
+        var cfg = new ClientConfig { Server = server, Port = port, Token = "t" };
+        var api = new FaxApi(cfg, _http) { Delay = (d, _) => { _delays.Add(d); return Task.CompletedTask; } };
+        _srv.Handler = (ctx, _) => FakeServer.Json(ctx, JobJson, 201);
+        await Assert.ThrowsAsync<FaxApiConfigException>(() =>
+            api.PostJobAsync(new MemoryStream(new byte[] { 1 }), "19543216309", null, "key-1234567890abcdef"));
+        await Assert.ThrowsAsync<FaxApiConfigException>(() => api.SendTestPageAsync("19543216309", null, "key-1234567890abcdef"));
+        await Assert.ThrowsAsync<FaxApiConfigException>(() => api.GetStatusAsync());
+        Assert.Empty(_srv.Requests);
+        Assert.Empty(_delays); // never retried
+    }
+
+    // ---- review finding 2: every attempt of one send goes to the endpoint it started with ----
+
+    [Fact]
+    public async Task RetryStaysOnTheEndpointTheSendStartedWith()
+    {
+        using var other = new FakeServer();
+        other.Handler = (ctx, _) => FakeServer.Json(ctx, JobJson, 201);
+        int n = 0;
+        _srv.Handler = (ctx, _) => Interlocked.Increment(ref n) == 1
+            ? FakeServer.Json(ctx, "{\"error\":\"busy\"}", 503)
+            : FakeServer.Json(ctx, JobJson, 201);
+        var cfg = new ClientConfig { Server = "127.0.0.1", Port = _srv.Port, Token = "tok-a" };
+        // Settings saved during the backoff: a different server and token.
+        var api = new FaxApi(cfg, _http) { Delay = (_, _) => { cfg.Port = other.Port; cfg.Token = "tok-b"; return Task.CompletedTask; } };
+
+        var j = await api.PostJobAsync(new MemoryStream(new byte[] { 1 }), "19543216309", null, "same-key-1234567890");
+        Assert.Equal("lf0123456789ab", j.Id);
+        Assert.Equal(2, _srv.Requests.Length);
+        Assert.All(_srv.Requests, r => Assert.Equal("Bearer tok-a", r.Headers["Authorization"]));
+        Assert.Empty(other.Requests);
+    }
+
+    [Fact]
+    public async Task EndpointOverloadIgnoresTheConfigAndSendsTheBytesAsGiven()
+    {
+        _srv.Handler = (ctx, _) => FakeServer.Json(ctx, JobJson, 201);
+        var cfg = new ClientConfig { Server = "127.0.0.1", Port = 1, Token = "wrong" };
+        var api = new FaxApi(cfg, _http);
+        var ep = new SendEndpoint(new Uri($"http://127.0.0.1:{_srv.Port}/"), "tok-ep");
+        var pdf = Encoding.ASCII.GetBytes("%PDF-1.4 x");
+        await api.PostJobAsync(ep, pdf, "19543216309", null, "key-1234567890abcdef");
+        await api.SendTestPageAsync(ep, "19543216309", "n", "key-abcdef1234567890");
+        Assert.Equal(2, _srv.Requests.Length);
+        Assert.Equal(pdf, _srv.Requests[0].Body);
+        Assert.All(_srv.Requests, r => Assert.Equal("Bearer tok-ep", r.Headers["Authorization"]));
+    }
+
+    [Fact]
+    public void MaxBodyMatchesFaxd() => Assert.Equal(25 * 1024 * 1024, FaxApi.MaxBodyBytes);
 }

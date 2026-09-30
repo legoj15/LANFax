@@ -5,6 +5,8 @@ namespace LANFax.Tests;
 public class ClientConfigTests
 {
     private static string Tmp() => Path.Combine(Path.GetTempPath(), "lanfax-" + Guid.NewGuid().ToString("N"), "config.json");
+    private static string TokenFor(string configPath) => Path.Combine(Path.GetDirectoryName(configPath)!, "user", "token.bin");
+    private static ClientConfig Load(string path) => ClientConfig.Load(path, TokenFor(path));
 
     [Fact]
     public void Defaults()
@@ -21,7 +23,7 @@ public class ClientConfigTests
     [Fact]
     public void LoadMissingFileGivesDefaults()
     {
-        var c = ClientConfig.Load(Tmp());
+        var c = Load(Tmp());
         Assert.Equal(8080, c.Port);
     }
 
@@ -30,11 +32,11 @@ public class ClientConfigTests
     {
         var path = Tmp();
         var c = new ClientConfig { Server = "192.0.2.10", Port = 9090, Token = "s3cret-token-value", KeepLocalCopies = true, PrinterName = "P", SpoolDir = @"D:\sp" };
-        c.Save(path);
+        c.Save(path, TokenFor(path));
         var text = File.ReadAllText(path);
         Assert.DoesNotContain("s3cret-token-value", text);
         Assert.Contains("\"token\"", text);
-        var d = ClientConfig.Load(path);
+        var d = Load(path);
         Assert.Equal("192.0.2.10", d.Server);
         Assert.Equal(9090, d.Port);
         Assert.Equal("s3cret-token-value", d.Token);
@@ -48,8 +50,8 @@ public class ClientConfigTests
     public void NullTokenRoundTrips()
     {
         var path = Tmp();
-        new ClientConfig { Server = "h" }.Save(path);
-        Assert.Null(ClientConfig.Load(path).Token);
+        new ClientConfig { Server = "h" }.Save(path, TokenFor(path));
+        Assert.Null(Load(path).Token);
     }
 
     private static string WriteTmp(string content)
@@ -69,7 +71,7 @@ public class ClientConfigTests
     [InlineData("null")]
     public void CorruptFileGivesDefaultsAndLoadError(string content)
     {
-        var c = ClientConfig.Load(WriteTmp(content));
+        var c = Load(WriteTmp(content));
         Assert.Equal(8080, c.Port);
         Assert.Equal("192.0.2.10", c.Server);
         Assert.Null(c.Token);
@@ -81,7 +83,7 @@ public class ClientConfigTests
     [InlineData("AAAAAAAA")] // base64, but not a DPAPI blob
     public void GarbageTokenIsDroppedWithLoadError(string token)
     {
-        var c = ClientConfig.Load(WriteTmp("{\"server\":\"10.0.0.5\",\"token\":\"" + token + "\"}"));
+        var c = Load(WriteTmp("{\"server\":\"10.0.0.5\",\"token\":\"" + token + "\"}"));
         Assert.Equal("10.0.0.5", c.Server);
         Assert.Null(c.Token);
         Assert.Contains("token", c.LoadError, StringComparison.OrdinalIgnoreCase);
@@ -92,9 +94,9 @@ public class ClientConfigTests
     public void GoodFileHasNoLoadError()
     {
         var path = Tmp();
-        new ClientConfig { Server = "h", Token = "t" }.Save(path);
-        var c = ClientConfig.Load(path);
+        new ClientConfig { Server = "h", Token = "t" }.Save(path, TokenFor(path));
+        var c = Load(path);
         Assert.Null(c.LoadError);
-        Assert.Null(ClientConfig.Load(Tmp()).LoadError); // missing file is not an error
+        Assert.Null(Load(Tmp()).LoadError); // missing file is not an error
     }
 }

@@ -53,9 +53,17 @@ if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
 }
 
 $printerAdded = $false
-if (-not (Get-Printer -Name $PrinterName -ErrorAction SilentlyContinue)) {
+$printerMoved = $false
+$existing = Get-Printer -Name $PrinterName -ErrorAction SilentlyContinue
+if (-not $existing) {
     Add-Printer -Name $PrinterName -DriverName $driver -PortName $portName
     $printerAdded = $true
 }
+elseif ($existing.PortName -ne $portName) {
+    # A queue left on another port (older install, different spool dir, made by hand) prints where nobody watches.
+    "moving printer '$PrinterName' from port '$($existing.PortName)' to '$portName'"
+    Set-Printer -Name $PrinterName -PortName $portName
+    $printerMoved = $true
+}
 
-"LANFax printer '$PrinterName' -> $portName (port added: $portAdded, printer added: $printerAdded)"
+"LANFax printer '$PrinterName' -> $portName (port added: $portAdded, printer added: $printerAdded, printer moved: $printerMoved)"

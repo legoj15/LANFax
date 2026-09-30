@@ -16,11 +16,15 @@ internal sealed class SettingsDialog : Form
     private readonly Button _clearToken = new() { Text = "Clear token", AutoSize = true };
     private readonly Label _tokenHint = new() { AutoSize = true, ForeColor = SystemColors.GrayText };
     private readonly Icon _icon = IconFactory.Create(true);
+    private readonly Func<bool> _sendInFlight;
     private bool _tokenCleared;
 
-    public SettingsDialog(ClientConfig cfg, ConfigLocation loc)
+    public const string WaitForSendText = "Wait for the current fax to finish before saving settings.";
+
+    /// <param name="sendInFlight">True while a fax is on the wire: saving then could move its retries to another server.</param>
+    public SettingsDialog(ClientConfig cfg, ConfigLocation loc, Func<bool> sendInFlight)
     {
-        _cfg = cfg; _loc = loc;
+        _cfg = cfg; _loc = loc; _sendInFlight = sendInFlight;
         Text = "LANFax settings";
         AutoScaleMode = AutoScaleMode.Dpi;
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -105,6 +109,7 @@ internal sealed class SettingsDialog : Form
         try
         {
             var cand = Candidate();
+            if (cand.Validate() is { } invalid) { _result.ForeColor = Color.Firebrick; _result.Text = "Cannot use these settings: " + invalid + "."; return; }
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
             var st = await new FaxApi(cand, http).GetStatusAsync();
             var regs = st.Registrations.Count == 0
@@ -129,13 +134,23 @@ internal sealed class SettingsDialog : Form
 
     private bool Save()
     {
+        if (_sendInFlight())
+        {
+            MessageBox.Show(this, WaitForSendText, "LANFax", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
         if (string.IsNullOrWhiteSpace(_host.Text))
         {
             MessageBox.Show(this, "Enter a server host or IP.", "LANFax", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
         var c = Candidate();
-        try { c.Save(_loc.Path); }
+        if (c.Validate() is { } invalid)
+        {
+            MessageBox.Show(this, "These settings cannot be used: " + invalid + ".", "LANFax", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+        try { c.Save(_loc.Path, ClientConfig.DefaultTokenPath); }
         catch (Exception e)
         {
             FileLog.Error("saving settings failed", e);

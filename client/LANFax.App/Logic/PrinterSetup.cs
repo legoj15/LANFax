@@ -7,9 +7,25 @@ namespace LANFax.App.Logic;
 public interface IPrinterKeyReader
 {
     bool Exists(string printerName);
+    /// <summary>The printer's port name (its <c>Port</c> value), "" when the value is missing, null when there is no such printer.</summary>
+    string? Port(string printerName);
 }
 
-/// <summary>Looks for HKLM\SYSTEM\CurrentControlSet\Control\Print\Printers\&lt;name&gt; (no process spawn).</summary>
+public enum PrinterState
+{
+    /// <summary>The printer exists and prints to the watched spool file.</summary>
+    Installed,
+    /// <summary>The printer exists but prints somewhere else (<see cref="PrinterStatus.ActualPort"/>): jobs would vanish.</summary>
+    Misconfigured,
+    Missing,
+}
+
+public sealed record PrinterStatus(PrinterState State, string? ActualPort);
+
+/// <summary>
+/// Reads HKLM\SYSTEM\CurrentControlSet\Control\Print\Printers\&lt;name&gt; and its <c>Port</c> value (no process
+/// spawn).
+/// </summary>
 public sealed class RegistryPrinterKeyReader : IPrinterKeyReader
 {
     private const string Root = @"SYSTEM\CurrentControlSet\Control\Print\Printers\";
@@ -28,6 +44,17 @@ public sealed class RegistryPrinterKeyReader : IPrinterKeyReader
         }
         catch (Exception) { return false; }
     }
+
+    public string? Port(string printerName)
+    {
+        if (KeyPath(printerName) is not { } key) return null;
+        try
+        {
+            using var k = Registry.LocalMachine.OpenSubKey(key);
+            return k == null ? null : k.GetValue("Port") as string ?? "";
+        }
+        catch (Exception) { return null; }
+    }
 }
 
 /// <param name="run">Starts the process and completes when it exits (tests fake it). Defaults to an elevated Process.Start.</param>
@@ -37,7 +64,23 @@ public sealed class PrinterSetup(IPrinterKeyReader reader, Func<ProcessStartInfo
 
     private readonly Func<ProcessStartInfo, Task> _run = run ?? RunProcessAsync;
 
-    public bool IsInstalled(string printerName) => reader.Exists(printerName);
+    /// <summary>The port a correctly installed printer uses: <c>&lt;spoolDir&gt;\print.pdf</c>, as the install script builds it.</summary>
+    public static string ExpectedPort(string spoolDir) => Path.Combine(TrimSlashes(spoolDir), "print.pdf");
+
+    /// <summary>Whether the printer exists and prints to the file the app watches (compared case-insensitively).</summary>
+    public PrinterStatus Status(string printerName, string spoolDir)
+    {
+        var port = reader.Port(printerName);
+        if (port == null) return new PrinterStatus(PrinterState.Missing, null);
+        return new PrinterStatus(SamePath(port, ExpectedPort(spoolDir)) ? PrinterState.Installed : PrinterState.Misconfigured, port);
+    }
+
+    private static bool SamePath(string a, string b)
+    {
+        if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase)) return true;
+        try { return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase); }
+        catch (Exception) { return false; } // "PORTPROMPT:" and other non-paths
+    }
 
     /// <summary>The script the csproj copies to install\ beside the exe (and the installer lays down there too).</summary>
     public static string ScriptPath => Path.Combine(AppContext.BaseDirectory, "install", "Install-LANFaxPrinter.ps1");
@@ -52,7 +95,10 @@ public sealed class PrinterSetup(IPrinterKeyReader reader, Func<ProcessStartInfo
         return t.Length == 0 || t.EndsWith(':') ? p : t; // leave "C:\" alone rather than make it "C:"
     }
 
-    /// <summary>Runs the install script elevated (UAC prompt) without blocking the UI thread, then re-checks. Null on success, else a message.</summary>
+    /// <summary>
+    /// Runs the install script elevated (UAC prompt) without blocking the UI thread, then re-checks that the printer
+    /// exists on the right port (the script moves an existing one). Null on success, else a message.
+    /// </summary>
     public async Task<string?> InstallAsync(string spoolDir, string printerName, string? script = null)
     {
         script ??= ScriptPath;
@@ -68,7 +114,13 @@ public sealed class PrinterSetup(IPrinterKeyReader reader, Func<ProcessStartInfo
         }
         catch (Win32Exception e) when (e.NativeErrorCode == 1223) { return "Installation cancelled."; }
         catch (Exception e) { return "Could not start the installer: " + e.Message; }
-        return IsInstalled(printerName) ? null : "The printer was not installed (see the script output or run it manually).";
+        var st = Status(printerName, spoolDir);
+        return st.State switch
+        {
+            PrinterState.Installed => null,
+            PrinterState.Misconfigured => $"The printer still points at {st.ActualPort}, not {ExpectedPort(spoolDir)} (run the install script manually).",
+            _ => "The printer was not installed (see the script output or run it manually).",
+        };
     }
 
     private static async Task RunProcessAsync(ProcessStartInfo psi)

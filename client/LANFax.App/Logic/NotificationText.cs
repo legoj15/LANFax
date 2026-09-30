@@ -25,6 +25,18 @@ public static class NotificationText
     public static string ForReceived(Job j) =>
         $"Fax received from {(string.IsNullOrWhiteSpace(j.FromNumber) ? "unknown sender" : j.FromNumber)}";
 
+    /// <summary>
+    /// Balloons for inbound faxes found by a catch-up (oldest first): one each for up to three, else one summary so a
+    /// long disconnection does not queue a minute of balloons.
+    /// </summary>
+    public static IReadOnlyList<string> ForCaughtUp(IReadOnlyList<Job> received) =>
+        received.Count <= 3
+            ? received.Select(ForReceived).ToList()
+            : [$"{received.Count} faxes were received while LANFax was not connected"];
+
+    public static string PrinterMisconfigured(string printerName, string actualPort) =>
+        $"The \"{printerName}\" printer points at {actualPort}, not the LANFax spool. Click here to fix it.";
+
     /// <summary>Uses the number the server queued; says so when it differs from what the user entered.</summary>
     public static string Queued(Job job, string entered) =>
         string.IsNullOrEmpty(job.ToNumber) || job.ToNumber == entered

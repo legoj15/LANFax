@@ -30,6 +30,8 @@ internal sealed class TrayContext : ApplicationContext
     private readonly System.Windows.Forms.Timer _poll = new() { Interval = (int)PollInterval.TotalMilliseconds };
     /// <summary>Test-page jobs (no local PDF, so not in the tracker) awaiting their terminal balloon.</summary>
     private readonly HashSet<string> _submitted = new();
+    /// <summary>Which received faxes were already announced (live or by a catch-up); persisted per user.</summary>
+    private readonly InboundAnnouncer _inbound;
     private readonly ToolStripMenuItem _installItem;
     private readonly ToolStripMenuItem _unsentItem;
     private readonly ToolStripMenuItem _retryItem;
@@ -45,6 +47,7 @@ internal sealed class TrayContext : ApplicationContext
     private long _noticeId;
     private bool _everConnected;
     private bool _polling;
+    private bool _catchingUp;
     private bool _installing;
     private bool _settingsOpen;
     private bool _exiting;
@@ -54,9 +57,10 @@ internal sealed class TrayContext : ApplicationContext
     {
         _ = _ui.Handle; // force handle creation on the UI thread so BeginInvoke works from workers
         _loc = ConfigLocation.Default();
-        _cfg = ClientConfig.Load(_loc.ReadPath); // never throws; problems land in LoadError
+        _cfg = ClientConfig.Load(_loc.ReadPath, ClientConfig.DefaultTokenPath); // never throws; problems land in LoadError
         _api = new FaxApi(_cfg, _http) { Log = m => FileLog.Info("api: " + m) };
         _tracker = new JobTracker(_cfg.SpoolDir, m => FileLog.Info("tracker: " + m));
+        _inbound = new InboundAnnouncer(InboundAnnouncer.DefaultPath, m => FileLog.Info("inbound: " + m));
         FileLog.Info($"config: {_loc.ReadPath} (save to {_loc.Path}, fallback={_loc.IsFallback}), server {_cfg.Server}:{_cfg.Port}, token set={!string.IsNullOrEmpty(_cfg.Token)}");
         if (_cfg.LoadError != null) FileLog.Error("config: " + _cfg.LoadError);
 
@@ -79,7 +83,11 @@ internal sealed class TrayContext : ApplicationContext
         menu.Items.Add("Exit", null, async (_, _) => await ExitAppAsync());
         menu.Opening += (_, _) =>
         {
-            _installItem.Visible = !_printer.IsInstalled(_cfg.PrinterName);
+            var printer = PrinterStatusNow();
+            _installItem.Visible = printer.State != PrinterState.Installed;
+            _installItem.Text = printer.State == PrinterState.Misconfigured
+                ? $"Fix \"{_cfg.PrinterName}\" printer (prints to {printer.ActualPort})..."
+                : $"Install \"{_cfg.PrinterName}\" printer...";
             UpdateOfferItem(_unsentItem, OfferCategory.Unsent);
             UpdateOfferItem(_retryItem, OfferCategory.Retry);
         };
@@ -123,8 +131,14 @@ internal sealed class TrayContext : ApplicationContext
         if (unsent.Count > 0) OnUi(() => { foreach (var u in unsent) EnqueueSend(u); });
         if (_cfg.LoadError != null)
             Balloon(NotificationText.ConfigProblem(_cfg.LoadError), OpenSettings);
-        if (!_printer.IsInstalled(_cfg.PrinterName))
+        var printerNow = PrinterStatusNow();
+        if (printerNow.State == PrinterState.Missing)
             Balloon($"The \"{_cfg.PrinterName}\" printer is not installed. Click here to install it.", () => _ = InstallPrinterAsync());
+        else if (printerNow.State == PrinterState.Misconfigured)
+        {
+            FileLog.Error($"printer \"{_cfg.PrinterName}\" prints to {printerNow.ActualPort}, expected {PrinterSetup.ExpectedPort(_cfg.SpoolDir)}");
+            Balloon(NotificationText.PrinterMisconfigured(_cfg.PrinterName, printerNow.ActualPort ?? ""), () => _ = InstallPrinterAsync());
+        }
         else if (string.IsNullOrEmpty(_cfg.Token) && _cfg.LoadError == null)
             Balloon("Set the server token in LANFax settings. Click here.", OpenSettings);
     }
@@ -197,6 +211,7 @@ internal sealed class TrayContext : ApplicationContext
                 _everConnected = true;
                 UpdateConnectionState(true);
                 _ = PollTrackedAsync(); // catch up on anything that finished while disconnected
+                _ = CatchUpInboundAsync(null); // and on faxes received meanwhile (or while the app was not running)
             });
         };
         es.Disconnected += e =>
@@ -219,12 +234,13 @@ internal sealed class TrayContext : ApplicationContext
             OnUi(() =>
             {
                 if (ct.IsCancellationRequested) return;
-                FileLog.Info($"event stream: resync requested (since {since?.ToString("o") ?? "unknown"}); polling tracked jobs");
+                FileLog.Info($"event stream: resync requested (since {since?.ToString("o") ?? "unknown"}); reloading jobs and inbox");
                 _ = PollTrackedAsync();
+                _ = CatchUpInboundAsync(since);
             });
         };
         es.JobChanged += j => OnUi(() => OnJobChanged(j));
-        es.Received += j => OnUi(() => Balloon(NotificationText.ForReceived(j)));
+        es.Received += j => OnUi(() => { if (_inbound.TryAnnounce(j)) Balloon(NotificationText.ForReceived(j)); });
         return es;
     }
 
@@ -238,7 +254,7 @@ internal sealed class TrayContext : ApplicationContext
         var oldTask = _sseTask;
         oldCts?.Cancel();
         UpdateConnectionState(false);
-        bool run = !string.IsNullOrEmpty(_cfg.Token); // nothing to authenticate with yet
+        bool run = !string.IsNullOrEmpty(_cfg.Token) && _cfg.Validate() == null; // nothing to authenticate with, or nowhere to connect
         var cts = run ? new CancellationTokenSource() : null;
         _sseCts = cts;
         _sseTask = Task.Run(async () =>
@@ -301,6 +317,27 @@ internal sealed class TrayContext : ApplicationContext
             }
         }
         finally { _polling = false; }
+    }
+
+    /// <summary>
+    /// Asks the server for inbound faxes updated since <paramref name="since"/> (the resync's) or since the newest one
+    /// already seen, and announces those not announced yet. Covers faxes the event stream never delivered: a resync
+    /// gap, a disconnection, or time the app was not running.
+    /// </summary>
+    private async Task CatchUpInboundAsync(DateTimeOffset? since)
+    {
+        if (_catchingUp || _exiting || string.IsNullOrEmpty(_cfg.Token)) return;
+        _catchingUp = true;
+        try
+        {
+            var jobs = await _api.GetJobsAsync(direction: "in", states: ["received"], limit: 100, updatedSince: _inbound.SinceFor(since));
+            var news = _inbound.Absorb(jobs);
+            if (news.Count > 0) FileLog.Info($"inbound catch-up: {news.Count} fax(es) not announced yet");
+            foreach (var text in NotificationText.ForCaughtUp(news)) Balloon(text);
+        }
+        catch (FaxApiException e) { FileLog.Info($"inbound catch-up: {e.StatusCode} {e.Message}"); }
+        catch (JsonException e) { FileLog.Info($"inbound catch-up: unreadable answer ({e.Message})"); }
+        finally { _catchingUp = false; }
     }
 
     /// <summary>The server has no such job (its database was reset): stop polling and give the document back to the user.</summary>
@@ -398,6 +435,8 @@ internal sealed class TrayContext : ApplicationContext
 
     // ---- actions ----
 
+    private PrinterStatus PrinterStatusNow() => _printer.Status(_cfg.PrinterName, _cfg.SpoolDir);
+
     private void OpenWeb()
     {
         try { Process.Start(new ProcessStartInfo(_cfg.BaseUri.ToString()) { UseShellExecute = true }); }
@@ -433,7 +472,7 @@ internal sealed class TrayContext : ApplicationContext
         {
             FileLog.Info("printer install requested");
             var err = await _printer.InstallAsync(_cfg.SpoolDir, _cfg.PrinterName);
-            if (err == null) Balloon($"The \"{_cfg.PrinterName}\" printer is installed.");
+            if (err == null) Balloon($"The \"{_cfg.PrinterName}\" printer is installed and prints to {PrinterSetup.ExpectedPort(_cfg.SpoolDir)}.");
             else { FileLog.Error("printer install: " + err); Balloon(err); }
         }
         finally
@@ -449,7 +488,7 @@ internal sealed class TrayContext : ApplicationContext
         _settingsOpen = true;
         try
         {
-            using var dlg = new SettingsDialog(_cfg, _loc);
+            using var dlg = new SettingsDialog(_cfg, _loc, () => _openDialog is { Sending: true });
             if (dlg.ShowDialog() == DialogResult.OK)
             {
                 FileLog.Info($"settings saved: {_cfg.Server}:{_cfg.Port}, token set={!string.IsNullOrEmpty(_cfg.Token)}");
@@ -474,9 +513,15 @@ internal sealed class TrayContext : ApplicationContext
             if (r == DialogResult.Yes)
             {
                 _exitPending = true; // no new dialogs while waiting
+                dlg.Enabled = false; // and no second attempt from this one: Dispose must not cut it off
                 FileLog.Info("exit: waiting for the send in flight");
-                var done = await Task.WhenAny(dlg.Idle, Task.Delay(ExitWait));
-                FileLog.Info(done == dlg.Idle ? "exit: send finished" : "exit: gave up waiting after 30 s");
+                var deadline = DateTime.UtcNow + ExitWait;
+                while (dlg.Sending && DateTime.UtcNow < deadline)
+                {
+                    var left = deadline - DateTime.UtcNow;
+                    if (left > TimeSpan.Zero) await Task.WhenAny(dlg.Idle, Task.Delay(left));
+                }
+                FileLog.Info(dlg.Sending ? "exit: gave up waiting after 30 s" : "exit: send finished");
             }
         }
         _exiting = true;

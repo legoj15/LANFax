@@ -198,6 +198,38 @@ public class SendSessionTests
         Assert.Equal("This document may already have been sent. Sending it again may fax it a second time.",
             SendSession.SuspectNote);
     }
+
+    [Theory]
+    [InlineData(SendKind.Suspect, true)]  // "may already have been sent": Cancel must not destroy it
+    [InlineData(SendKind.New, false)]
+    [InlineData(SendKind.Draft, false)]
+    [InlineData(SendKind.Retry, false)]
+    public void Cancel_keeps_a_suspect_document(SendKind kind, bool keeps)
+    {
+        Assert.Equal(keeps, New().CancelKeepsDocumentFor(kind));
+        Assert.False(New(null).CancelKeepsDocumentFor(kind)); // the tray's test page has no document
+    }
+
+    [Fact]
+    public void Cancel_keeps_a_locked_document_of_any_kind()
+    {
+        var s = New();
+        var list = new List<SendPlan>();
+        Run(s, "U", list);
+        Assert.True(s.CancelKeepsDocumentFor(SendKind.New));
+    }
+
+    [Fact]
+    public void A_config_error_after_Started_is_not_sent_and_changes_nothing()
+    {
+        var s = New();
+        var key = s.IdempotencyKey;
+        s.Started(s.Build("5552345678", null, false, false));
+        Assert.Equal(AttemptOutcome.NotSent, s.Failed(new FaxApiConfigException("bad server")));
+        Assert.False(s.InFlight);
+        Assert.False(s.FieldsLocked);
+        Assert.Equal(key, s.IdempotencyKey);
+    }
 }
 
 public class SendOutcomeTests
@@ -226,6 +258,8 @@ public class SendOutcomeTests
         { new FaxApiException(0, "cannot reach faxd"), AttemptOutcome.Uncertain },
         { new FaxApiException(200, "unreadable"), AttemptOutcome.Uncertain },
         { new FaxApiException(307, "Temporary Redirect"), AttemptOutcome.Uncertain },
+        // The request URI could not be built from the settings: provably nothing went out.
+        { new FaxApiConfigException("bad server"), AttemptOutcome.NotSent },
         // Anything else thrown after Started: the request may have gone out.
         { new ArgumentException("the fax number has no digits"), AttemptOutcome.Uncertain },
         { new TaskCanceledException(), AttemptOutcome.Uncertain },

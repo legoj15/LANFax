@@ -8,6 +8,7 @@ public sealed class SendExecutorTests : IDisposable
 {
     readonly string _dir = Path.Combine(Path.GetTempPath(), "lanfax-se-" + Guid.NewGuid().ToString("N"));
     string Jobs => Path.Combine(_dir, "jobs");
+    readonly ClientConfig Cfg = new() { Server = "127.0.0.1", Port = 8080, Token = "tok-a" };
 
     public SendExecutorTests() => Directory.CreateDirectory(Jobs);
     public void Dispose() { try { Directory.Delete(_dir, true); } catch { } }
@@ -22,20 +23,21 @@ public sealed class SendExecutorTests : IDisposable
         public Func<string?>? OnCall;
         public readonly List<string?> DiskAtCall = new();
         public byte[]? Body;
+        public readonly List<SendEndpoint> Endpoints = new();
 
-        public Task<Job> PostJobAsync(Stream pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default)
+        public Task<Job> PostJobAsync(SendEndpoint endpoint, byte[] pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default)
         {
             Calls.Add($"post {to} {subject} {idempotencyKey}");
+            Endpoints.Add(endpoint);
             DiskAtCall.Add(OnCall?.Invoke());
-            using var ms = new MemoryStream();
-            pdf.CopyTo(ms);
-            Body = ms.ToArray();
+            Body = pdf;
             return Task.FromResult((answer ?? (() => J("lf1")))());
         }
 
-        public Task<Job> SendTestPageAsync(string to, string? note, string idempotencyKey, CancellationToken ct = default)
+        public Task<Job> SendTestPageAsync(SendEndpoint endpoint, string to, string? note, string idempotencyKey, CancellationToken ct = default)
         {
             Calls.Add($"test {to} {note} {idempotencyKey}");
+            Endpoints.Add(endpoint);
             DiskAtCall.Add(OnCall?.Invoke());
             return Task.FromResult((answer ?? (() => J("lf2")))());
         }
@@ -65,7 +67,7 @@ public sealed class SendExecutorTests : IDisposable
         api.OnCall = () => RecordAt(id);
         var session = new SendSession(id, pdf);
         var plan = session.Build("555 234 5678", "hello", false, false);
-        var r = await new SendExecutor(api, new JobTracker(_dir)).RunAsync(session, plan);
+        var r = await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, plan);
 
         Assert.Equal(SendAttemptStatus.Accepted, r.Status);
         Assert.Equal("lf1", r.Job!.Id);
@@ -84,7 +86,7 @@ public sealed class SendExecutorTests : IDisposable
         api.OnCall = () => RecordAt(id);
         var session = new SendSession(id, pdf);
         var plan = session.Build("5552345678", null, useTestPage: true, false);
-        var r = await new SendExecutor(api, new JobTracker(_dir)).RunAsync(session, plan);
+        var r = await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, plan);
         Assert.Equal(SendAttemptStatus.Accepted, r.Status);
         Assert.StartsWith("test 15552345678", api.Calls.Single());
         Assert.Equal(new[] { "sending " + plan.IdempotencyKey }, api.DiskAtCall);
@@ -99,7 +101,7 @@ public sealed class SendExecutorTests : IDisposable
         var api = new FakeApi();
         var session = new SendSession(id, pdf);
         var plan = session.Build("5552345678", null, false, false);
-        var r = await new SendExecutor(api, new JobTracker(blocked)).RunAsync(session, plan);
+        var r = await new SendExecutor(api, Cfg, new JobTracker(blocked)).RunAsync(session, plan);
 
         Assert.Equal(SendAttemptStatus.NotSent, r.Status);
         Assert.StartsWith("Nothing was sent: the send could not be recorded on disk", r.Message);
@@ -116,7 +118,7 @@ public sealed class SendExecutorTests : IDisposable
         File.Delete(pdf);
         var api = new FakeApi();
         var session = new SendSession(id, pdf);
-        var r = await new SendExecutor(api, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, false, false));
+        var r = await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, false, false));
         Assert.Equal(SendAttemptStatus.NotSent, r.Status);
         Assert.StartsWith("Cannot read the document", r.Message);
         Assert.Empty(api.Calls);
@@ -132,7 +134,7 @@ public sealed class SendExecutorTests : IDisposable
         var api = new FakeApi(() => throw new FaxApiException(status, "boom"));
         var session = new SendSession(id, pdf);
         var plan = session.Build("5552345678", null, false, false);
-        var r = await new SendExecutor(api, new JobTracker(_dir)).RunAsync(session, plan);
+        var r = await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, plan);
         Assert.Equal(SendAttemptStatus.Failed, r.Status);
         Assert.Equal(outcome, r.Outcome);
         Assert.Equal("boom", r.Message);
@@ -147,9 +149,163 @@ public sealed class SendExecutorTests : IDisposable
     {
         var api = new FakeApi();
         var session = new SendSession(Guid.NewGuid(), null);
-        var r = await new SendExecutor(api, null).RunAsync(session, session.Build("5552345678", null, false, false));
+        var r = await new SendExecutor(api, Cfg, null).RunAsync(session, session.Build("5552345678", null, false, false));
         Assert.Equal(SendAttemptStatus.Accepted, r.Status);
         Assert.Single(api.Calls);
         Assert.Empty(Directory.GetFiles(Jobs));
+    }
+
+    // ---- review finding 1: a server/port that cannot form a URI never reaches Started ----
+
+    [Theory]
+    [InlineData("127.0.0.1:1", 8080)]
+    [InlineData("127.0.0.1", 0)]
+    public async Task An_unusable_server_or_port_is_not_sent_and_not_recorded(string server, int port)
+    {
+        var (id, pdf) = Spooled();
+        var handler = new StubHandler(_ => throw new InvalidOperationException("no request may be made"));
+        using var http = new HttpClient(handler);
+        var cfg = new ClientConfig { Server = server, Port = port, Token = "t" };
+        var session = new SendSession(id, pdf);
+        var r = await new SendExecutor(new FaxApi(cfg, http), cfg, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, false, false));
+
+        Assert.Equal(SendAttemptStatus.NotSent, r.Status);
+        Assert.Contains("Settings", r.Message);
+        Assert.Empty(handler.Requests);
+        Assert.Null(RecordAt(id));
+        Assert.Equal(0, session.Attempts);
+        Assert.False(session.FieldsLocked);
+    }
+
+    [Fact]
+    public async Task A_config_error_thrown_after_Started_is_still_not_sent()
+    {
+        var (id, pdf) = Spooled();
+        var api = new FakeApi(() => throw new FaxApiConfigException("bad server"));
+        var session = new SendSession(id, pdf);
+        var key = session.IdempotencyKey;
+        var r = await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, false, false));
+        Assert.Equal(SendAttemptStatus.NotSent, r.Status);
+        Assert.False(session.FieldsLocked);
+        Assert.False(session.InFlight);
+        Assert.Equal(key, session.IdempotencyKey);
+        Assert.StartsWith("draft", RecordAt(id));
+    }
+
+    // ---- review finding 2: the endpoint is frozen when the send starts ----
+
+    [Fact]
+    public async Task Settings_saved_between_attempts_do_not_move_the_retry()
+    {
+        var (id, pdf) = Spooled();
+        var cfg = new ClientConfig { Server = "127.0.0.1", Port = 8081, Token = "tok-a" };
+        int n = 0;
+        var handler = new StubHandler(_ => ++n == 1
+            ? new System.Net.Http.HttpResponseMessage(System.Net.HttpStatusCode.ServiceUnavailable)
+            : Json201());
+        using var http = new HttpClient(handler);
+        var api = new FaxApi(cfg, http)
+        {
+            // The user saves Settings during the backoff: another server, another token.
+            Delay = (_, _) => { cfg.Server = "10.9.9.9"; cfg.Port = 9999; cfg.Token = "tok-b"; return Task.CompletedTask; },
+        };
+        var session = new SendSession(id, pdf);
+        var r = await new SendExecutor(api, cfg, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, false, false));
+
+        Assert.Equal(SendAttemptStatus.Accepted, r.Status);
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.All(handler.Requests, q =>
+        {
+            Assert.Equal("http://127.0.0.1:8081/jobs", q.Uri);
+            Assert.Equal("Bearer tok-a", q.Auth);
+        });
+    }
+
+    [Fact]
+    public async Task A_locked_send_is_not_resent_to_a_different_server()
+    {
+        var (id, pdf) = Spooled();
+        var cfg = new ClientConfig { Server = "127.0.0.1", Port = 8081, Token = "tok-a" };
+        var fail = true;
+        var api = new FakeApi(() => fail ? throw new FaxApiException(0, "timeout") : J("lf9"));
+        var session = new SendSession(id, pdf);
+        var exec = new SendExecutor(api, cfg, new JobTracker(_dir));
+        var first = await exec.RunAsync(session, session.Build("5552345678", null, false, false));
+        Assert.Equal(AttemptOutcome.Uncertain, first.Outcome);
+
+        // Settings now point at another fax server: the same key there would dial a second time.
+        cfg.Server = "10.9.9.9";
+        fail = false;
+        var second = await exec.RunAsync(session, session.Build("5552345678", null, false, false));
+        Assert.Equal(SendAttemptStatus.NotSent, second.Status);
+        Assert.Contains("127.0.0.1", second.Message);
+        Assert.Single(api.Calls);
+        Assert.StartsWith("uncertain", RecordAt(id));
+
+        // Back on the original server (a new token is fine: same server, same key) it goes out.
+        cfg.Server = "127.0.0.1";
+        cfg.Token = "tok-new";
+        var third = await exec.RunAsync(session, session.Build("5552345678", null, false, false));
+        Assert.Equal(SendAttemptStatus.Accepted, third.Status);
+        Assert.Equal("tok-new", api.Endpoints[^1].Token);
+    }
+
+    [Fact]
+    public async Task The_endpoint_is_taken_from_the_config_when_the_attempt_starts()
+    {
+        var (id, pdf) = Spooled();
+        var api = new FakeApi();
+        var session = new SendSession(id, pdf);
+        await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, false, false));
+        var ep = Assert.Single(api.Endpoints);
+        Assert.Equal(new Uri("http://127.0.0.1:8080/"), ep.BaseUri);
+        Assert.Equal("tok-a", ep.Token);
+    }
+
+    // ---- review finding 6 (low): documents over faxd's body limit are refused before anything is recorded ----
+
+    [Fact]
+    public async Task A_document_over_the_server_limit_is_not_sent()
+    {
+        var (id, pdf) = Spooled();
+        using (var fs = new FileStream(pdf, FileMode.Open)) fs.SetLength(FaxApi.MaxBodyBytes + 1L);
+        var api = new FakeApi();
+        var session = new SendSession(id, pdf);
+        var r = await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, false, false));
+        Assert.Equal(SendAttemptStatus.NotSent, r.Status);
+        Assert.Contains("25 MB", r.Message);
+        Assert.Empty(api.Calls);
+        Assert.Null(RecordAt(id));
+    }
+
+    [Fact]
+    public async Task A_test_page_instead_of_an_oversized_document_is_allowed()
+    {
+        var (id, pdf) = Spooled();
+        using (var fs = new FileStream(pdf, FileMode.Open)) fs.SetLength(FaxApi.MaxBodyBytes + 1L);
+        var api = new FakeApi();
+        var session = new SendSession(id, pdf);
+        var r = await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, true, false));
+        Assert.Equal(SendAttemptStatus.Accepted, r.Status);
+    }
+
+    static System.Net.Http.HttpResponseMessage Json201() => new(System.Net.HttpStatusCode.Created)
+    {
+        Content = new StringContent("""
+            {"id":"lf0123456789ab","direction":"out","state":"queued","to_number":"15552345678",
+             "created_at":"2026-09-29T15:00:00+00:00","updated_at":"2026-09-29T15:00:01+00:00"}
+            """, System.Text.Encoding.UTF8, "application/json"),
+    };
+
+    sealed record Seen(string Uri, string? Auth);
+
+    sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> answer) : HttpMessageHandler
+    {
+        public readonly List<Seen> Requests = new();
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            Requests.Add(new Seen(request.RequestUri!.ToString(), request.Headers.Authorization?.ToString()));
+            return Task.FromResult(answer(request));
+        }
     }
 }

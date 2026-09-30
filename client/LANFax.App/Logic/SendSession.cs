@@ -30,8 +30,12 @@ public static class SendOutcome
         _ => AttemptOutcome.Uncertain,
     };
 
-    public static AttemptOutcome Classify(Exception e) =>
-        e is FaxApiException f ? Classify(f.StatusCode) : AttemptOutcome.Uncertain;
+    public static AttemptOutcome Classify(Exception e) => e switch
+    {
+        FaxApiConfigException => AttemptOutcome.NotSent, // the request URI could not be built: nothing went out
+        FaxApiException f => Classify(f.StatusCode),
+        _ => AttemptOutcome.Uncertain,
+    };
 
     /// <summary>The text shown under the fields after a failed attempt.</summary>
     public static string Describe(Exception e) => e switch
@@ -70,6 +74,7 @@ public sealed class SendSession
 
     private readonly Func<Guid> _newKey;
     private SendPlan? _inFlight;
+    private Uri? _inFlightServer;
 
     public SendSession(Guid spoolId, string? pdfPath, Func<Guid>? newKey = null)
     {
@@ -97,12 +102,23 @@ public sealed class SendSession
     public string IdempotencyKey { get; private set; }
     public int Attempts { get; private set; }
     public SendPlan? LockedPlan { get; private set; }
+    /// <summary>
+    /// The server the uncertain attempt went to (null when not locked, or locked from disk). The key may be queued
+    /// there, so the locked request must not go to any other server.
+    /// </summary>
+    public Uri? LockedServer { get; private set; }
     public bool FieldsLocked => LockedPlan != null;
     /// <summary>
     /// Cancel keeps the document (listed under "Unsent documents") instead of deleting it: the server may have the
     /// job, so the document and its record must not be lost. The tray's test page has no document to keep.
     /// </summary>
     public bool CancelKeepsDocument => FieldsLocked && PdfPath != null;
+
+    /// <summary>
+    /// <see cref="CancelKeepsDocument"/>, and also for a <see cref="SendKind.Suspect"/> document: its warning says it
+    /// may already have been sent, so a user who cancels rather than risk a duplicate must not lose it.
+    /// </summary>
+    public bool CancelKeepsDocumentFor(SendKind kind) => PdfPath != null && (FieldsLocked || kind == SendKind.Suspect);
     /// <summary>Locked from a record on disk (a previous run), not by a failure in this dialog.</summary>
     public bool Resumed { get; }
     public bool InFlight => _inFlight != null;
@@ -115,11 +131,13 @@ public sealed class SendSession
             keepLocalCopies, IdempotencyKey);
 
     /// <summary>The request is about to go out. Call after the plan is validated and persisted.</summary>
-    public void Started(SendPlan plan)
+    /// <param name="server">The base URI it goes to; pinned as <see cref="LockedServer"/> if the attempt turns out uncertain.</param>
+    public void Started(SendPlan plan, Uri? server = null)
     {
         if (_inFlight != null) throw new InvalidOperationException("an attempt is already in flight");
         Attempts++;
         _inFlight = plan;
+        _inFlightServer = server;
     }
 
     public void Succeeded(Job job)
@@ -131,7 +149,18 @@ public sealed class SendSession
     }
 
     /// <summary>Records what the attempt in flight threw: classified by <see cref="SendOutcome"/>, with its status.</summary>
-    public AttemptOutcome Failed(Exception e) => Failed(SendOutcome.Classify(e), (e as FaxApiException)?.StatusCode);
+    public AttemptOutcome Failed(Exception e)
+    {
+        var o = SendOutcome.Classify(e);
+        if (o == AttemptOutcome.NotSent)
+        {
+            // Thrown before any request was built (FaxApiConfigException): the attempt in flight provably sent
+            // nothing, so it ends without changing the key or the lock.
+            _inFlight = null;
+            return o;
+        }
+        return Failed(o, (e as FaxApiException)?.StatusCode);
+    }
 
     /// <summary>
     /// Records a failed attempt. <see cref="AttemptOutcome.NotSent"/> is for validation failures before
@@ -150,12 +179,14 @@ public sealed class SendSession
         if (o == AttemptOutcome.Uncertain)
         {
             LockedPlan ??= plan; // once uncertain, the same request until the server proves it has nothing
+            LockedServer ??= _inFlightServer; // ...and to the same server
             return o;
         }
         if (LockedPlan != null)
         {
             if (status is null or 401) return o; // no proof the server lacks the job: stay locked, same key
             LockedPlan = null;
+            LockedServer = null;
         }
         IdempotencyKey = _newKey().ToString();
         return o;

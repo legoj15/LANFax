@@ -10,7 +10,7 @@ internal enum DialogOutcome
     Accepted,
     /// <summary>The user pressed Cancel or closed the window: discard the PDF.</summary>
     Cancelled,
-    /// <summary>The user cancelled a locked (possibly already sent) job: keep the PDF and its record.</summary>
+    /// <summary>The user cancelled a locked or suspect (possibly already sent) job: keep the PDF and its record.</summary>
     Kept,
     /// <summary>Closed by app exit or Windows shutdown: keep the PDF (offered again at next start).</summary>
     Abandoned,
@@ -63,7 +63,7 @@ internal sealed class SendDialog : Form
     public SendDialog(ClientConfig cfg, ISendApi api, SendRequest request, JobTracker? journal, Action openSettings)
     {
         _cfg = cfg; _openSettings = openSettings;
-        _executor = new SendExecutor(api, request.PdfPath != null ? journal : null,
+        _executor = new SendExecutor(api, cfg, request.PdfPath != null ? journal : null,
             (m, e) => { if (e == null) FileLog.Info(m); else FileLog.Error(m, e); });
         Request = request;
         Session = request.LockedPlan is { } locked ? SendSession.Resume(locked) : new SendSession(request.SpoolId, request.PdfPath);
@@ -239,9 +239,10 @@ internal sealed class SendDialog : Form
         }
         if (Outcome == DialogOutcome.Accepted) return;
         // Only an explicit user close discards the document; app exit or shutdown keeps it for next start.
-        // While locked (resumed, or uncertain in this run) the server may have the job: Cancel keeps it.
+        // While locked (resumed, or uncertain in this run) the server may have the job, and a Suspect document says
+        // it may already have been sent: Cancel keeps it.
         Outcome = e.CloseReason != CloseReason.UserClosing ? DialogOutcome.Abandoned
-            : Session.CancelKeepsDocument ? DialogOutcome.Kept : DialogOutcome.Cancelled;
+            : Session.CancelKeepsDocumentFor(Request.Kind) ? DialogOutcome.Kept : DialogOutcome.Cancelled;
     }
 
     protected override void Dispose(bool disposing)

@@ -160,6 +160,7 @@ public class PrinterSetupTests
     sealed class FakeReader(params string[] keys) : IPrinterKeyReader
     {
         public bool Exists(string printerName) => keys.Contains(printerName, StringComparer.OrdinalIgnoreCase);
+        public string? Port(string printerName) => Exists(printerName) ? @"C:\spool\print.pdf" : null;
     }
 
     [Fact]
@@ -229,6 +230,48 @@ public class PrinterSetupTests
     sealed class FuncReader(Func<string, bool> f) : IPrinterKeyReader
     {
         public bool Exists(string printerName) => f(printerName);
+        public string? Port(string printerName) => f(printerName) ? @"C:\spool\print.pdf" : null;
+    }
+
+    sealed class PortReader(string? port) : IPrinterKeyReader
+    {
+        public bool Exists(string printerName) => port != null;
+        public string? Port(string printerName) => port;
+    }
+
+    [Theory]
+    [InlineData(null, PrinterState.Missing)]
+    [InlineData(@"C:\ProgramData\LANFax\spool\print.pdf", PrinterState.Installed)]
+    [InlineData(@"c:\programdata\lanfax\SPOOL\print.pdf", PrinterState.Installed)]
+    [InlineData(@"C:\Old\spool\print.pdf", PrinterState.Misconfigured)]
+    [InlineData("PORTPROMPT:", PrinterState.Misconfigured)]
+    [InlineData("", PrinterState.Misconfigured)]
+    public void Status_compares_the_printer_port_with_the_watched_path(string? port, PrinterState expected)
+    {
+        var st = new PrinterSetup(new PortReader(port)).Status("LAN Fax", @"C:\ProgramData\LANFax\spool\");
+        Assert.Equal(expected, st.State);
+        Assert.Equal(port, st.ActualPort);
+    }
+
+    [Fact]
+    public void Expected_port_is_print_pdf_in_the_spool_dir() =>
+        Assert.Equal(@"C:\ProgramData\LANFax\spool\print.pdf", PrinterSetup.ExpectedPort(@"C:\ProgramData\LANFax\spool\"));
+
+    [Fact]
+    public void Misconfigured_notice_names_the_port() =>
+        Assert.Equal(@"The ""LAN Fax"" printer points at C:\Old\print.pdf, not the LANFax spool. Click here to fix it.",
+            NotificationText.PrinterMisconfigured("LAN Fax", @"C:\Old\print.pdf"));
+
+    [Fact]
+    public async Task Install_reports_a_printer_still_on_the_wrong_port()
+    {
+        var script = Path.GetTempFileName();
+        try
+        {
+            var ps = new PrinterSetup(new PortReader(@"C:\Old\print.pdf"), _ => Task.CompletedTask);
+            Assert.StartsWith(@"The printer still points at C:\Old\print.pdf", await ps.InstallAsync(@"C:\spool", "LAN Fax", script));
+        }
+        finally { File.Delete(script); }
     }
 }
 

@@ -30,24 +30,24 @@ client/
   global.json                       pins SDK 10.0.x
   LANFax.sln
   LANFax.Core/                      net10.0 class library: no UI
-    ClientConfig.cs                 %ProgramData%\LANFax\config.json (server, port, DPAPI token, printer name, spool dir); Load never throws, sets LoadError
-    Dpapi.cs                        machine-scope DPAPI via crypt32 P/Invoke (no NuGet package)
-    FaxApi.cs                       ISendApi (post job, test send) + HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download
+    ClientConfig.cs                 %ProgramData%\LANFax\config.json (server, port, printer name, spool dir) + per-user %LocalAppData%\LANFax\token.bin; Validate(); Load never throws, sets LoadError
+    Dpapi.cs                        DPAPI via crypt32 P/Invoke (no NuGet package); Protect takes a DpapiScope (CurrentUser for the token)
+    FaxApi.cs                       ISendApi (post job, test send, both to a SendEndpoint snapshot, PDF as byte[]) + HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download; FaxApiConfigException
     EventStream.cs                  SSE client: GET /events?token=, Last-Event-ID, stall detection, reconnect with backoff, raises typed events
     SpoolWatcher.cs                 watches the port path; stability wait; %PDF and %%EOF checks; moves to jobs/<guid>.pdf (or rejected/<guid>.pdf); raises NewPrintJob / Error
     Numbers.cs                      normalize_number / check_number mirror (shared vectors: LANFax.Tests/numbers-vectors.json)
     Models.cs                       Job, ArmState, ServerStatus records mirroring faxd JSON
   (PrinterSetup, which detects the printer and launches the elevated install/uninstall script, lives in LANFax.App)
   LANFax.App/                       net10.0-windows WinForms, single-file self-contained win-x64
-    Program.cs                      single-instance mutex; tray icon; no console
+    Program.cs                      machine-wide single-instance mutex (Global\LANFax.Tray, see "One active session"); tray icon; no console
     TrayContext.cs                  NotifyIcon + menu: Open, Send a test..., Receive a test (arm 20 min), Settings, Install printer, Exit
     SendDialog.cs                   non-modal; number, subject, page count, Send / Cancel; "Send test page instead" checkbox
-    Logic/                          testable plain classes: SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, ...
-    MainForm.cs                     (phase 3) status header, arm card with countdown, jobs grid, inbox grid, open PDF
+    Logic/                          testable plain classes: SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer, InstanceGuard, ...
+    MainForm.cs                     (phase 3, NOT YET WRITTEN) status header, arm card with countdown, jobs grid, inbox grid, open PDF
     SettingsDialog.cs               server host/ip, port, token, "Clear token", "Test connection"
   LANFax.Tests/                     xunit: Core only (no UI)
   install/
-    Install-LANFaxPrinter.ps1       elevated: Add-PrinterPort -Name <spool path>; Add-Printer -Name "LAN Fax" -DriverName "Microsoft Print To PDF" -PortName <spool path>; idempotent
+    Install-LANFaxPrinter.ps1       elevated: Add-PrinterPort -Name <spool path>; Add-Printer -Name "LAN Fax" -DriverName "Microsoft Print To PDF" -PortName <spool path>, or Set-Printer -PortName <spool path> when the printer exists on another port; idempotent
     Uninstall-LANFaxPrinter.ps1     removes printer and port; leaves %ProgramData%\LANFax
     (both scripts self-elevate by relaunching with ONE -ArgumentList command-line string, never a pre-quoted array)
     LANFax.iss                      Inno Setup: installs app to Program Files, runs Install-LANFaxPrinter.ps1 from [Code] (non-zero exit = non-fatal message), adds Run key for tray autostart; uninstall taskkills LANFax.exe in CurUninstallStepChanged(usUninstall) (after the user confirms), then removes the printer; /DAppSource=<dir> overrides the published app folder (the test suite compiles against a stub)
@@ -65,6 +65,13 @@ client/
   `Flags: uninsneveruninstall`: uninstalling keeps `config.json`, unsent
   documents (`spool\jobs`), kept copies (`spool\sent`) and rejected print
   files; a reinstall picks them up.
+- The app checks the binding, not only the name: `PrinterSetup.Status` reads
+  `HKLM\SYSTEM\CurrentControlSet\Control\Print\Printers\<name>` and its
+  `Port` value and returns Installed (port is `<spool dir>\print.pdf`,
+  case-insensitive), Misconfigured (another port) or Missing. Misconfigured
+  shows "The "LAN Fax" printer points at X, not the LANFax spool. Click here
+  to fix it." and the tray item becomes "Fix ... printer"; both re-run the
+  install script, which moves the queue with `Set-Printer`.
 - Watcher: `FileSystemWatcher` on the spool dir (Created/Changed) plus a 2 s
   polling fallback. A job is complete when the file has existed for at least
   1 s, its size is unchanged across two checks, and it can be opened with
@@ -121,8 +128,18 @@ client/
    retried).
 5. `SendSession` (one per dialog) owns the key, a fresh GUID that is not the
    spool file id. One attempt, in order: validate the number (`SendPlan`),
-   read the PDF, persist `sending` (step 6), `Started`, send. A failure before
-   `Started` is "not sent" and changes nothing; anything thrown after it is
+   refuse a PDF over faxd's `MAX_BODY` (25 MB, `FaxApi.MaxBodyBytes`), read
+   it, snapshot the endpoint (`SendEndpoint.From(cfg)`: base URI + token; a
+   server/port that cannot form a URI is refused here), persist `sending`
+   (step 6), `Started`, send. Every attempt of that send, FaxApi's retries
+   included, goes to the snapshot, so Settings saved mid-retry cannot replay
+   the key to another server; Settings also refuse Save while a send is in
+   flight ("Wait for the current fax to finish"). A session locked by an
+   uncertain attempt pins that server (`LockedServer`): a later Send while
+   Settings point elsewhere is "not sent" with a message naming both (a new
+   token for the same server is fine). A failure before `Started` is "not
+   sent" and changes nothing; a `FaxApiConfigException` (the URI could not be
+   built) is "not sent" even after `Started`; anything thrown after it is
    classified by the pure `SendOutcome.Classify` (4xx = rejected, everything
    else including 3xx, 5xx, status 0, an unreadable 2xx and non-API
    exceptions = uncertain):
@@ -170,7 +187,8 @@ client/
    the dialog is locked (resumed from disk, or after an uncertain failure in
    this run), where Cancel keeps both and the document is listed under
    "Unsent documents (N)..." in the tray menu (the record says `uncertain`,
-   so the next start reopens it locked). A locked dialog that a definite 4xx
+   so the next start reopens it locked). A Suspect document ("may already
+   have been sent") is kept on Cancel too. A locked dialog that a definite 4xx
    unlocked is a draft again: Cancel deletes. The tray's test page has no
    document, so its Cancel keeps nothing. App exit or shutdown with a dialog
    open keeps the PDF.
@@ -196,8 +214,9 @@ client/
    flushed temp write and the rename) is adopted when it parses as a record;
    a torn temp file, or one beside an existing json, is ignored.
 9. Exit: if a send is on the wire, the tray asks "A fax is being sent. Wait
-   for it?". Yes waits up to 30 s for the result (an accepted job is still
-   recorded), No exits at once; the `sending` record already prevents a
+   for it?". Yes disables the dialog (no second attempt can start) and waits
+   while it is sending, up to 30 s in all, for the result (an accepted job is
+   still recorded), No exits at once; the `sending` record already prevents a
    duplicate. On Windows shutdown during a send the dialog refuses the
    first close and registers a shutdown block reason ("A fax is being
    sent."), so Windows shows it and the user can still force the shutdown.
@@ -207,15 +226,46 @@ client/
    pending click action. A click stops the timer before its action runs (the
    action may open a modal dialog that pumps messages), timeouts and closes
    are ignored while it runs, and the next balloon shows once it returns. Startup balloons: settings problem
-   (`ClientConfig.LoadError`, click opens Settings), printer missing, token
-   missing. A 401 on the event stream shows "The server rejected the LANFax
+   (`ClientConfig.LoadError`, click opens Settings), printer missing or on
+   the wrong port (click installs/fixes), token missing. A 401 on the event stream shows "The server rejected the LANFax
    token" once per app run (again after Settings are saved); the click opens
    Settings. `SpoolWatcher.Error` shows a balloon (Core rate-limits it).
    `FaxApi`, `EventStream` and `SpoolWatcher` `Log` go to the app log.
 11. The dialog queue opens the next dialog even if one fails to open (that
    document goes to "Unsent documents (N)...") or its close handler throws.
-## Monitor (phase 3)
+## Inbound catch-up (phase 2, tray)
 
+- `InboundAnnouncer` decides which received faxes get "Fax received from X":
+  a live `received` event and a catch-up both go through it, so each fax is
+  announced once. It keeps the last 200 announced ids and the newest inbound
+  `updated_at` seen in `%LocalAppData%\LANFax\announced.json` (a restart
+  does not re-announce them).
+- On every stream `Connected` (first connect and each reconnect) and on a
+  `resync`, the tray calls `GET /jobs?direction=in&state=received&limit=100
+  &updated_since=<resync since, else newest seen>` and announces the ids not
+  announced yet, oldest first (more than 3 give one summary balloon, "N faxes
+  were received while LANFax was not connected"). With no state at all (first
+  run) the list is taken as a silent baseline.
+
+## One active session
+
+- The spool file and `spool\jobs` journal are machine-wide, so only one
+  LANFax runs per machine: the mutex is `Global\LANFax.Tray`. A second start
+  in the same session asks the running tray for its "already running"
+  balloon (`Local\LANFax.Tray.ShowRunning`); a start in another Windows
+  session (fast user switching, RDP) shows "LANFax is already running in
+  another session" and exits. Print jobs from the other session still land in
+  the spool and are offered on the active instance's desktop: on a shared PC
+  only one user at a time should be signed in with LANFax.
+
+## Monitor (phase 3, pending)
+
+- **Not implemented yet.** There is no `MainForm`; "Open LANFax" opens the web
+  page. Core's `GetStatusAsync`, `ServerStatus.Merge`, `ArmState`,
+  `GetInboxAsync`, `DownloadPdfAsync`, `ArmAsync`/`DisarmAsync` and the
+  `EventStream.StatusChanged`/`ArmChanged` events exist for it and have no
+  production caller until then (only the inbound catch-up uses `GetJobsAsync`).
+  The arm-window-expiring balloon is part of this phase.
 - `MainForm` mirrors the web page: status pill (registrations, daemon,
   receiving), arm card with countdown and buttons (1 h, 4 h, 8 h, 20 min test
   window, Disarm), jobs grid (time, to, state badge, pages, error), inbox
@@ -231,7 +281,7 @@ client/
   arrives for `StallTimeout` (45 s) the stream is aborted, `Disconnected`
   gets a `TimeoutException`, and it reconnects with `Last-Event-ID`.
 - A `resync` event (`{"reason","since"}`, sent when the replay gap is too large)
-  raises `EventStream.Resync(since)`; the tray polls tracked jobs, and the
+  raises `EventStream.Resync(since)`; the tray polls tracked jobs and runs the inbound catch-up, and the
   grids reload with `GET /jobs?updated_since=<since>` instead of expecting replay.
 - `FaxApi`, `EventStream` and `SpoolWatcher` each take an optional
   `Log` (`Action<string>`) for diagnostics (skipped list rows, malformed
@@ -244,15 +294,28 @@ client/
 
 ## Config
 
-`%ProgramData%\LANFax\config.json`:
+`%ProgramData%\LANFax\config.json` (shared by every Windows user, no secret):
 ```json
-{ "server": "192.0.2.10", "port": 8080, "token": "<DPAPI machine-scope, base64>", "keepLocalCopies": false }
+{ "server": "192.0.2.10", "port": 8080, "token": null, "keepLocalCopies": false, "printerName": "LAN Fax", "spoolDir": "..." }
 ```
+The token is per Windows user: `%LocalAppData%\LANFax\token.bin`, the raw
+DPAPI blob protected with `DpapiScope.CurrentUser`, so a standard user on a
+shared PC cannot read another user's token (the shared directory grants
+Users Modify). Clearing the token deletes the file. Migration: a `token`
+still in the shared file (machine-scope, written by older versions) is
+decrypted, re-protected into the user's `token.bin` and removed from the
+shared file on first load; once a user has `token.bin`, a shared token is
+removed and ignored. Each other user enters the token once. The Settings
+dialog is unchanged.
 Default server is the IP, not the hostname, so VPN name resolution never
 matters. Settings dialog has "Test connection" (`GET /status`).
-`ClientConfig.Load` never throws: a blank, corrupt or unreadable file gives
-defaults, and a token that is not base64 or not decryptable on this machine
-is dropped; both set `LoadError` (never contains the token) for the App to
+`ClientConfig.Validate()` checks port 1..65535 and that the server is a bare
+host name or IP (no port, scheme or path) that forms a URI; Settings refuse
+to save (or test) anything it rejects.
+`ClientConfig.Load(path, tokenPath)` never throws: a blank, corrupt or
+unreadable file gives defaults; an unusable port or server falls back to the
+default for that value; a token that is not decryptable for this user is
+dropped; all set `LoadError` (never contains the token) for the App to
 show.
 
 ## Build and test rules
@@ -270,4 +333,5 @@ show.
   `client/LANFax.Tests/numbers-vectors.json` and its identical copy
   `server/tests/numbers-vectors.json` (`tests.test_numbers_vectors` checks
   both copies match). Edit both together.
-- The app never stores the token in plain text and never logs it.
+- The app never stores the token in plain text, never in the shared config,
+  and never logs it.

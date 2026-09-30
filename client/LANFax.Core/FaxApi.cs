@@ -17,17 +17,49 @@ public class FaxApiException(int statusCode, string message, Exception? inner = 
 
 public sealed class FaxApiUnauthorizedException() : FaxApiException(401, "unauthorized (check the token in Settings)");
 
+/// <summary>
+/// The settings cannot form a request URI (a server with a port or path in it, a port outside 1..65535). Thrown
+/// before any request is built, so it proves nothing was sent; never retried. StatusCode is 0.
+/// </summary>
+public sealed class FaxApiConfigException(string message) : FaxApiException(0, message);
+
+/// <summary>
+/// Where one send goes: the base URI and token as they were when the send started. Every attempt of that send
+/// (FaxApi's retries included) uses this snapshot, so saving Settings mid-retry cannot replay its Idempotency-Key
+/// against another server.
+/// </summary>
+public sealed record SendEndpoint(Uri BaseUri, string? Token)
+{
+    /// <exception cref="FaxApiConfigException">the server or port cannot form a URI (<see cref="ClientConfig.Validate"/>)</exception>
+    public static SendEndpoint From(ClientConfig cfg)
+    {
+        if (cfg.Validate() is { } err) throw new FaxApiConfigException(err);
+        try { return new SendEndpoint(cfg.BaseUri, cfg.Token); }
+        catch (Exception e) when (e is UriFormatException or InvalidOperationException or ArgumentException)
+        {
+            throw new FaxApiConfigException("the server address cannot be used: " + e.Message);
+        }
+    }
+}
+
 /// <summary>The two requests that submit a fax; the send dialog's <c>SendExecutor</c> depends on this, not on HTTP.</summary>
 public interface ISendApi
 {
-    Task<Job> PostJobAsync(Stream pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default);
-    Task<Job> SendTestPageAsync(string to, string? note, string idempotencyKey, CancellationToken ct = default);
+    Task<Job> PostJobAsync(SendEndpoint endpoint, byte[] pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default);
+    Task<Job> SendTestPageAsync(SendEndpoint endpoint, string to, string? note, string idempotencyKey, CancellationToken ct = default);
 }
 
-/// <summary>HttpClient wrapper for the faxd API. The token is sent as a Bearer header and never logged.</summary>
+/// <summary>
+/// HttpClient wrapper for the faxd API. The token is sent as a Bearer header and never logged. Calls without a
+/// <see cref="SendEndpoint"/> snapshot the config once per call; a config that cannot form a URI throws
+/// <see cref="FaxApiConfigException"/> before any request.
+/// </summary>
 public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi
 {
     public const int MaxAttempts = 3;
+
+    /// <summary>faxd's MAX_BODY: a larger POST /jobs body is refused (413), so the client does not upload it.</summary>
+    public const int MaxBodyBytes = 25 * 1024 * 1024;
 
     /// <summary>Waits before attempt 2, 3 (index 0, 1). Tests replace <see cref="Delay"/>.</summary>
     public IReadOnlyList<TimeSpan> Backoffs { get; set; } =
@@ -104,14 +136,28 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi
     /// <exception cref="ArgumentException"><paramref name="to"/> has non-ASCII characters or no digits; nothing is sent.</exception>
     public async Task<Job> PostJobAsync(Stream pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default)
     {
-        to = WireNumber(to);
+        var ep = SendEndpoint.From(cfg); // before reading: a config error sends and reads nothing
         using var buf = new MemoryStream();
         await pdf.CopyToAsync(buf, ct);
-        var bytes = buf.ToArray();
-        return await PostWithRetryAsync(() =>
+        return await PostJobAsync(ep, buf.ToArray(), to, subject, idempotencyKey, ct);
+    }
+
+    /// <summary><see cref="PostJobAsync(Stream, string, string?, string, CancellationToken)"/> with the document already in memory (not copied).</summary>
+    public Task<Job> PostJobAsync(byte[] pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default) =>
+        PostJobAsync(SendEndpoint.From(cfg), pdf, to, subject, idempotencyKey, ct);
+
+    /// <summary>POST /jobs to <paramref name="endpoint"/> for every attempt; <paramref name="pdf"/> is sent as is, never copied.</summary>
+    /// <exception cref="ArgumentException"><paramref name="to"/> has non-ASCII characters or no digits; nothing is sent.</exception>
+    public Task<Job> PostJobAsync(SendEndpoint endpoint, byte[] pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(endpoint);
+        ArgumentNullException.ThrowIfNull(pdf);
+        to = WireNumber(to);
+        var uri = Url(endpoint, "jobs"); // built once, outside the "may be on the wire" region
+        return PostWithRetryAsync(() =>
         {
-            var r = Req(HttpMethod.Post, "jobs");
-            r.Content = new ByteArrayContent(bytes);
+            var r = Req(endpoint, HttpMethod.Post, uri);
+            r.Content = new ByteArrayContent(pdf);
             r.Content.Headers.ContentType = new MediaTypeHeaderValue("application/pdf");
             r.Headers.TryAddWithoutValidation("X-Fax-To", to);
             if (!string.IsNullOrEmpty(subject)) r.Headers.TryAddWithoutValidation("X-Fax-Subject", Ascii(subject));
@@ -122,12 +168,19 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi
 
     /// <summary>POST /test/send, same retry rules and number handling as <see cref="PostJobAsync"/>.</summary>
     /// <exception cref="ArgumentException"><paramref name="to"/> has non-ASCII characters or no digits; nothing is sent.</exception>
-    public Task<Job> SendTestPageAsync(string to, string? note, string idempotencyKey, CancellationToken ct = default)
+    public Task<Job> SendTestPageAsync(string to, string? note, string idempotencyKey, CancellationToken ct = default) =>
+        SendTestPageAsync(SendEndpoint.From(cfg), to, note, idempotencyKey, ct);
+
+    /// <summary>POST /test/send to <paramref name="endpoint"/> for every attempt.</summary>
+    /// <exception cref="ArgumentException"><paramref name="to"/> has non-ASCII characters or no digits; nothing is sent.</exception>
+    public Task<Job> SendTestPageAsync(SendEndpoint endpoint, string to, string? note, string idempotencyKey, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(endpoint);
         to = WireNumber(to);
+        var uri = Url(endpoint, "test/send");
         return PostWithRetryAsync(() =>
         {
-            var r = Req(HttpMethod.Post, "test/send");
+            var r = Req(endpoint, HttpMethod.Post, uri);
             r.Content = JsonBody(new { to, note = note ?? "" });
             r.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
             return r;
@@ -165,7 +218,7 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi
                 var (code, body) = await SendAsync(make, ct);
                 return ParseJob(code, body); // an unreadable 2xx throws with its 2xx code: not retried
             }
-            catch (FaxApiException e) when (attempt < MaxAttempts && e.StatusCode is 0 or 502 or 503 && e is not FaxApiUnauthorizedException)
+            catch (FaxApiException e) when (attempt < MaxAttempts && e.StatusCode is 0 or 502 or 503 && e is not (FaxApiUnauthorizedException or FaxApiConfigException))
             {
                 await Delay(Backoffs[Math.Min(attempt - 1, Backoffs.Count - 1)], ct);
             }
@@ -238,10 +291,19 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi
         return n;
     }
 
+    /// <summary>A request against a snapshot of the config (throws <see cref="FaxApiConfigException"/> for an unusable one).</summary>
     private HttpRequestMessage Req(HttpMethod m, string path)
     {
-        var r = new HttpRequestMessage(m, new Uri(cfg.BaseUri, path));
-        if (!string.IsNullOrEmpty(cfg.Token)) r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", cfg.Token);
+        var ep = SendEndpoint.From(cfg);
+        return Req(ep, m, Url(ep, path));
+    }
+
+    private static Uri Url(SendEndpoint ep, string path) => new(ep.BaseUri, path);
+
+    private static HttpRequestMessage Req(SendEndpoint ep, HttpMethod m, Uri uri)
+    {
+        var r = new HttpRequestMessage(m, uri);
+        if (!string.IsNullOrEmpty(ep.Token)) r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ep.Token);
         return r;
     }
 
@@ -253,9 +315,10 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi
 
     private async Task<(HttpStatusCode, byte[])> SendAsync(Func<HttpRequestMessage> make, CancellationToken ct)
     {
+        // Built before the network try: a failure here (FaxApiConfigException) provably sent nothing.
+        using var req = make();
         try
         {
-            using var req = make();
             using var resp = await http.SendAsync(req, ct);
             if (!resp.IsSuccessStatusCode) throw await ToException(resp);
             return (resp.StatusCode, await resp.Content.ReadAsByteArrayAsync(ct));
