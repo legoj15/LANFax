@@ -31,7 +31,8 @@ CloseApplications=yes
 RestartApplications=no
 
 [Dirs]
-; Deliberate shared-machine decision: any local user may edit config.json and every user's print job must write the spool.
+; Deliberate shared-machine decision: any local user may edit config.json, and the tray app of whoever is signed in
+; writes the spool (jobs\, rejected\, sent\). The spooler no longer writes here: jobs arrive through \\.\pipe\LANFax.
 ; uninsneveruninstall: config.json, unsent documents and kept copies survive an uninstall (and a reinstall finds them).
 Name: "{commonappdata}\LANFax"; Permissions: users-modify; Flags: uninsneveruninstall
 Name: "{commonappdata}\LANFax\spool"; Permissions: users-modify; Flags: uninsneveruninstall

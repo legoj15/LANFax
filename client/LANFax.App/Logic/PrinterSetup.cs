@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using LANFax.Core;
 using Microsoft.Win32;
 
 namespace LANFax.App.Logic;
@@ -13,14 +14,35 @@ public interface IPrinterKeyReader
 
 public enum PrinterState
 {
-    /// <summary>The printer exists and prints to the watched spool file.</summary>
+    /// <summary>The printer exists and prints to the LANFax pipe.</summary>
     Installed,
-    /// <summary>The printer exists but prints somewhere else (<see cref="PrinterStatus.ActualPort"/>): jobs would vanish.</summary>
+    /// <summary>
+    /// The printer exists but prints somewhere else (<see cref="PrinterStatus.ActualPort"/>): jobs would vanish. This
+    /// includes the old file port <c>spool\print.pdf</c> (installs before 2026-09-30), which the install script moves.
+    /// </summary>
     Misconfigured,
     Missing,
 }
 
 public sealed record PrinterStatus(PrinterState State, string? ActualPort);
+
+/// <summary>
+/// The tray's periodic printer check: remembers the last status seen and says which new one to announce. A change
+/// (state or port) to Missing or Misconfigured is announced once; the same status on later ticks, and a change back to
+/// Installed, are not. The start-up status is the initial one (the start-up balloon covers it).
+/// </summary>
+public sealed class PrinterWatch(PrinterStatus initial)
+{
+    public PrinterStatus Last { get; private set; } = initial;
+
+    /// <summary>The status to announce, or null when there is nothing new to warn about.</summary>
+    public PrinterStatus? Observe(PrinterStatus now)
+    {
+        bool changed = now != Last;
+        Last = now;
+        return changed && now.State != PrinterState.Installed ? now : null;
+    }
+}
 
 /// <summary>
 /// Reads HKLM\SYSTEM\CurrentControlSet\Control\Print\Printers\&lt;name&gt; and its <c>Port</c> value (no process
@@ -64,22 +86,16 @@ public sealed class PrinterSetup(IPrinterKeyReader reader, Func<ProcessStartInfo
 
     private readonly Func<ProcessStartInfo, Task> _run = run ?? RunProcessAsync;
 
-    /// <summary>The port a correctly installed printer uses: <c>&lt;spoolDir&gt;\print.pdf</c>, as the install script builds it.</summary>
-    public static string ExpectedPort(string spoolDir) => Path.Combine(TrimSlashes(spoolDir), "print.pdf");
+    /// <summary>The port a correctly installed printer uses: the listener's pipe, <c>\\.\pipe\LANFax</c>, as the install script builds it.</summary>
+    public static string ExpectedPort() => PrintPipeListener.PortName(PrintPipeListener.DefaultPipeName);
 
-    /// <summary>Whether the printer exists and prints to the file the app watches (compared case-insensitively).</summary>
-    public PrinterStatus Status(string printerName, string spoolDir)
+    /// <summary>Whether the printer exists and prints to the pipe the app listens on (compared case-insensitively).</summary>
+    public PrinterStatus Status(string printerName)
     {
         var port = reader.Port(printerName);
         if (port == null) return new PrinterStatus(PrinterState.Missing, null);
-        return new PrinterStatus(SamePath(port, ExpectedPort(spoolDir)) ? PrinterState.Installed : PrinterState.Misconfigured, port);
-    }
-
-    private static bool SamePath(string a, string b)
-    {
-        if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase)) return true;
-        try { return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase); }
-        catch (Exception) { return false; } // "PORTPROMPT:" and other non-paths
+        return new PrinterStatus(string.Equals(port, ExpectedPort(), StringComparison.OrdinalIgnoreCase)
+            ? PrinterState.Installed : PrinterState.Misconfigured, port);
     }
 
     /// <summary>The script the csproj copies to install\ beside the exe (and the installer lays down there too).</summary>
@@ -129,11 +145,11 @@ public sealed class PrinterSetup(IPrinterKeyReader reader, Func<ProcessStartInfo
         }
         catch (Win32Exception e) when (e.NativeErrorCode == 1223) { return "Installation cancelled."; }
         catch (Exception e) { return "Could not start the installer: " + e.Message; }
-        var st = Status(printerName, spoolDir);
+        var st = Status(printerName);
         return st.State switch
         {
             PrinterState.Installed => null,
-            PrinterState.Misconfigured => $"The printer still points at {st.ActualPort}, not {ExpectedPort(spoolDir)} (run the install script manually).",
+            PrinterState.Misconfigured => $"The printer still points at {st.ActualPort}, not {ExpectedPort()} (run the install script manually).",
             _ => "The printer was not installed (see the script output or run it manually).",
         };
     }

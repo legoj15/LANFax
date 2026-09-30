@@ -9,9 +9,11 @@ internal sealed class TrayContext : ApplicationContext
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan ExitWait = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan HealthInterval = TimeSpan.FromSeconds(10);
-    /// <summary>How long start waits for a print.pdf left from the last run to be claimed before resuming the queue.</summary>
-    private static readonly TimeSpan LeftoverWait = TimeSpan.FromSeconds(2);
+    /// <summary>How long after the listener starts the queue is checked for documents stuck in Error.</summary>
+    private static readonly TimeSpan StuckCheckDelay = TimeSpan.FromSeconds(60);
+    /// <summary>How often the printer's port is re-checked (a registry read), so a printer removed or moved is reported.</summary>
+    private static readonly TimeSpan PrinterCheckInterval = TimeSpan.FromSeconds(30);
+    private const string ReceivingReason = "Receiving a document from the LAN Fax printer";
 
     private readonly ConfigLocation _loc;
     private readonly ClientConfig _cfg;
@@ -29,20 +31,12 @@ internal sealed class TrayContext : ApplicationContext
     private readonly Control _ui = new();
     private readonly Icon _iconOn = IconFactory.Create(true);
     private readonly Icon _iconOff = IconFactory.Create(false);
-    private readonly SpoolWatcher _spool;
-    /// <summary>Paused while no watcher claims print.pdf (exit, or a watcher that cannot start); resumed while one does.</summary>
-    private readonly QueueLifecycle _queueLife;
-    /// <summary>Finished spooler jobs against claimed files: a job with no file was overwritten at the port.</summary>
-    private readonly LossCheckHost _loss;
-    /// <summary>Printer port, loss check and queue state, re-read every <see cref="HealthInterval"/> off the UI thread (spooler calls can hang).</summary>
-    private readonly PrinterHealth _health;
-    private readonly System.Threading.Timer _healthTimer;
-    private int _healthBusy;
-    /// <summary>Prints again what the printer kept but nobody claimed (a crash, a kill, a replaced file); deletes the rest.</summary>
-    private readonly KeptJobRecovery _recovery;
-    /// <summary>Held queue until the last run's print.pdf is claimed; null when the watcher could not start.</summary>
-    private readonly StartGate? _startGate;
+    private readonly PrintPipeListener _spool;
     private readonly System.Windows.Forms.Timer _poll = new() { Interval = (int)PollInterval.TotalMilliseconds };
+    private readonly System.Windows.Forms.Timer _printerCheck = new() { Interval = (int)PrinterCheckInterval.TotalMilliseconds };
+    private readonly PrinterWatch _printerWatch;
+    /// <summary>Asks Windows to wait for sign-out/shutdown while a print job is arriving through the pipe.</summary>
+    private readonly ShutdownBlocker _shutdown;
     /// <summary>Test-page jobs (no local PDF, so not in the tracker) awaiting their terminal balloon.</summary>
     private readonly HashSet<string> _submitted = new();
     /// <summary>Which received faxes were already announced (live or by a catch-up); persisted per user.</summary>
@@ -68,8 +62,6 @@ internal sealed class TrayContext : ApplicationContext
     private bool _settingsOpen;
     private bool _exiting;
     private bool _exitPending;
-    private bool _watching; // the spool watcher started
-    private string? _leftoverClaim; // path of the first claim when print.pdf was left from the last run
 
     /// <param name="showSignal">The per-session "show yourself" event, created with the instance mutex (owned by Program).</param>
     public TrayContext(EventWaitHandle showSignal)
@@ -118,13 +110,10 @@ internal sealed class TrayContext : ApplicationContext
         menu.Opening += (_, _) =>
         {
             var printer = PrinterStatusNow();
-            _installItem.Visible = printer.State != PrinterState.Installed || _queueLife is { Denied: true }; // assigned later in the constructor
-            _installItem.Text = printer.State switch
-            {
-                PrinterState.Misconfigured => $"Fix \"{_cfg.PrinterName}\" printer (prints to {printer.ActualPort})...",
-                PrinterState.Installed => $"Repair \"{_cfg.PrinterName}\" printer permissions...",
-                _ => $"Install \"{_cfg.PrinterName}\" printer...",
-            };
+            _installItem.Visible = printer.State != PrinterState.Installed;
+            _installItem.Text = printer.State == PrinterState.Misconfigured
+                ? $"Fix \"{_cfg.PrinterName}\" printer (prints to {printer.ActualPort})..."
+                : $"Install \"{_cfg.PrinterName}\" printer...";
             UpdateOfferItem(_unsentItem, OfferCategory.Unsent);
             UpdateOfferItem(_retryItem, OfferCategory.Retry);
         };
@@ -145,7 +134,11 @@ internal sealed class TrayContext : ApplicationContext
         catch (Exception e) { FileLog.Error(@"scanning spool\jobs failed", e); }
         foreach (var u in unsent) FileLog.Info($"spool {u.SpoolId}: unsent document ({u.Kind})");
 
-        _spool = new SpoolWatcher(_cfg.SpoolDir) { Log = m => FileLog.Info("spool: " + m) };
+        _spool = new PrintPipeListener(_cfg.SpoolDir) { Log = m => FileLog.Info(m) };
+        // Stop runs on the UI thread inside WM_ENDSESSION: nothing it raises while stopping needs the UI thread.
+        _shutdown = new ShutdownBlocker(() => _spool.IsReceiving, _spool.Stop, m => FileLog.Info("shutdown: " + m));
+        // The listener raises true/false once per job, in order; BeginInvoke keeps that order on the UI thread.
+        _spool.ReceivingChanged += on => OnUi(() => { if (on && _spool.IsReceiving) _shutdown.Block(ReceivingReason); else if (!on) _shutdown.Release(); });
         _spool.NewPrintJob += (id, path) => OnUi(() =>
         {
             FileLog.Info($"new print job {id}");
@@ -153,157 +146,53 @@ internal sealed class TrayContext : ApplicationContext
         });
         _spool.Error += (reason, ex) =>
         {
-            FileLog.Error("spool: " + reason, ex); // Core already rate-limits these
-            OnUi(() => Balloon($"A print job could not be picked up: {reason}"));
+            FileLog.Error("pipe: " + reason, ex); // Core already rate-limits the repeating ones
+            OnUi(() => Balloon(NotificationText.PrintPipeProblem(_cfg.PrinterName, reason)));
         };
-        // Its only balloon is the access-denied one, whose fix is the install script (it grants the pause right).
-        _queueLife = new QueueLifecycle(new SpoolerPrintQueue(_cfg.PrinterName), _cfg.PrinterName,
-            m => FileLog.Info(m), text => OnUi(() => Balloon(text, () => _ = InstallPrinterAsync())));
-        _recovery = new KeptJobRecovery(new SpoolerKeptJobs(_cfg.PrinterName), new KeptJobLedger(Path.Combine(_cfg.SpoolDir, "kept-jobs.json")))
-        {
-            Log = m => FileLog.Info("kept jobs: " + m),
-        };
-        // A claim while no loss check runs is counted by the kept-job sweep against the jobs nobody followed.
-        _loss = new LossCheckHost(CreateLossMonitor, TimeSpan.FromSeconds(5), m => FileLog.Info(m), _recovery.ClaimUnpaired);
-        _spool.Claimed += _ => _loss.FileClaimed();
-        // Held (a crash leaves it printing) while a print.pdf left from the last run is claimed, so the first resumed
-        // job cannot overwrite it; the loss check starts after that claim, which belongs to no job of this session.
-        _queueLife.Hold();
-        bool leftover = File.Exists(_spool.PrintPath); // the last job printed while nobody watched, if any
-        // Its claim (the first one) is where recovery reads the leftover's page count to name the job it came from.
-        if (leftover) _spool.Claimed += p => Interlocked.CompareExchange(ref _leftoverClaim, p, null);
-        try { _spool.Start(); _watching = true; }
-        catch (Exception e) { FileLog.Error("spool watcher failed to start", e); Balloon("Cannot watch " + _cfg.SpoolDir + ": " + e.Message); }
-        if (_watching)
-        {
-            // Released now, or by the health check once the leftover is claimed (the queue stays held meanwhile).
-            _startGate = new StartGate(() => _spool.IsIdle, () => FinishStart(leftover), m => FileLog.Info(m),
-                () => OnUi(() => Balloon(NotificationText.HeldAtStart(_cfg.PrinterName, _spool.PrintPath))));
-            if (!_spool.WaitIdle(LeftoverWait) || !_startGate.TryRelease())
-                FileLog.Info($"spool: print.pdf still at the port after {LeftoverWait.TotalSeconds:0} s; the queue stays held until it is claimed");
-        }
-        else
-        {
-            _loss.Restart();
-            _queueLife.WatcherFailed(); // nobody claims: documents wait in the queue
-        }
-        Microsoft.Win32.SystemEvents.SessionEnded += OnSessionEnded;
-        // A crash skips Exit: hold the queue on the way down too (best effort; the next start resumes it).
-        AppDomain.CurrentDomain.UnhandledException += (_, _) => _queueLife.Exiting();
+        // A pipe that cannot be created (another LANFax has it) is reported through Error, not thrown.
+        var listenerStart = DateTime.UtcNow;
+        try { _spool.Start(); }
+        catch (Exception e) { FileLog.Error("print pipe failed to start", e); Balloon("Cannot receive print jobs in " + _cfg.SpoolDir + ": " + e.Message); }
+        _ = AnnounceStuckPrintJobsAsync(listenerStart);
 
         _events = CreateEventStream();
         StartEventStream();
         _poll.Tick += async (_, _) => await PollTrackedAsync();
         _poll.Start();
-        var printerNow = PrinterStatusNow();
-        _health = new PrinterHealth(PrinterStatusNow, printerNow.State, () => _startGate is { Released: true }, _queueLife, _loss,
-            AnnounceMisconfigured, m => FileLog.Info(m))
-        {
-            // Kept-job recovery needs it; anyone with the printer's administer right can clear it.
-            KeepJobs = new KeepPrintedJobsGuard(new SpoolerPrintQueue(_cfg.PrinterName), _cfg.PrinterName, m => FileLog.Info(m),
-                text => OnUi(() => Balloon(text, () => _ = InstallPrinterAsync()))),
-        };
-        _healthTimer = new System.Threading.Timer(_ => HealthTick(), null, HealthInterval, HealthInterval);
 
         // Unsent documents open straight away, one dialog at a time, not behind a balloon that can be missed.
         if (unsent.Count > 0) OnUi(() => { foreach (var u in unsent) EnqueueSend(u); });
         if (_cfg.LoadError != null)
             Balloon(NotificationText.ConfigProblem(_cfg.LoadError), OpenSettings);
-        if (printerNow.State == PrinterState.Missing)
-            Balloon($"The \"{_cfg.PrinterName}\" printer is not installed. Click here to install it.", () => _ = InstallPrinterAsync());
-        else if (printerNow.State == PrinterState.Misconfigured)
-            AnnounceMisconfigured(printerNow);
+        var printerNow = PrinterStatusNow();
+        _printerWatch = new PrinterWatch(printerNow);
+        if (printerNow.State != PrinterState.Installed)
+            AnnouncePrinter(printerNow);
         else if (string.IsNullOrEmpty(_cfg.Token) && _cfg.LoadError == null)
             Balloon("Set the server token in LANFax settings. Click here.", OpenSettings);
+        _printerCheck.Tick += (_, _) => CheckPrinter();
+        _printerCheck.Start();
     }
 
-    /// <summary>
-    /// The start-up hand-over, once the last run's print.pdf is claimed (the queue is still held): the loss check
-    /// starts (that claim belongs to no job of this session), kept jobs printed while nobody watched are printed again
-    /// (they wait in the held queue), then the queue is resumed so held and reprinted documents drain one by one.
-    /// </summary>
-    private void FinishStart(bool leftover)
+    /// <summary>Balloon for a printer that is missing or prints somewhere else; clicking it installs or repairs.</summary>
+    private void AnnouncePrinter(PrinterStatus s)
     {
-        _loss.Restart(); // a missing printer is logged here and picked up by the health check once it exists
-        int? leftoverPages = Volatile.Read(ref _leftoverClaim) is { } claimed ? PdfInfo.CountPages(claimed) : null;
-        var r = _recovery.RecoverAtStart(leftover, id => _loss.Current?.IsFollowed(id) == true, leftoverPages);
-        if (r.Unrecovered.Count > 0)
+        if (s.State == PrinterState.Missing)
         {
-            var docs = r.Unrecovered.Select(k => k.Document).ToList();
-            FileLog.Error($"kept jobs: {docs.Count} replaced document(s) could not be printed again: {string.Join(", ", docs)}");
-            OnUi(() => Balloon(NotificationText.ForUnrecovered(_cfg.PrinterName, docs)));
+            FileLog.Error($"printer \"{_cfg.PrinterName}\" is not installed");
+            Balloon(NotificationText.PrinterMissing(_cfg.PrinterName), () => _ = InstallPrinterAsync());
+            return;
         }
-        _queueLife.Started();
+        FileLog.Error($"printer \"{_cfg.PrinterName}\" prints to {s.ActualPort}, expected {PrinterSetup.ExpectedPort()}");
+        Balloon(NotificationText.PrinterMisconfigured(_cfg.PrinterName, s.ActualPort ?? ""), () => _ = InstallPrinterAsync());
     }
 
-    /// <summary>Every <see cref="HealthInterval"/> on a pool thread; a tick still running (a hung spooler) skips the next.</summary>
-    private void HealthTick()
+    /// <summary>Periodic re-check: a printer removed or moved off the pipe after start is reported once per change.</summary>
+    private void CheckPrinter()
     {
-        if (_exiting || Interlocked.Exchange(ref _healthBusy, 1) == 1) return;
-        try
-        {
-            _startGate?.TryRelease();
-            _health.Tick();
-            if (_startGate is { Released: true })
-            {
-                var unrecovered = _recovery.Sweep(id => _loss.Current?.IsFollowed(id) == true);
-                if (unrecovered.Count > 0)
-                {
-                    var docs = unrecovered.Select(k => k.Document).ToList();
-                    FileLog.Error($"kept jobs: {docs.Count} possibly replaced document(s) could not be printed again: {string.Join(", ", docs)}");
-                    OnUi(() => Balloon(NotificationText.ForUnrecovered(_cfg.PrinterName, docs, whileRunning: true)));
-                }
-            }
-        }
-        catch (Exception e) { FileLog.Error("printer check failed", e); }
-        finally { Volatile.Write(ref _healthBusy, 0); }
+        if (_exiting || _installing) return; // the install reports its own result
+        if (_printerWatch.Observe(PrinterStatusNow()) is { } changed) AnnouncePrinter(changed);
     }
-
-    /// <summary>
-    /// A new loss check over the queue's finished jobs. A job trusted as matched to a claimed file is deleted from the
-    /// queue (kept printed jobs); a replaced one, and any whose claim may have been its file, is printed again when the
-    /// printer kept it. Otherwise "print it again" is shown only when that can help: a printer that prints elsewhere,
-    /// or a watcher that is not running, has its own balloon. Claims no followed job took go to the kept-job sweep.
-    /// </summary>
-    private PrintLossMonitor CreateLossMonitor()
-    {
-        var jobs = new SpoolerJobSource(_cfg.PrinterName) { Log = m => FileLog.Info("spooler: " + m) };
-        var monitor = new PrintLossMonitor(jobs, () => File.Exists(_spool.PrintPath))
-        {
-            Log = m => FileLog.Info("loss check: " + m),
-            IgnoreJob = _recovery.DeletedHere, // deleting an old kept job reads as a finish to a fresh job source
-        };
-        monitor.Matched += id =>
-        {
-            _recovery.Claimed(id); // on the watcher's claim loop: the spooler call runs elsewhere
-            _ = Task.Run(() => { try { _recovery.Drain(); } catch (Exception e) { FileLog.Error("kept jobs: delete failed", e); } });
-        };
-        monitor.ClaimUnpaired += _recovery.ClaimUnpaired;
-        // A doubtful job not kept is covered by the balloon of the lost job it goes with; one kept but refused is not.
-        monitor.Doubtful += id => { if (_recovery.Reprint(id) == ReprintOutcome.Refused) AnnounceLost(id); };
-        monitor.Lost += id =>
-        {
-            if (_recovery.Reprint(id) == ReprintOutcome.PrintingAgain) return; // the watcher claims it like any job
-            AnnounceLost(id);
-        };
-        return monitor;
-    }
-
-    private void AnnounceLost(int id) => OnUi(() =>
-    {
-        var printer = PrinterStatusNow().State;
-        if (NotificationText.ForLostJob(_cfg.PrinterName, printer, _watching) is { } text) Balloon(text);
-        else FileLog.Info($"loss check: spooler job {id} not reported as replaced (printer {printer}, watching {_watching})");
-    });
-
-    private void AnnounceMisconfigured(PrinterStatus s)
-    {
-        FileLog.Error($"printer \"{_cfg.PrinterName}\" prints to {s.ActualPort}, expected {PrinterSetup.ExpectedPort(_cfg.SpoolDir)}");
-        OnUi(() => Balloon(NotificationText.PrinterMisconfigured(_cfg.PrinterName, s.ActualPort ?? ""), () => _ = InstallPrinterAsync()));
-    }
-
-    /// <summary>Logoff or shutdown ends the process without the tray Exit: hold the queue for the next start.</summary>
-    private void OnSessionEnded(object? sender, Microsoft.Win32.SessionEndedEventArgs e) => _queueLife.Exiting();
 
     // ---- threading and notifications ----
 
@@ -593,7 +482,36 @@ internal sealed class TrayContext : ApplicationContext
 
     // ---- actions ----
 
-    private PrinterStatus PrinterStatusNow() => _printer.Status(_cfg.PrinterName, _cfg.SpoolDir);
+    private PrinterStatus PrinterStatusNow() => _printer.Status(_cfg.PrinterName);
+
+    /// <summary>
+    /// Documents printed while no LANFax listened wait in the queue; the spooler retries them and they arrive on their
+    /// own once the listener runs (seen within 30 s), but a job it gave up on (cut off mid-write, or waiting longer
+    /// than its retry lasts, which is unmeasured beyond 4 minutes) stays in "Error". Jobs submitted before the start
+    /// and still in Error <see cref="StuckCheckDelay"/> later get one balloon that opens the queue. No automatic
+    /// restart: a restarted job was once delivered twice (measured), so the user decides.
+    /// </summary>
+    private async Task AnnounceStuckPrintJobsAsync(DateTime listenerStartUtc)
+    {
+        try
+        {
+            await Task.Delay(StuckCheckDelay);
+            if (_exiting) return;
+            var jobs = await Task.Run(() => PrintQueueJobs.List(_cfg.PrinterName));
+            if (jobs == null) return; // no such printer: the printer balloons cover it
+            var stuck = PrintQueueJobs.StuckSince(jobs, listenerStartUtc);
+            if (stuck.Count == 0) return;
+            foreach (var j in stuck) FileLog.Info($"print queue: job {j.Id} '{j.Document}' of {j.User}, submitted {j.SubmittedUtc:o}, is in error (status 0x{j.Status:x})");
+            OnUi(() => Balloon(NotificationText.StuckPrintJobs(_cfg.PrinterName, stuck.Count), OpenPrinterQueue));
+        }
+        catch (Exception e) { FileLog.Error("checking the print queue for stuck documents failed", e); }
+    }
+
+    private void OpenPrinterQueue()
+    {
+        try { Process.Start(new ProcessStartInfo("rundll32.exe") { ArgumentList = { "printui.dll,PrintUIEntry", "/o", "/n", _cfg.PrinterName } }); }
+        catch (Exception e) { FileLog.Error("opening the print queue failed", e); }
+    }
 
     private void OpenWeb()
     {
@@ -630,12 +548,7 @@ internal sealed class TrayContext : ApplicationContext
         {
             FileLog.Info("printer install requested");
             var err = await _printer.InstallAsync(_cfg.SpoolDir, _cfg.PrinterName);
-            if (err == null && _startGate is { Released: true }) // still held for a leftover: the gate resumes it
-            {
-                _queueLife.Resumed(); // the script leaves the queue paused for a watcher to take over
-                _loss.Restart(); // the printer may be new or re-created: a fresh notification handle
-            }
-            if (err == null) Balloon($"The \"{_cfg.PrinterName}\" printer is installed and prints to {PrinterSetup.ExpectedPort(_cfg.SpoolDir)}.");
+            if (err == null) Balloon($"The \"{_cfg.PrinterName}\" printer is installed and prints to {PrinterSetup.ExpectedPort()}.");
             else { FileLog.Error("printer install: " + err); Balloon(err); }
         }
         finally
@@ -689,21 +602,12 @@ internal sealed class TrayContext : ApplicationContext
         }
         _exiting = true;
         _poll.Stop();
-        _healthTimer.Change(Timeout.Infinite, Timeout.Infinite);
+        _printerCheck.Stop();
         _noticeTimer.Stop();
         _sseCts?.Cancel();
-        _queueLife.Exiting(); // first, so a job already on its way to the port is still claimed; later ones wait in the queue
-        // A claim already past its cancellation check is reported before the count is settled below.
-        if (!_spool.StopAndWait(TimeSpan.FromSeconds(2))) FileLog.Info("exit: a spool check was still running after 2 s");
-        // Kept jobs accounted for are deleted now, or the next start would print them again; the rest stay kept.
-        var monitor = _loss.Current;
-        try
-        {
-            monitor?.SettleForExit();
-            _recovery.SettleAtExit(id => monitor?.IsFollowed(id) == true);
-        }
-        catch (Exception e) { FileLog.Error("kept jobs: settling at exit failed", e); }
-        _loss.Dispose();
+        // A document still arriving gets PrintPipeListener.StopGrace: say so, and keep the UI thread free meanwhile.
+        if (_spool.IsReceiving) _tray.Text = "LANFax: finishing a document that is still printing...";
+        await Task.Run(_spool.Stop);
         _tray.Visible = false;
         ExitThread();
     }
@@ -714,15 +618,12 @@ internal sealed class TrayContext : ApplicationContext
         {
             _exiting = true;
             _poll.Dispose();
-            _healthTimer.Dispose();
+            _printerCheck.Dispose();
             _noticeTimer.Dispose();
             _showWait?.Unregister(null);
             _sseCts?.Cancel();
-            _queueLife.Exiting();
             _spool.Dispose();
-            _loss.Dispose();
-            try { _recovery.Drain(); } catch (Exception) { /* logged by Exit when it ran; shutting down */ }
-            Microsoft.Win32.SystemEvents.SessionEnded -= OnSessionEnded;
+            _shutdown.Dispose();
             var open = _openDialog; _openDialog = null;
             open?.Dispose();
             _tray.Dispose();

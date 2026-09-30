@@ -160,7 +160,7 @@ public class PrinterSetupTests
     sealed class FakeReader(params string[] keys) : IPrinterKeyReader
     {
         public bool Exists(string printerName) => keys.Contains(printerName, StringComparer.OrdinalIgnoreCase);
-        public string? Port(string printerName) => Exists(printerName) ? @"C:\spool\print.pdf" : null;
+        public string? Port(string printerName) => Exists(printerName) ? @"\\.\pipe\LANFax" : null;
     }
 
     [Fact]
@@ -230,7 +230,7 @@ public class PrinterSetupTests
     sealed class FuncReader(Func<string, bool> f) : IPrinterKeyReader
     {
         public bool Exists(string printerName) => f(printerName);
-        public string? Port(string printerName) => f(printerName) ? @"C:\spool\print.pdf" : null;
+        public string? Port(string printerName) => f(printerName) ? @"\\.\pipe\LANFax" : null;
     }
 
     sealed class PortReader(string? port) : IPrinterKeyReader
@@ -241,26 +241,53 @@ public class PrinterSetupTests
 
     [Theory]
     [InlineData(null, PrinterState.Missing)]
-    [InlineData(@"C:\ProgramData\LANFax\spool\print.pdf", PrinterState.Installed)]
-    [InlineData(@"c:\programdata\lanfax\SPOOL\print.pdf", PrinterState.Installed)]
-    [InlineData(@"C:\Old\spool\print.pdf", PrinterState.Misconfigured)]
+    [InlineData(@"\\.\pipe\LANFax", PrinterState.Installed)]
+    [InlineData(@"\\.\PIPE\lanfax", PrinterState.Installed)]
+    // The file port of installs before 2026-09-30: the tray offers the repair, which moves the printer to the pipe.
+    [InlineData(@"C:\ProgramData\LANFax\spool\print.pdf", PrinterState.Misconfigured)]
+    [InlineData(@"\\.\pipe\LANFaxProbe", PrinterState.Misconfigured)]
+    [InlineData(@"\\otherpc\pipe\LANFax", PrinterState.Misconfigured)]
     [InlineData("PORTPROMPT:", PrinterState.Misconfigured)]
     [InlineData("", PrinterState.Misconfigured)]
-    public void Status_compares_the_printer_port_with_the_watched_path(string? port, PrinterState expected)
+    public void Status_compares_the_printer_port_with_the_pipe(string? port, PrinterState expected)
     {
-        var st = new PrinterSetup(new PortReader(port)).Status("LAN Fax", @"C:\ProgramData\LANFax\spool\");
+        var st = new PrinterSetup(new PortReader(port)).Status("LAN Fax");
         Assert.Equal(expected, st.State);
         Assert.Equal(port, st.ActualPort);
     }
 
     [Fact]
-    public void Expected_port_is_print_pdf_in_the_spool_dir() =>
-        Assert.Equal(@"C:\ProgramData\LANFax\spool\print.pdf", PrinterSetup.ExpectedPort(@"C:\ProgramData\LANFax\spool\"));
+    public void Expected_port_is_the_lanfax_pipe() =>
+        Assert.Equal(@"\\.\pipe\LANFax", PrinterSetup.ExpectedPort());
+
+    [Fact]
+    public void Print_pipe_problem_names_the_printer_and_fits_a_balloon()
+    {
+        Assert.Equal(@"""LAN Fax"" printer: a print job was rejected: it is not a PDF (3 bytes). Kept as C:\r\x.pdf",
+            NotificationText.PrintPipeProblem("LAN Fax", @"a print job was rejected: it is not a PDF (3 bytes). Kept as C:\r\x.pdf"));
+        var longText = NotificationText.PrintPipeProblem("LAN Fax", new string('x', 400));
+        Assert.Equal(255, longText.Length);
+        Assert.EndsWith("...", longText);
+    }
 
     [Fact]
     public void Misconfigured_notice_names_the_port() =>
-        Assert.Equal(@"The ""LAN Fax"" printer points at C:\Old\print.pdf, not the LANFax spool. Click here to fix it.",
+        Assert.Equal(@"The ""LAN Fax"" printer prints to C:\Old\print.pdf, not to LANFax (\\.\pipe\LANFax). Click here to fix it.",
             NotificationText.PrinterMisconfigured("LAN Fax", @"C:\Old\print.pdf"));
+
+    [Fact]
+    public void Stuck_print_jobs_notice_counts_says_how_to_send_them_and_warns_of_a_double_delivery()
+    {
+        // A restarted job was once delivered twice, and two prints of the same document within the same second are
+        // byte-identical (measured 2026-09-30), so duplicates cannot be told from reprints: the notice warns instead.
+        var one = NotificationText.StuckPrintJobs("LAN Fax", 1);
+        var three = NotificationText.StuckPrintJobs("LAN Fax", 3);
+        Assert.Equal(@"1 document printed to ""LAN Fax"" before LANFax started is stuck in the printer queue with an error. Click here to open the queue and restart it. A restart can deliver it twice: send only one copy.",
+            one);
+        Assert.Equal(@"3 documents printed to ""LAN Fax"" before LANFax started are stuck in the printer queue with an error. Click here to open the queue and restart them. A restart can deliver a document twice: send only one copy.",
+            three);
+        Assert.True(one.Length <= 255 && three.Length <= 255); // the balloon's limit
+    }
 
     [Fact]
     public async Task Install_reports_a_printer_still_on_the_wrong_port()
@@ -272,6 +299,73 @@ public class PrinterSetupTests
             Assert.StartsWith(@"The printer still points at C:\Old\print.pdf", await ps.InstallAsync(@"C:\spool", "LAN Fax", script));
         }
         finally { File.Delete(script); }
+    }
+
+    [Fact]
+    public void Missing_notice_names_the_printer() =>
+        Assert.Equal(@"The ""LAN Fax"" printer is not installed. Click here to install it.", NotificationText.PrinterMissing("LAN Fax"));
+}
+
+public class PrinterWatchTests
+{
+    private static readonly PrinterStatus Ok = new(PrinterState.Installed, @"\\.\pipe\LANFax");
+    private static readonly PrinterStatus Gone = new(PrinterState.Missing, null);
+    private static readonly PrinterStatus Elsewhere = new(PrinterState.Misconfigured, "PORTPROMPT:");
+
+    [Fact]
+    public void A_steady_installed_printer_is_never_announced()
+    {
+        var w = new PrinterWatch(Ok);
+        for (int i = 0; i < 5; i++) Assert.Null(w.Observe(Ok));
+    }
+
+    [Fact]
+    public void Installed_to_missing_is_announced_once_not_every_tick()
+    {
+        var w = new PrinterWatch(Ok);
+        Assert.Equal(Gone, w.Observe(Gone));
+        Assert.Null(w.Observe(Gone));
+        Assert.Null(w.Observe(Gone));
+    }
+
+    [Fact]
+    public void Installed_to_misconfigured_is_announced_once()
+    {
+        var w = new PrinterWatch(Ok);
+        Assert.Equal(Elsewhere, w.Observe(Elsewhere));
+        Assert.Null(w.Observe(Elsewhere));
+    }
+
+    [Fact]
+    public void Each_new_break_after_a_repair_is_announced_again()
+    {
+        var w = new PrinterWatch(Ok);
+        Assert.NotNull(w.Observe(Gone));
+        Assert.Null(w.Observe(Ok)); // repaired: nothing to warn about
+        Assert.Equal(Elsewhere, w.Observe(Elsewhere));
+        Assert.Null(w.Observe(Ok));
+        Assert.Equal(Gone, w.Observe(Gone));
+    }
+
+    [Fact]
+    public void A_state_already_announced_at_start_is_not_repeated()
+    {
+        // The start-up balloon covers the initial state; the watch only reports changes from it.
+        var w = new PrinterWatch(Gone);
+        Assert.Null(w.Observe(Gone));
+        var w2 = new PrinterWatch(Elsewhere);
+        Assert.Null(w2.Observe(Elsewhere));
+    }
+
+    [Fact]
+    public void A_move_to_another_wrong_port_or_from_missing_to_misconfigured_is_a_change()
+    {
+        var w = new PrinterWatch(Elsewhere);
+        var other = new PrinterStatus(PrinterState.Misconfigured, @"C:\x\print.pdf");
+        Assert.Equal(other, w.Observe(other));
+        Assert.Null(w.Observe(other));
+        var w2 = new PrinterWatch(Gone);
+        Assert.Equal(Elsewhere, w2.Observe(Elsewhere));
     }
 }
 
@@ -418,57 +512,6 @@ public class InstallerScriptTests
             Assert.True(File.Exists(Path.Combine(output, "LANFax-Setup.exe")));
         }
         finally { try { Directory.Delete(tmp, true); } catch { } }
-    }
-}
-
-/// <summary>Shared-PC hazard: a document printed by another Windows user says so in the send dialog.</summary>
-public class PrintedByTests
-{
-    const string Me = "S-1-5-21-1-2-3-1001";
-    const string Bob = "S-1-5-21-1-2-3-1002";
-    const string Admins = "S-1-5-32-544";
-
-    static PrintedBy For(FileOwner? owner) => new(_ => owner, Me, [Admins, "S-1-5-32-545"]);
-
-    [Fact]
-    public void Another_users_document_names_its_owner() =>
-        Assert.Equal(@"PC\bob", For(new FileOwner(Bob, @"PC\bob")).OtherOwner(@"C:\spool\jobs\x.pdf"));
-
-    [Theory]
-    [InlineData(Me)]        // mine
-    [InlineData(Admins)]    // an elevated admin's files are owned by Administrators, a group this user is in
-    [InlineData("S-1-5-18")] // SYSTEM: the spooler did not impersonate anyone, so there is no one to name
-    [InlineData("S-1-5-19")]
-    [InlineData("S-1-5-20")]
-    public void Owners_that_are_not_another_user_are_not_shown(string sid) =>
-        Assert.Null(For(new FileOwner(sid, "whoever")).OtherOwner("x.pdf"));
-
-    [Fact]
-    public void An_owner_that_cannot_be_read_is_not_shown()
-    {
-        Assert.Null(For(null).OtherOwner("x.pdf"));
-        Assert.Null(new PrintedBy(_ => throw new UnauthorizedAccessException(), Me, []).OtherOwner("x.pdf"));
-    }
-
-    [Fact]
-    public void The_document_line_says_who_printed_it()
-    {
-        Assert.Equal("PDF, 2 pages, 14 KB", PrintedBy.DocumentLine("2 pages, 14 KB", null));
-        Assert.Equal(@"PDF, 2 pages, 14 KB. Printed by PC\bob", PrintedBy.DocumentLine("2 pages, 14 KB", @"PC\bob"));
-    }
-
-    [Fact]
-    public void A_file_this_user_created_is_not_someone_elses()
-    {
-        var f = Path.GetTempFileName();
-        try
-        {
-            var owner = PrintedBy.ReadOwner(f);
-            Assert.NotNull(owner);
-            Assert.StartsWith("S-1-", owner!.Sid);
-            Assert.Null(PrintedBy.ForCurrentUser().OtherOwner(f));
-        }
-        finally { File.Delete(f); }
     }
 }
 

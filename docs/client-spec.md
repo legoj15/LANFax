@@ -11,11 +11,10 @@ built against.
   `global.json`.
 - Printer driver `Microsoft Print To PDF` (v4, inbox driver) is installed and
   bound to the `PORTPROMPT:` port on the stock printer. The `local` parameter
-  set of `Add-PrinterPort` takes only `-Name`, so a file-path port needs no
-  host address. No existing port on the box is path-named, so **the silent
-  write-to-path behaviour is unverified and is the first thing phase 2 must
-  prove** with a disposable printer (needs elevation: a UAC prompt the user
-  must accept).
+  set of `Add-PrinterPort` takes only `-Name`, so a file-path or named-pipe
+  port needs no host address. The client prints to the pipe port
+  `\\.\pipe\LANFax` (see "Spool path and the printer" for why and what was
+  measured). Adding a port or printer needs elevation (a UAC prompt).
 - A printer named `Fax` (Microsoft Shared Fax Driver) and a shared
   `\\server1\Fax` already exist. Ours is named **`LAN Fax`**.
 - Inno Setup 6 is at `E:\Program Files (x86)\Inno Setup 6\ISCC.exe` (not on C:).
@@ -34,11 +33,7 @@ client/
     Dpapi.cs                        DPAPI via crypt32 P/Invoke (no NuGet package); Protect takes a DpapiScope (CurrentUser for the token)
     FaxApi.cs                       ISendApi (post job, test send, both to a SendEndpoint snapshot, PDF as byte[]) + HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download; FaxApiConfigException
     EventStream.cs                  SSE client: GET /events?token=, Last-Event-ID, stall detection, reconnect with backoff, raises typed events
-    SpoolWatcher.cs                 watches the port path; claims print.pdf with an exclusive handle and holds it through the %PDF / %%EOF checks and the rename (by handle) to jobs/<guid>.pdf (or rejected/<guid>.pdf); raises Claimed / NewPrintJob / Error
-    ClaimedFile.cs                  CreateFileW(GENERIC_READ|DELETE, share 0) + SetFileInformationByHandle(FileRenameInfo); no delete-on-close
-    PrintQueue.cs                   IPrintQueueControl + SpoolerPrintQueue (winspool SetPrinter pause/resume, IsPaused; JobCount is probe-only); IPrintJobSource + SpoolerJobSource (FindFirstPrinterChangeNotification, job STATUS field, "finished" = JOB_STATUS_PRINTED, IsRunning false once the watch dies: 10 failed reads in a row with 100 ms x n backoff)
-    PrintLossMonitor.cs             finished spooler jobs vs claimed files; a pair is trusted (Matched) once no job reported within 15 s after it is lost; an unmatched job after 15 s raises Lost, and the pairs made shortly before it Doubtful; claims no followed job took raise ClaimUnpaired; IgnoreJob skips jobs LANFax deleted itself
-    KeptJobs.cs                     KeptJob + IKeptJobStore + SpoolerKeptJobs (EnumJobs level 1 printed jobs, SetJob delete/restart), KeptJobLedger (spool\kept-jobs.json), KeptJobRecovery (reprint at start / on loss or doubt, delete when trusted, sweep and exit settle by claim count)
+    PrintPipeListener.cs            serves the printer's pipe port \\.\pipe\LANFax (ACL: deny NETWORK, allow SYSTEM + current user, job-writing rights for Authenticated Users; first instance only, retried while taken; 2 instances); streams each connection to jobs/<guid>.pdf.part, flushes, renames to jobs/<guid>.pdf (or moves to rejected/); raises NewPrintJob / Error; EofCounter
     Numbers.cs                      normalize_number / check_number mirror (shared vectors: LANFax.Tests/numbers-vectors.json)
     Models.cs                       Job, ArmState, ServerStatus records mirroring faxd JSON
   (PrinterSetup, which detects the printer and launches the elevated install/uninstall script, lives in LANFax.App)
@@ -46,255 +41,227 @@ client/
     Program.cs                      machine-wide single-instance mutex (Global\LANFax.Tray, see "One active session"); tray icon; no console
     TrayContext.cs                  NotifyIcon + menu: Open, Send a test..., Receive a test (arm 20 min), Settings, Install printer, Exit
     SendDialog.cs                   non-modal; number, subject, page count, Send / Cancel; "Send test page instead" checkbox
-    Logic/                          testable plain classes: SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer + InboundCatchUp, InstanceGuard, PrintedBy, QueueLifecycle, PrintGuard (LossCheckHost + StartGate + PrinterHealth + KeepPrintedJobsGuard), ...
+    Logic/                          testable plain classes: SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer + InboundCatchUp, InstanceGuard, ...
     MainForm.cs                     (phase 3, NOT YET WRITTEN) status header, arm card with countdown, jobs grid, inbox grid, open PDF
     SettingsDialog.cs               server host/ip, port, token, "Clear token", "Test connection"
-  LANFax.Tests/                     xunit: Core (config, FaxApi, EventStream, SpoolWatcher, numbers) + install/Inno script checks
+  LANFax.Tests/                     xunit: Core (config, FaxApi, EventStream, PrintPipeListener against real pipes, numbers) + install/Inno script checks
   LANFax.App.Tests/                 xunit: App Logic classes (no UI; the WinForms files are not tested)
   install/
-    Install-LANFaxPrinter.ps1       elevated: Add-PrinterPort -Name <spool path>; Add-Printer -Name "LAN Fax" -DriverName "Microsoft Print To PDF" -PortName <spool path>, or Set-Printer -PortName <spool path> when the printer exists on another port; adds an allow ACE for BUILTIN\Users (S-1-5-32-545, READ_CONTROL|PRINTER_ACCESS_ADMINISTER|PRINTER_ACCESS_USE, no inheritance) to this printer's PermissionSDDL; sets KeepPrintedJobs (Win32_Printer, Set-CimInstance); pauses the queue (Win32_Printer Pause) for the app to resume, unless a LANFax.exe runs in any session (then it is left printing); idempotent
-    Uninstall-LANFaxPrinter.ps1     removes printer and port (documents still held in the queue are discarded, and the count of unprinted ones is printed; kept printed jobs are not counted); if Remove-Printer fails the queue is resumed, never left paused; leaves %ProgramData%\LANFax
+    Install-LANFaxPrinter.ps1       elevated: Add-PrinterPort -Name \\.\pipe\<PipeName>; Add-Printer -Name "LAN Fax" -DriverName "Microsoft Print To PDF" -PortName <pipe port>, or Set-Printer -PortName <pipe port> when the printer exists on another port; removes the old file port spool\print.pdf when unused; KeepPrintedJobs off (lists jobs it kept, removes none); resumes a paused queue; removes the superseded Users manage ACE if present; idempotent
+    Uninstall-LANFaxPrinter.ps1     removes printer, pipe port and an unused old file port; leaves %ProgramData%\LANFax
     (both scripts self-elevate by relaunching with ONE -ArgumentList command-line string, never a pre-quoted array)
     LANFax.iss                      Inno Setup: installs app to Program Files, runs Install-LANFaxPrinter.ps1 from [Code] (non-zero exit = non-fatal message), adds Run key for tray autostart; uninstall taskkills LANFax.exe in CurUninstallStepChanged(usUninstall) (after the user confirms), then removes the printer; /DAppSource=<dir> overrides the published app folder (the test suite compiles against a stub)
   build.ps1                         dotnet test, dotnet publish, iscc -> dist/LANFax-Setup.exe
-  tools/Probe-PrinterBurst.ps1      live burst probe on the real printer (not in the sln or the build): builds tools/BurstProbe, runs only the watcher + loss check + kept-job deletes, prints -Count jobs of 1..Count pages at once; -Runs, -PausedFirst, -NoWatch, -Crash (nobody claims while they print, then the start-up recovery), -ShowStatuses; tray app must be closed; deletes its kept jobs; leaves the queue resumed
+  tools/Probe-PipePrinter.ps1       live probe on the disposable "LANFax Pipe Probe" printer (not in the sln or the build): builds tools/PipeProbe, runs only PrintPipeListener on pipe LANFaxProbe; -Count/-Runs (N jobs of 1..N pages), -NoListenerSeconds, -StopMidJobSeconds, -WhoIs, -Drain; files go to a temp folder
 ```
 
 ## Spool path and the printer
 
-- Port name and file: `C:\ProgramData\LANFax\spool\print.pdf`. The installer
-  grants BUILTIN\Users Modify, inherited, on `C:\ProgramData\LANFax` itself
-  (not only `spool\`): any logged-in user's print job can write the spool (the
-  spooler writes as the user for Local Ports) and any Windows user can save
-  `config.json`. The Inno Setup `[Dirs]` entry for `{commonappdata}\LANFax`
-  must grant `users-modify` too. All three `[Dirs]` entries carry
+- Port: the local named pipe `\\.\pipe\LANFax` (a Local Port, Local Monitor,
+  created with `Add-PrinterPort -Name '\\.\pipe\LANFax'`, elevated). The
+  spooler opens one connection per print job, writes the PDF the driver
+  renders, and closes it. Every job is its own connection, so no job can
+  overwrite another (measured, see "Why a pipe port" below). The tray app
+  serves the pipe with `LANFax.Core.PrintPipeListener` (pipe name
+  configurable, default `LANFax`; the live probe uses `LANFaxProbe`).
+- Spool dir `C:\ProgramData\LANFax\spool` keeps `jobs\`, `rejected\` and
+  `sent\`; there is no `print.pdf` any more. The installer grants
+  BUILTIN\Users Modify, inherited, on `C:\ProgramData\LANFax` itself (not
+  only `spool\`): the tray app runs as whoever is signed in and writes
+  `jobs\` (PDFs and tracker records), `rejected\` and `sent\`, and any Windows
+  user can save `config.json`. The spooler no longer writes the spool. The
+  Inno Setup `[Dirs]` entries grant `users-modify` too and carry
   `Flags: uninsneveruninstall`: uninstalling keeps `config.json`, unsent
   documents (`spool\jobs`), kept copies (`spool\sent`) and rejected print
-  files; a reinstall picks them up.
-- The app checks the binding, not only the name: `PrinterSetup.Status` reads
-  `HKLM\SYSTEM\CurrentControlSet\Control\Print\Printers\<name>` and its
-  `Port` value and returns Installed (port is `<spool dir>\print.pdf`,
-  case-insensitive), Misconfigured (another port) or Missing. Misconfigured
-  shows "The "LAN Fax" printer points at X, not the LANFax spool. Click here
-  to fix it." and the tray item becomes "Fix ... printer"; both re-run the
-  install script, which moves the queue with `Set-Printer`.
-- Watcher (claim and hold): `FileSystemWatcher` on the spool dir plus a 2 s
-  polling fallback start one loop, which runs while `print.pdf` exists and
-  tries to claim it every `RetryEvery` (10 ms). The claim is
-  `ClaimedFile.TryOpen`: `CreateFileW(GENERIC_READ | DELETE, share 0)`. It
-  fails (sharing violation) while the spooler still has the file open, so a
-  successful claim means that job is finished; from then on the spooler's
-  next job gets a sharing violation on `print.pdf` and retries by itself
-  (measured: completes 3-6 s after the handle closes, nothing lost). Under the
-  claim the file is checked: not `%PDF` (or 0 bytes) goes to
-  `spool\rejected\<guid>.pdf` with `Error("print.pdf was not a PDF ...; kept
-  as ...")`; one `%%EOF` goes to `spool\jobs\<guid>.pdf`; two or more goes to
-  `rejected\` with `Error("print.pdf contained N documents; the LAN Fax
-  printer received two jobs at once. Print them one at a time.")` (a guard; it
-  never fires for this printer); no `%%EOF` goes to `rejected\` as not a PDF
-  at once, still under the claim (the exclusive open proves the spooler closed
-  it, so it is truncated; releasing it would reopen the overwrite window).
-  Access denied on the claim (a file pending deletion, briefly; or an ACL that
-  keeps this user out, for good) is reported through `Error("cannot take
-  print.pdf off the printer port: access denied ...")` once it lasts
-  `AccessDeniedReportAfter` (5 s), rate-limited like other errors. Every move is a rename through the held handle
-  (`SetFileInformationByHandle(FileRenameInfo)`, `\??\` path, no replace), so
-  the file is never unlocked at the port path. Nothing is deleted and there is
-  no delete-on-close: a crash while holding just closes the handle and leaves
-  `print.pdf` in place. After each move `Claimed(path)` fires (the loss check
-  counts these), then `NewPrintJob(guid, path)` for `jobs\`. Stopped after the
-  move: the file stays in `jobs\` without a record and the next start's
-  `JobTracker.Scan` offers it.
-- Timings are instance properties (`RetryEvery` 10 ms, `PollEvery` 2 s,
-  `AccessDeniedReportAfter` 5 s). `WaitIdle(timeout)` starts a check and
-  blocks until nothing is at the port and no check runs (start-up uses it). The old settle wait (1 s age + 500 ms size recheck) is gone:
-  holding the exclusive handle is the proof the spooler is done.
-- A failed move (e.g. `jobs\` unwritable) raises `Error(reason, exception)`
-  at most once per distinct reason per 60 s; the claim is kept and only the
-  rename is retried (every 250 ms, after 5 failures every `PollEvery`), so
-  the spooler's next job keeps getting a sharing violation instead of
-  replacing the file. A check loop that ends re-checks for `print.pdf` once it
-  is marked idle (a Created event in that gap used to be dropped).
-  `Stop()` cancels a check in progress before it moves or raises. A file held
-  open elsewhere for 2 min is logged (not an error: a long job looks the same).
-- Queue pause lifecycle (`QueueLifecycle` over `IPrintQueueControl`,
-  `SpoolerPrintQueue`): the queue is paused whenever no watcher claims
-  `print.pdf`, so jobs wait in the queue instead of overwriting each other at
-  the port. The install script pauses it (unless LANFax.exe is running). The
-  tray app at start: pauses it (a crash leaves it printing), notes whether a
-  `print.pdf` is left from the last run, starts the watcher and waits up to
-  2 s (`WaitIdle`) for that leftover to be claimed. `StartGate` then runs the
-  hand-over once: the loss check starts (so the leftover claim is not
-  counted), kept jobs are recovered (below), and the queue is resumed (held
-  and reprinted jobs drain into a claiming watcher). If the leftover is still
-  at the port after 2 s (antivirus scanning it), the queue stays held and the
-  10 s health tick releases the gate once `SpoolWatcher.IsIdle`; resuming
-  early would let the first held job overwrite the leftover while its own
-  claim was counted for it. A hold lasting 60 s (the leftover open in a PDF
-  viewer: the claim's share-mode-0 open fails with a sharing violation, which
-  the watcher only logs) shows one balloon: "Documents printed to LAN Fax are
-  waiting: <spool>\print.pdf is open in another program. Close it and LANFax
-  will pick them up." It
-  pauses it if the watcher cannot start, and on tray Exit, on
-  `SystemEvents.SessionEnded` (logoff, shutdown), on `Dispose` and, best
-  effort, on an unhandled exception. After "Install printer" succeeds (with
-  the start hand-over done) the app resumes it and restarts the loss check.
-  Every 10 s, on a thread-pool timer (a hung spooler must not freeze the tray;
-  a tick still running skips the next), `PrinterHealth.Tick` re-reads the
-  printer (registry, cheap): a move to
-  another port is announced once per change with the Misconfigured balloon;
-  Missing/Misconfigured -> Installed restarts the loss check (the printer may
-  be new or re-created); while the watcher runs, a dead loss check is started
-  again and `QueueLifecycle.Reconcile` resumes a queue found paused (the
-  install script, a person; one LANFax per machine, so never another user's
-  LANFax). It also checks the printer's "Keep printed documents"
-  (`KeepPrintedJobsGuard` over `IKeepPrintedJobs`: `PRINTER_INFO_5`
-  Attributes `0x100`): anyone with the Users ACE can clear it on the Advanced
-  tab, which would silently turn off kept-job recovery, so it is set back
-  (SetPrinter level 5 on a handle with ADMINISTER|USE; ADMINISTER alone is
-  refused, measured; logged), and if that is
-  refused one balloon per change offers the repair (the install script sets
-  it). Measured with `Probe-PrinterBurst.ps1 -KeepCheck` (clear, then set
-  back through this path). A resume that keeps failing is logged once until it changes. A pause/resume
-  failure never stops the app: it is logged, and access denied (Win32 5) shows
-  one balloon per run: "LANFax cannot pause or resume the "LAN Fax" printer,
-  so documents printed while LANFax is closed may be lost. Click here to
-  repair it (an administrator must approve)." The click runs the install
-  script, and the tray menu then shows "Repair "LAN Fax" printer
-  permissions..." even though the printer is installed. A denied pause on
-  Exit is not shown (the tray is going away); the next start's pause fails the
-  same way and shows it. A missing printer is logged only (it has its own
-  balloon). Permission: by default only the installing user and
-  Administrators may pause (measured `PermissionSDDL` 2026-09-30: the
-  installing user's SID has `LCSWSDRCWDWO`, Everyone only `SWRC`), hence the
-  installer's Users ACE. That ACE is wider than pause/resume: Windows has no
-  narrower right, and `PRINTER_ACCESS_ADMINISTER` also lets any user change
-  this printer's port, driver, separator page and print processor (not its
-  permissions, not deleting it). The 10 s health check limits a moved port to
-  at most ~10 s of misrouted jobs before the Fix balloon. Open decision in
-  handoff.md. A `taskkill /F` (the uninstaller), a crash that skips the
-  handlers, or a power loss leaves the queue running with nobody claiming
-  until the next start; the kept-job recovery below gets those documents back.
-- Kept-job recovery (`KeptJobRecovery` over `IKeptJobStore`,
-  `SpoolerKeptJobs`): the installer sets `KeepPrintedJobs`, so a printed job
-  stays in the queue with status Printed (observed statuses with it on:
-  `0x8`, `0x0`, `0x10`, `0x2010` while printing, `0x0`, then `0x80`; our
-  delete then gives `0x84`, `0x184`) and `SetJob(JOB_CONTROL_RESTART)` prints
-  it to `print.pdf` again (measured: same size, a new file 200 ms later).
-  At start (queue held, leftover claimed): every kept printed job not in the
-  ledger and not followed by the loss check was printed while nobody claimed;
-  the one whose page count (`JOB_INFO_1.TotalPages`) matches the claimed
-  leftover owns it (deleted), the others are restarted and wait in the held
-  queue, then drain through the watcher. Queue position is not print order
-  (measured, `-Crash` x3: jobs spooled together printed out of position
-  order; picking the last by position deleted a 1-page job whose file was
-  gone while restarting the leftover's 2-page job). When no single job has
-  the leftover's page count, every job is restarted (one duplicate send
-  dialog, never a loss). Claims made before the loss check starts (the leftover, and jobs
-  a refused pause let print meanwhile) are counted: as many claims as those
-  jobs and all are deleted instead (nothing was replaced). While running: a
-  job the loss check trusts as `Matched` is deleted (queued, deleted on a
-  pool thread by `Drain`); a `Lost` job and its `Doubtful` companions are
-  restarted (at most 2 times each) instead of the "print it again" balloon,
-  which shows only when the lost job is not kept or cannot be restarted (or a
-  doubtful one is kept but refused). Claims no followed job took
-  (`ClaimUnpaired`: no job reported within 15 s, dropped by a reset, in
-  flight in a replaced monitor, or made while no monitor runs) are recorded;
-  the health tick's `Sweep` waits until every kept printed job the loss check
-  does not follow has been seen for 60 s, then deletes them all when there
-  are as many claims, otherwise prints them all again (which one was replaced
-  cannot be told: duplicates, never a silent loss) and reports the ones it
-  cannot restart; unneeded claims are forgotten after 60 s. Nothing is
-  deleted that no claim accounts for. On Exit: the watcher is stopped and
-  waited for (2 s, so a claim past its cancellation check is reported), pairs
-  at least 2 s old that no pending job doubts are trusted
-  (`SettleForExit`), and `SettleAtExit` deletes unfollowed jobs only when
-  the claims add up; everything else stays kept and the next start prints
-  it again. A job this user may not restart or
-  delete (another user's: SetJob needs the job owner or an admin) is reported
-  (start: "... printed to LAN Fax while LANFax was not running and replaced
-  before it could be sent; print it again.") and written to
-  `spool\kept-jobs.json` (id + submit time) so no later start touches it;
-  entries for jobs gone from the queue are pruned. Deleting a kept job the
-  current job source never saw print reads as a finish (PRINTED|DELETING);
-  `DeletedHere` feeds `PrintLossMonitor.IgnoreJob` so it is not counted
-  (found live by the `-Crash` probe). Residual: a crash between a claim and
-  its delete prints that document again at the next start (a duplicate send
-  dialog, never a silent loss). An install without `KeepPrintedJobs` (older
-  script) keeps the old detect-only behaviour.
-- Loss check (`PrintLossMonitor` over `IPrintJobSource`,
-  `SpoolerJobSource`): spooler change notifications for the queue's jobs
-  (`JOB_NOTIFY_FIELD_STATUS`, needs only `PRINTER_ACCESS_USE`, so every
-  user's jobs); a job is finished the first time its status has
-  `JOB_STATUS_PRINTED` (observed: `0x84` PRINTED|DELETING then `0x184`,
-  about 5-15 ms before the watcher's claim). Matching is by count: each claim
-  pays the newest unmatched finished job (the port keeps only the last one
-  written), a claim may also wait 15 s for its job. A finished job still
-  unmatched after 15 s while no file sits at the port raises `Lost` (checked
-  every 5 s). A claim can be the file of a job whose "finished" is still on
-  its way (claim-before-finish), so the newest pending job may be the wrong
-  owner: a pair is only trusted (`Matched`, which deletes the kept job) once
-  15 s have passed and no job reported after it (within 15 s) is still
-  pending; when such a job is `Lost`, the pairs made before it within 15 s
-  are raised `Doubtful` and printed again too. A pair made after the lost job
-  finished is not doubted (the claimed file was written after the lost one). The balloon "A document printed to LAN Fax may have been
-  replaced; print it again." shows only when the printer is Installed and the
-  watcher runs (`NotificationText.ForLostJob`); otherwise printing again
-  cannot help, the port or watcher balloon names the real cause, and the
-  loss is logged. `LossCheckHost` owns the one monitor, restarts it on
-  demand, and forwards the watcher's claims to the current one without
-  blocking (with no monitor, a claim goes to the kept-job sweep). Discarded
-  notifications (`PRINTER_NOTIFY_INFO_DISCARDED`) reset the monitor: pending
-  and paired jobs stop being followed, their claims are handed to the sweep,
-  and for 15 s nothing is paired (a claim may be a job the discarded batch
-  reported); the sweep's claim count then decides. The refresh read that
-  follows reports every kept job's status: those ids are recorded but not
-  counted as finishes (they may have printed long ago, e.g. another user's
-  ledgered job). Jobs finished while the app is not running are not counted
-  by the loss check; the kept-job recovery covers that time. `FinishedJobs` dedups statuses per printing: a job leaves the set
-  on DELETED or on a status without PRINTED (restarted; measured: a
-  restarted kept job reports `0x800`, `0x0`, `0x10`, `0x2010`, then `0x80`
-  again, so it re-arms), a repeated DELETED is
-  remembered (256 ids), and kept jobs are capped at 4096, oldest ids first
-  (the old set was cleared at 4096, which fired the next `0x184` twice).
-  Winspool offsets are hand-computed for x64; `SpoolerJobSource.Start` and
-  `JobCount` throw `PlatformNotSupportedException` in a 32-bit process.
-- Phase-2 probe, result 2026-09-30 (the real `LAN Fax` printer, tray app not
-  running, `Out-Printer` twice back to back): the second job **silently
-  overwrites** the first. A 3-page job followed at once by a 1-page job left
-  one `print.pdf` with `/Count 1` and one `%%EOF`; the 3-page job alone gives
-  `/Count 3`. No spooler error, no append. The spooler runs the jobs one after
-  the other, so the first file is complete and then replaced.
-- Burst probe after the claim-and-hold fix, 2026-09-30
-  (`client/tools/Probe-PrinterBurst.ps1`, watcher only, jobs spooled
-  concurrently with `PrintDocument` so the spooler runs them back to back):
-  5 jobs x 3 runs, 5 jobs spooled into a paused queue then resumed, and 10
-  jobs x 1 run: every run claimed exactly N files with `/Count` {1..N}, one
-  `%%EOF` each, spooler finished = claimed, loss check 0. Timing: the spooler
-  marks job N printed and starts job N+1 about 2 ms later, but job N+1
-  creates `print.pdf` about 190 ms after that; the watcher claimed 5-17 ms
-  after "printed", so the margin is roughly 175 ms. With `-NoWatch` (3 jobs,
-  no watcher) the overwrite reproduces (one file, `/Count 3`) and the loss
-  check reported exactly the 2 lost jobs. Residual risk: a claim delayed past
-  that margin (the machine stalled ~200 ms) still loses the earlier job;
-  the loss check then says so. `Out-Printer` was not used for the burst
-  (text pagination makes page counts inexact, and sequential `Print()` calls
-  never overlapped: each blocks about one job's rendering).
-- Kept-job probes, 2026-09-30 (KeepPrintedJobs set on this PC's printer by
-  its owner, non-elevated `Set-CimInstance`): `-Count 5` PASS with every
-  matched job deleted (probe jobs still kept: 0); `-Count 5 -Crash` (5 jobs
-  printed with nobody claiming, then the start-up hand-over) claimed the
-  leftover `/Count 5` plus 4 restarted jobs, page counts {1..5}, loss check 0.
-  Its first run showed the false loss fixed by `IgnoreJob` (the leftover
-  owner's delete read as a finish).
-- Round-4 probes, 2026-09-30: `-Count 3 -Crash -Runs 3` PASS with the
-  page-count owner (in run 3 the last job by position had 1 page, the
-  leftover 2); an earlier `-Crash` run under the position rule gave page
-  counts {2,2,3} (a silent loss). `-Count 5` PASS with trusted matches
-  deleted after the 15 s wait (probe jobs still kept: 0). `-KeepCheck` PASS
-  (cleared, then set back through `SetKeepPrintedJobs`). Restart statuses
-  (`-ShowStatuses`): `0x800` twice, then `0x0`, `0x10`, `0x2010`, `0x0`,
-  `0x80`, `0x84`, `0x184`.
+  jobs; a reinstall picks them up.
+- The app checks the binding, not only the name: `PrinterSetup.Status`
+  reads `HKLM\SYSTEM\CurrentControlSet\Control\Print\Printers\<name>` and
+  its `Port` value and returns Installed (port is `\\.\pipe\LANFax`,
+  case-insensitive), Misconfigured (any other port, including the file port
+  `spool\print.pdf` of installs before 2026-09-30) or Missing. Misconfigured
+  shows "The "LAN Fax" printer prints to X, not to LANFax (\\.\pipe\LANFax).
+  Click here to fix it." and the tray item becomes "Fix ... printer"; both
+  re-run the install script, which moves the queue with `Set-Printer`.
+  The tray checks at start, when its menu opens, and every 30 s
+  (`PrinterCheckInterval`, a registry read). `PrinterWatch` (Logic,
+  unit-tested) remembers the last status: a change of state or port to
+  Missing or Misconfigured gets the same balloon as at start once per
+  change, never on every tick; a change back to Installed is silent; the
+  start-up status is the baseline; ticks are skipped while an install runs.
+- Install script (idempotent, PowerShell 5.1): creates the pipe port if
+  missing, adds the printer on it or moves an existing one onto it, removes
+  the old file port `<spool dir>\print.pdf` when no printer uses it, lists
+  (never removes) jobs `KeepPrintedJobs` kept after they printed and only
+  then turns that setting off (off first could let the spooler drop them
+  before they are listed) (`Format-KeptPrintedJobs`: status Printed, not Error; count
+  and document names in the script output; harmless unless someone
+  restarts one, which would fax it again, so the user deletes them), moves a
+  non-empty document left in the old `print.pdf` to `spool\jobs\<guid>.pdf`
+  (the tray offers it as unsent at its start) only when `Test-SinglePdf`
+  accepts it by the listener's rule ("Print job acceptance" below); anything
+  else (two jobs written over each other, a cut-off one) goes to
+  `spool\rejected\print-<guid>.pdf` and is never offered. It resumes a
+  paused queue, and removes
+  exactly one ACE if present: the
+  BUILTIN\Users allow `0x0002000C` (manage printer) that the superseded
+  install added (a one-off revert of c677f1a, accepted as such). It adds no
+  permissions. The queue settings come first; the ACE revert and the old
+  port removal come last and only warn on failure, so neither can leave the
+  queue paused. Uninstall removes the jobs still in the queue (with no
+  listener they never finish, and a printer with jobs is only marked "pending
+  deletion"), then the printer (it warns if the printer is still there), the
+  pipe port and an unused old file port.
+- Pipe security: DACL = deny NT AUTHORITY\NETWORK (named pipes are reachable
+  over SMB), allow SYSTEM and the user running the listener full access, and
+  allow Authenticated Users `0x13019b` (GENERIC_READ|GENERIC_WRITE|DELETE
+  without FILE_CREATE_PIPE_INSTANCE). The spooler opens the port as the job's
+  owner, so that last rule is what lets another signed-in user's job in; it
+  is what printing to the printer already allows. Measured 2026-09-30 with
+  `Probe-PipePrinter.ps1 -WhoIs -OtherUser` (the listener's DACL minus the
+  printing user's own rule, i.e. what another user's job faces): SYSTEM only
+  -> refused; `0x120196`, `0x12019b` and `0x12019f` (GENERIC_READ|WRITE) ->
+  refused; `0x13019f` and `0x13019b` -> delivered. Every refused job waited
+  as "Error, Printing" and was not retried within 45 s. A print from a real
+  second account has not been run; the probe stands in for it.
+- The first instance is created with `PipeOptions.FirstPipeInstance`
+  (FILE_FLAG_FIRST_PIPE_INSTANCE): if the name exists (a second LANFax,
+  another signed-in user's LANFax, a squatter) `Start` raises
+  `Error("another program is already listening on \\.\pipe\LANFax ...")`,
+  `IsListening` stays false, and the listener keeps trying every
+  `NameRetry` (5 s), reports it again every `NameTakenRepeat` (10 min) while
+  the name stays taken, and serves the pipe once it is free. A fixed pipe
+  name cannot be reserved: any local program that creates it first receives
+  every user's print jobs. This detects that, it does not prevent it (the
+  only real fix is a SYSTEM service that holds the name from boot; open item
+  in handoff.md). When every instance is gone for a moment (a client that
+  came and went before a spare existed, or a spare that could not be
+  created) the name is taken again with FILE_FLAG_FIRST_PIPE_INSTANCE, so a
+  program that grabbed it in that moment is reported, never joined. Max 2 instances: the one handling a job and a
+  spare waiting, so the spooler's next connection always finds an instance.
+  Jobs are handled one at a time in arrival order.
+- Per connection: stream to `jobs\<guid>.pdf.part` (64 KB buffer, never the
+  whole job in memory), `Flush(true)`, rename to `jobs\<guid>.pdf`, raise
+  `NewPrintJob(guid, path)`. End of stream (the client closed) is the end of
+  the job. Rejected, moved to `rejected\<guid>.pdf` and reported through
+  `Error` (never deleted): a job that fails "Print job acceptance" below
+  (over `MaxJobBytes`: the first 200 MB are kept, the rest is read and
+  dropped so the spooler's write succeeds and the job leaves the queue); an
+  IOException while reading (broken connection). A connection that delivers no bytes is only
+  logged (its empty file is deleted); the spooler was seen making one.
+  A connection silent for `IdleTimeout` (2 min) is dropped: with no bytes
+  at all it is reported (rate-limited, "a program connected ... and sent
+  nothing"), with some it is rejected like a broken connection. Jobs are read
+  one at a time and any signed-in user may open the pipe, so without it a
+  client that connects and sends nothing would stall the printer. It bounds
+  the stall, it does not prevent a program that reconnects in a loop.
+  A failure on our side while writing (disk full, `jobs\` not writable)
+  drops the connection, moves the `.part` to `rejected\` and reports it.
+- Start moves stale `jobs\*.part` (a crash mid-job) to `rejected\` and logs
+  it, unless a loop an earlier `Stop` gave up on is still running (its
+  `.part` is not stale; the sweep waits for the next start). `*.pdf.part` never matches the tracker's `jobs\*.pdf` scan.
+- `Stop()`: no new connection, nothing raised any more (a job rejected or
+  failing during the grace is only logged); a job in progress
+  gets `StopGrace` (5 s) to finish and is then kept in `jobs\` (offered as
+  unsent at the next start); after that it is cut off and its `.part` moved
+  to `rejected\`. A job the spooler already started on the spare instance is
+  read the same way (an instance accepts clients from creation until it is
+  closed); no new spare is opened once stopping. A connection that lands in
+  the instant between the last check and closing the pipe is still dropped
+  (only pausing the printer first would close that). `Stop` blocks at most
+  `StopWait` (7 s); a loop still busy then (slow disk) is logged and finishes
+  in the background, and the next `Start` waits for it before sweeping
+  `.part` files. Idle stop is immediate. Tray Exit runs `Stop` off the UI
+  thread and sets the tray tooltip while a document is still arriving.
+- Print job acceptance (one rule, applied by `PrintPipeListener` to every
+  job and by the install script's `Test-SinglePdf` to a document left in the
+  old `print.pdf`; `PdfAcceptanceVectors` in LANFax.Tests pins both): the
+  bytes start with `%PDF`, hold exactly one `%%EOF`, have nothing but PDF
+  whitespace (space, CR, LF, tab, FF, NUL) after it, and are at most 200 MB.
+  Print To PDF writes exactly one `%%EOF` (every probe run), so this refuses
+  a cut-off job, one that ended after an earlier section, and two jobs
+  written over each other, and costs no real document.
+- In flight: `IsReceiving` is true from the moment a client is connected
+  until its file is saved (renamed and raised, or set aside);
+  `ReceivingChanged(bool)` fires true then false once per job, on a
+  thread-pool thread, also while stopping. The tray's `ShutdownBlocker` (a
+  hidden top-level `NativeWindow`; WM_QUERYENDSESSION only reaches top-level
+  windows) calls `ShutdownBlockReasonCreate` with "Receiving a document from
+  the LAN Fax printer" on true and destroys it on false, and answers
+  WM_QUERYENDSESSION with FALSE while `IsReceiving`, so sign-out or shutdown
+  waits for the read; the user can still force it from the Windows screen,
+  and then WM_ENDSESSION (wParam != 0, still receiving) calls the listener's
+  `Stop` synchronously before returning (`SessionEnd.OnEndSession`), so the
+  job gets `StopGrace` to finish into `jobs\`; one cut off after that leaves
+  a `.part` the next start moves to `rejected\`. `SendDialog` uses the same
+  P/Invokes for a send on the wire. Not exercised with a real sign-out.
+- Rate limiting: pipe-level failures (cannot open an instance, cannot save)
+  raise `Error` at most once per distinct reason per 60 s; rejected jobs
+  every time. The tray shows `NotificationText.PrintPipeProblem` (printer
+  name + reason, cut to 255 characters).
+- Who connects (measured with `Probe-PipePrinter.ps1 -WhoIs`): the client
+  process is `spoolsv`; after the first read `GetImpersonationUserName` and
+  the impersonation token say NT AUTHORITY\LOCAL SERVICE at Identification
+  level, with no job-owner SID in its groups (pipe clients use dynamic
+  security tracking, so the reported identity is the one at the last write).
+  The open is done as the job owner (see "Pipe security": a DACL without the
+  printing user refuses it). The owner cannot be read from the pipe, and the
+  job file is always written by the tray user, so the old "Printed by
+  <owner>" line (NTFS owner of the spooled file) was removed with
+  `PrintedBy`; the owner would have to come from the spooler (open item in
+  handoff.md).
+
+### Why a pipe port (measured 2026-09-30, this PC, not elevated)
+
+- File port (`spool\print.pdf`, the design before 2026-09-30): the second of
+  two back-to-back jobs **silently overwrites** the first. A 3-page job
+  followed at once by a 1-page job left one `print.pdf` with `/Count 1` and
+  one `%%EOF`; no spooler error, no append. Documents printed while the tray
+  app is not running are lost except the last, and a job finishing inside
+  the watcher's settle window replaces the one before it.
+- The file-claim design that tried to close that hole (claim-and-hold with an
+  exclusive handle, queue paused whenever no watcher ran, a loss check over
+  spooler job notifications, kept-job recovery with KeepPrintedJobs, a Users
+  "manage printer" ACE so a standard user could pause and resume) is in
+  commit c677f1a and was dropped: four review rounds, still with timing
+  windows, a permission widening on the printer, and a lot of state to keep
+  right. A pipe port removes the shared file, so none of it is needed.
+- Pipe port, disposable printer `LANFax Pipe Probe` on `\\.\pipe\LANFaxProbe`
+  (`client/tools/Probe-PipePrinter.ps1`, only the listener runs; jobs printed
+  with `PrintDocument`, explicit page counts):
+  - 5 jobs back to back, 3 runs, and 10 jobs once: every run N files,
+    `/Count` exactly 1..N in print order, one `%%EOF` each, no listener
+    error, queue empty afterwards.
+  - No listener: the first job shows "Error, Printing" and the spooler
+    retries it (4+ minutes seen, no event-log error); the rest wait "Normal".
+    5 jobs printed, 30 s without a listener, then listening: all 5 delivered
+    whole, in order. How long the spooler keeps retrying is NOT measured
+    beyond those 4+ minutes: a job printed hours before LANFax starts may
+    already sit in a non-retried "Error" (as a cut-off job does, below) and
+    need `Restart-PrintJob`. The tray checks the queue 60 s after the
+    listener starts (`PrintQueueJobs`, EnumJobs level 1, no elevation):
+    jobs submitted before the start and still in Error get one balloon
+    ("N documents printed to "LAN Fax" before LANFax started are stuck ...")
+    that opens the queue (`printui.dll,PrintUIEntry /o`). It does not
+    restart them: a restart can deliver a job twice (below), so the user
+    decides.
+  - A job refused at open (the DACL probe above) and then restarted with
+    `Restart-PrintJob` once a listener ran was delivered TWICE in one run
+    (two whole copies of the same queue job, 0.5 s apart). Any automatic
+    restart of errored jobs must expect duplicates.
+  - Duplicates cannot be dropped by content: the same document printed
+    twice back to back within one second is byte-identical
+    (`Probe-PipePrinter.ps1 -Same -Count 4`, 2026-09-30: 4 prints, 3
+    distinct SHA-256; the only differing bytes are `/CreationDate` and
+    `/ModDate`, which have 1 s resolution). Suppressing a repeat hash would
+    swallow an intentional reprint, so there is none; the stuck-jobs balloon
+    says a restart can deliver a document twice and to send only one copy.
+  - Listener stopped mid-job (40 pages, the spooler writes while the driver
+    renders, so the job takes 15-20 s): the job goes to "Error, Printing" and
+    is **not** retried by the spooler (30 s, 60 s and 10+ minutes seen) even
+    after the listener is back. `Restart-PrintJob` (the job owner may, no
+    elevation) delivers it whole. Hence `StopGrace`, and the rule that the
+    listener never drops a connection for a bad job (it reads to the end).
+  - `Add-PrinterPort -Name '\\.\pipe\...'` and `Add-Printer` need elevation.
 
 ## Send flow (phase 2)
 
@@ -307,13 +274,8 @@ client/
    line shows "N page(s), X KB" (`PdfInfo`: largest `/Count` inside an object
    with `/Type /Pages`, so outline counts are ignored, else the number of
    `/Type /Page` objects), computed on the thread pool after the dialog opens.
-   Shared PC: when the spooled file's NTFS owner is another Windows user (not
-   this user, a group this user is in, or SYSTEM/LOCAL/NETWORK SERVICE) the
-   line ends ". Printed by <DOMAIN\user>" (`PrintedBy`). A file owned by
-   BUILTIN\Administrators (what an elevated process's files often get) is
-   inherently ambiguous: it says nothing about which user printed it, so it
-   may be labelled either way depending on whether this user is an
-   administrator.
+   The dialog does not say which Windows user printed the document (the pipe
+   does not tell; open item in handoff.md).
 3. Subject optional. "Send test page instead of this document" checkbox
    turns the request into `POST /test/send` and discards the PDF.
 4. `POST /jobs` with `Content-Type: application/pdf`, `X-Fax-To` (the
@@ -451,8 +413,8 @@ client/
    (`ClientConfig.LoadError`, click opens Settings), printer missing or on
    the wrong port (click installs/fixes), token missing. A 401 on the event stream shows "The server rejected the LANFax
    token" once per app run (again after Settings are saved); the click opens
-   Settings. `SpoolWatcher.Error` shows a balloon (Core rate-limits it).
-   `FaxApi`, `EventStream` and `SpoolWatcher` `Log` go to the app log.
+   Settings. `PrintPipeListener.Error` shows a balloon (Core rate-limits the repeating ones).
+   `FaxApi`, `EventStream` and `PrintPipeListener` `Log` go to the app log.
 11. The dialog queue opens the next dialog even if one fails to open (that
    document goes to "Unsent documents (N)...") or its close handler throws.
 ## State vocabularies (where each transition is decided)
@@ -504,9 +466,13 @@ client/
   retries the signal for up to 2 s before concluding "another session", so a
   second launch during startup is not misreported. Within the same 2 s it also
   retries the mutex, so a start during the owner's shutdown becomes the new
-  owner instead of exiting. Print jobs from the other session still land in
-  the spool and are offered on the active instance's desktop: on a shared PC
-  only one user at a time should be signed in with LANFax.
+  owner instead of exiting. Print jobs from the other session reach the
+  active instance through the pipe (the pipe lets every signed-in user's job
+  in; measured by DACL probe, not with a real second account) and are offered
+  on its desktop, with nothing saying who printed them: on a shared PC only
+  one user at a time should be signed in with LANFax. With no LANFax running,
+  jobs wait in the queue (see "Why a pipe port" for how long that is known
+  to hold).
 
 ## Monitor (phase 3, pending)
 
@@ -533,7 +499,7 @@ client/
 - A `resync` event (`{"reason","since"}`, sent when the replay gap is too large)
   raises `EventStream.Resync(since)`; the tray polls tracked jobs and runs the inbound catch-up, and the
   grids reload with `GET /jobs?updated_since=<since>` instead of expecting replay.
-- `FaxApi`, `EventStream` and `SpoolWatcher` each take an optional
+- `FaxApi`, `EventStream` and `PrintPipeListener` each take an optional
   `Log` (`Action<string>`) for diagnostics (skipped list rows, malformed
   events, stalls, spool errors); none of them ever passes the token to it.
 - Balloons: fax received (from), job sent, job failed, arm window expiring in

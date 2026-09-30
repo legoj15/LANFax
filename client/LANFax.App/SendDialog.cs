@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using LANFax.App.Logic;
 using LANFax.Core;
 
@@ -161,9 +160,7 @@ internal sealed class SendDialog : Form
     private async Task DescribeDocumentAsync(string pdfPath)
     {
         var text = await PdfInfo.DescribeFileAsync(pdfPath); // off the UI thread; resumes on it
-        // Shared PC: every user prints into the one spool, so say when someone else printed this.
-        var other = await Task.Run(() => PrintedBy.ForCurrentUser().OtherOwner(pdfPath));
-        if (!IsDisposed) _document.Text = PrintedBy.DocumentLine(text, other);
+        if (!IsDisposed) _document.Text = "PDF, " + text;
     }
 
     private void UpdateEnabled() => _send.Enabled =
@@ -196,7 +193,7 @@ internal sealed class SendDialog : Form
         else
         {
             _idle.TrySetResult();
-            if (_blockingShutdown) { _blockingShutdown = false; ShutdownBlockReasonDestroy(Handle); }
+            if (_blockingShutdown) { _blockingShutdown = false; ShutdownBlocker.ShutdownBlockReasonDestroy(Handle); }
         }
         UpdateEnabled();
     }
@@ -235,7 +232,7 @@ internal sealed class SendDialog : Form
             {
                 // Ask Windows to wait; the user sees the reason and can still shut down (the record prevents a duplicate).
                 e.Cancel = true;
-                if (!_blockingShutdown) _blockingShutdown = ShutdownBlockReasonCreate(Handle, "A fax is being sent.");
+                if (!_blockingShutdown) _blockingShutdown = ShutdownBlocker.ShutdownBlockReasonCreate(Handle, "A fax is being sent.");
                 return;
             }
         }
@@ -252,12 +249,4 @@ internal sealed class SendDialog : Form
         if (disposing) _icon.Dispose();
         base.Dispose(disposing);
     }
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool ShutdownBlockReasonCreate(IntPtr hWnd, string reason);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool ShutdownBlockReasonDestroy(IntPtr hWnd);
 }
