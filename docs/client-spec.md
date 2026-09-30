@@ -34,7 +34,11 @@ client/
     Dpapi.cs                        DPAPI via crypt32 P/Invoke (no NuGet package); Protect takes a DpapiScope (CurrentUser for the token)
     FaxApi.cs                       ISendApi (post job, test send, both to a SendEndpoint snapshot, PDF as byte[]) + HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download; FaxApiConfigException
     EventStream.cs                  SSE client: GET /events?token=, Last-Event-ID, stall detection, reconnect with backoff, raises typed events
-    SpoolWatcher.cs                 watches the port path; stability wait; %PDF and %%EOF checks; moves to jobs/<guid>.pdf (or rejected/<guid>.pdf); raises NewPrintJob / Error
+    SpoolWatcher.cs                 watches the port path; claims print.pdf with an exclusive handle and holds it through the %PDF / %%EOF checks and the rename (by handle) to jobs/<guid>.pdf (or rejected/<guid>.pdf); raises Claimed / NewPrintJob / Error
+    ClaimedFile.cs                  CreateFileW(GENERIC_READ|DELETE, share 0) + SetFileInformationByHandle(FileRenameInfo); no delete-on-close
+    PrintQueue.cs                   IPrintQueueControl + SpoolerPrintQueue (winspool SetPrinter pause/resume, IsPaused; JobCount is probe-only); IPrintJobSource + SpoolerJobSource (FindFirstPrinterChangeNotification, job STATUS field, "finished" = JOB_STATUS_PRINTED, IsRunning false once the watch dies: 10 failed reads in a row with 100 ms x n backoff)
+    PrintLossMonitor.cs             finished spooler jobs vs claimed files; a pair is trusted (Matched) once no job reported within 15 s after it is lost; an unmatched job after 15 s raises Lost, and the pairs made shortly before it Doubtful; claims no followed job took raise ClaimUnpaired; IgnoreJob skips jobs LANFax deleted itself
+    KeptJobs.cs                     KeptJob + IKeptJobStore + SpoolerKeptJobs (EnumJobs level 1 printed jobs, SetJob delete/restart), KeptJobLedger (spool\kept-jobs.json), KeptJobRecovery (reprint at start / on loss or doubt, delete when trusted, sweep and exit settle by claim count)
     Numbers.cs                      normalize_number / check_number mirror (shared vectors: LANFax.Tests/numbers-vectors.json)
     Models.cs                       Job, ArmState, ServerStatus records mirroring faxd JSON
   (PrinterSetup, which detects the printer and launches the elevated install/uninstall script, lives in LANFax.App)
@@ -42,17 +46,18 @@ client/
     Program.cs                      machine-wide single-instance mutex (Global\LANFax.Tray, see "One active session"); tray icon; no console
     TrayContext.cs                  NotifyIcon + menu: Open, Send a test..., Receive a test (arm 20 min), Settings, Install printer, Exit
     SendDialog.cs                   non-modal; number, subject, page count, Send / Cancel; "Send test page instead" checkbox
-    Logic/                          testable plain classes: SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer + InboundCatchUp, InstanceGuard, PrintedBy, ...
+    Logic/                          testable plain classes: SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer + InboundCatchUp, InstanceGuard, PrintedBy, QueueLifecycle, PrintGuard (LossCheckHost + StartGate + PrinterHealth + KeepPrintedJobsGuard), ...
     MainForm.cs                     (phase 3, NOT YET WRITTEN) status header, arm card with countdown, jobs grid, inbox grid, open PDF
     SettingsDialog.cs               server host/ip, port, token, "Clear token", "Test connection"
   LANFax.Tests/                     xunit: Core (config, FaxApi, EventStream, SpoolWatcher, numbers) + install/Inno script checks
   LANFax.App.Tests/                 xunit: App Logic classes (no UI; the WinForms files are not tested)
   install/
-    Install-LANFaxPrinter.ps1       elevated: Add-PrinterPort -Name <spool path>; Add-Printer -Name "LAN Fax" -DriverName "Microsoft Print To PDF" -PortName <spool path>, or Set-Printer -PortName <spool path> when the printer exists on another port; idempotent
-    Uninstall-LANFaxPrinter.ps1     removes printer and port; leaves %ProgramData%\LANFax
+    Install-LANFaxPrinter.ps1       elevated: Add-PrinterPort -Name <spool path>; Add-Printer -Name "LAN Fax" -DriverName "Microsoft Print To PDF" -PortName <spool path>, or Set-Printer -PortName <spool path> when the printer exists on another port; adds an allow ACE for BUILTIN\Users (S-1-5-32-545, READ_CONTROL|PRINTER_ACCESS_ADMINISTER|PRINTER_ACCESS_USE, no inheritance) to this printer's PermissionSDDL; sets KeepPrintedJobs (Win32_Printer, Set-CimInstance); pauses the queue (Win32_Printer Pause) for the app to resume, unless a LANFax.exe runs in any session (then it is left printing); idempotent
+    Uninstall-LANFaxPrinter.ps1     removes printer and port (documents still held in the queue are discarded, and the count of unprinted ones is printed; kept printed jobs are not counted); if Remove-Printer fails the queue is resumed, never left paused; leaves %ProgramData%\LANFax
     (both scripts self-elevate by relaunching with ONE -ArgumentList command-line string, never a pre-quoted array)
     LANFax.iss                      Inno Setup: installs app to Program Files, runs Install-LANFaxPrinter.ps1 from [Code] (non-zero exit = non-fatal message), adds Run key for tray autostart; uninstall taskkills LANFax.exe in CurUninstallStepChanged(usUninstall) (after the user confirms), then removes the printer; /DAppSource=<dir> overrides the published app folder (the test suite compiles against a stub)
   build.ps1                         dotnet test, dotnet publish, iscc -> dist/LANFax-Setup.exe
+  tools/Probe-PrinterBurst.ps1      live burst probe on the real printer (not in the sln or the build): builds tools/BurstProbe, runs only the watcher + loss check + kept-job deletes, prints -Count jobs of 1..Count pages at once; -Runs, -PausedFirst, -NoWatch, -Crash (nobody claims while they print, then the start-up recovery), -ShowStatuses; tray app must be closed; deletes its kept jobs; leaves the queue resumed
 ```
 
 ## Spool path and the printer
@@ -73,41 +78,223 @@ client/
   shows "The "LAN Fax" printer points at X, not the LANFax spool. Click here
   to fix it." and the tray item becomes "Fix ... printer"; both re-run the
   install script, which moves the queue with `Set-Printer`.
-- Watcher: `FileSystemWatcher` on the spool dir (Created/Changed) plus a 2 s
-  polling fallback. A job is complete when the file has existed for at least
-  1 s, its size is unchanged across two checks, and it can be opened with
-  `FileShare.None`. A complete file that is 0 bytes or does not start with
-  `%PDF` is deleted and reported via `Error("... not a PDF ...")`. The
-  `%%EOF` markers in the whole file are counted: 0 means not finished yet, so
-  the watcher keeps checking while the size is unchanged for up to `EofWait`
-  (10 s), then deletes it as not a PDF (a truncated document is never
-  faxed); 2 or more means two jobs landed in one file, so it is moved to
-  `spool\rejected\<guid>.pdf`, never sent, and reported via `Error("print.pdf
-  contained N documents; the LAN Fax printer received two jobs at once. Print
-  them one at a time.")`. Right before the move the size and first 1024 bytes
-  are compared with what was checked (in-place truncation or rewrite guard);
-  if they differ the file is checked again from the start. Otherwise move it
-  to `spool\jobs\<guid>.pdf` immediately (frees the port path for the next
-  job) and raise `NewPrintJob(guid, path)`.
-- The timings (`MinAge` 1 s, `SizeRecheck` 500 ms, `RetryEvery` 250 ms,
-  `PollEvery` 2 s, `EofWait` 10 s) are instance properties so the tests run the
-  same checks about five times faster.
+- Watcher (claim and hold): `FileSystemWatcher` on the spool dir plus a 2 s
+  polling fallback start one loop, which runs while `print.pdf` exists and
+  tries to claim it every `RetryEvery` (10 ms). The claim is
+  `ClaimedFile.TryOpen`: `CreateFileW(GENERIC_READ | DELETE, share 0)`. It
+  fails (sharing violation) while the spooler still has the file open, so a
+  successful claim means that job is finished; from then on the spooler's
+  next job gets a sharing violation on `print.pdf` and retries by itself
+  (measured: completes 3-6 s after the handle closes, nothing lost). Under the
+  claim the file is checked: not `%PDF` (or 0 bytes) goes to
+  `spool\rejected\<guid>.pdf` with `Error("print.pdf was not a PDF ...; kept
+  as ...")`; one `%%EOF` goes to `spool\jobs\<guid>.pdf`; two or more goes to
+  `rejected\` with `Error("print.pdf contained N documents; the LAN Fax
+  printer received two jobs at once. Print them one at a time.")` (a guard; it
+  never fires for this printer); no `%%EOF` goes to `rejected\` as not a PDF
+  at once, still under the claim (the exclusive open proves the spooler closed
+  it, so it is truncated; releasing it would reopen the overwrite window).
+  Access denied on the claim (a file pending deletion, briefly; or an ACL that
+  keeps this user out, for good) is reported through `Error("cannot take
+  print.pdf off the printer port: access denied ...")` once it lasts
+  `AccessDeniedReportAfter` (5 s), rate-limited like other errors. Every move is a rename through the held handle
+  (`SetFileInformationByHandle(FileRenameInfo)`, `\??\` path, no replace), so
+  the file is never unlocked at the port path. Nothing is deleted and there is
+  no delete-on-close: a crash while holding just closes the handle and leaves
+  `print.pdf` in place. After each move `Claimed(path)` fires (the loss check
+  counts these), then `NewPrintJob(guid, path)` for `jobs\`. Stopped after the
+  move: the file stays in `jobs\` without a record and the next start's
+  `JobTracker.Scan` offers it.
+- Timings are instance properties (`RetryEvery` 10 ms, `PollEvery` 2 s,
+  `AccessDeniedReportAfter` 5 s). `WaitIdle(timeout)` starts a check and
+  blocks until nothing is at the port and no check runs (start-up uses it). The old settle wait (1 s age + 500 ms size recheck) is gone:
+  holding the exclusive handle is the proof the spooler is done.
 - A failed move (e.g. `jobs\` unwritable) raises `Error(reason, exception)`
-  at most once per distinct reason per 60 s; the file stays at `print.pdf`.
-  After 5 consecutive failures the watcher retries only on the 2 s poll.
-  `Stop()` cancels a check in progress before it moves or raises.
+  at most once per distinct reason per 60 s; the claim is kept and only the
+  rename is retried (every 250 ms, after 5 failures every `PollEvery`), so
+  the spooler's next job keeps getting a sharing violation instead of
+  replacing the file. A check loop that ends re-checks for `print.pdf` once it
+  is marked idle (a Created event in that gap used to be dropped).
+  `Stop()` cancels a check in progress before it moves or raises. A file held
+  open elsewhere for 2 min is logged (not an error: a long job looks the same).
+- Queue pause lifecycle (`QueueLifecycle` over `IPrintQueueControl`,
+  `SpoolerPrintQueue`): the queue is paused whenever no watcher claims
+  `print.pdf`, so jobs wait in the queue instead of overwriting each other at
+  the port. The install script pauses it (unless LANFax.exe is running). The
+  tray app at start: pauses it (a crash leaves it printing), notes whether a
+  `print.pdf` is left from the last run, starts the watcher and waits up to
+  2 s (`WaitIdle`) for that leftover to be claimed. `StartGate` then runs the
+  hand-over once: the loss check starts (so the leftover claim is not
+  counted), kept jobs are recovered (below), and the queue is resumed (held
+  and reprinted jobs drain into a claiming watcher). If the leftover is still
+  at the port after 2 s (antivirus scanning it), the queue stays held and the
+  10 s health tick releases the gate once `SpoolWatcher.IsIdle`; resuming
+  early would let the first held job overwrite the leftover while its own
+  claim was counted for it. A hold lasting 60 s (the leftover open in a PDF
+  viewer: the claim's share-mode-0 open fails with a sharing violation, which
+  the watcher only logs) shows one balloon: "Documents printed to LAN Fax are
+  waiting: <spool>\print.pdf is open in another program. Close it and LANFax
+  will pick them up." It
+  pauses it if the watcher cannot start, and on tray Exit, on
+  `SystemEvents.SessionEnded` (logoff, shutdown), on `Dispose` and, best
+  effort, on an unhandled exception. After "Install printer" succeeds (with
+  the start hand-over done) the app resumes it and restarts the loss check.
+  Every 10 s, on a thread-pool timer (a hung spooler must not freeze the tray;
+  a tick still running skips the next), `PrinterHealth.Tick` re-reads the
+  printer (registry, cheap): a move to
+  another port is announced once per change with the Misconfigured balloon;
+  Missing/Misconfigured -> Installed restarts the loss check (the printer may
+  be new or re-created); while the watcher runs, a dead loss check is started
+  again and `QueueLifecycle.Reconcile` resumes a queue found paused (the
+  install script, a person; one LANFax per machine, so never another user's
+  LANFax). It also checks the printer's "Keep printed documents"
+  (`KeepPrintedJobsGuard` over `IKeepPrintedJobs`: `PRINTER_INFO_5`
+  Attributes `0x100`): anyone with the Users ACE can clear it on the Advanced
+  tab, which would silently turn off kept-job recovery, so it is set back
+  (SetPrinter level 5 on a handle with ADMINISTER|USE; ADMINISTER alone is
+  refused, measured; logged), and if that is
+  refused one balloon per change offers the repair (the install script sets
+  it). Measured with `Probe-PrinterBurst.ps1 -KeepCheck` (clear, then set
+  back through this path). A resume that keeps failing is logged once until it changes. A pause/resume
+  failure never stops the app: it is logged, and access denied (Win32 5) shows
+  one balloon per run: "LANFax cannot pause or resume the "LAN Fax" printer,
+  so documents printed while LANFax is closed may be lost. Click here to
+  repair it (an administrator must approve)." The click runs the install
+  script, and the tray menu then shows "Repair "LAN Fax" printer
+  permissions..." even though the printer is installed. A denied pause on
+  Exit is not shown (the tray is going away); the next start's pause fails the
+  same way and shows it. A missing printer is logged only (it has its own
+  balloon). Permission: by default only the installing user and
+  Administrators may pause (measured `PermissionSDDL` 2026-09-30: the
+  installing user's SID has `LCSWSDRCWDWO`, Everyone only `SWRC`), hence the
+  installer's Users ACE. That ACE is wider than pause/resume: Windows has no
+  narrower right, and `PRINTER_ACCESS_ADMINISTER` also lets any user change
+  this printer's port, driver, separator page and print processor (not its
+  permissions, not deleting it). The 10 s health check limits a moved port to
+  at most ~10 s of misrouted jobs before the Fix balloon. Open decision in
+  handoff.md. A `taskkill /F` (the uninstaller), a crash that skips the
+  handlers, or a power loss leaves the queue running with nobody claiming
+  until the next start; the kept-job recovery below gets those documents back.
+- Kept-job recovery (`KeptJobRecovery` over `IKeptJobStore`,
+  `SpoolerKeptJobs`): the installer sets `KeepPrintedJobs`, so a printed job
+  stays in the queue with status Printed (observed statuses with it on:
+  `0x8`, `0x0`, `0x10`, `0x2010` while printing, `0x0`, then `0x80`; our
+  delete then gives `0x84`, `0x184`) and `SetJob(JOB_CONTROL_RESTART)` prints
+  it to `print.pdf` again (measured: same size, a new file 200 ms later).
+  At start (queue held, leftover claimed): every kept printed job not in the
+  ledger and not followed by the loss check was printed while nobody claimed;
+  the one whose page count (`JOB_INFO_1.TotalPages`) matches the claimed
+  leftover owns it (deleted), the others are restarted and wait in the held
+  queue, then drain through the watcher. Queue position is not print order
+  (measured, `-Crash` x3: jobs spooled together printed out of position
+  order; picking the last by position deleted a 1-page job whose file was
+  gone while restarting the leftover's 2-page job). When no single job has
+  the leftover's page count, every job is restarted (one duplicate send
+  dialog, never a loss). Claims made before the loss check starts (the leftover, and jobs
+  a refused pause let print meanwhile) are counted: as many claims as those
+  jobs and all are deleted instead (nothing was replaced). While running: a
+  job the loss check trusts as `Matched` is deleted (queued, deleted on a
+  pool thread by `Drain`); a `Lost` job and its `Doubtful` companions are
+  restarted (at most 2 times each) instead of the "print it again" balloon,
+  which shows only when the lost job is not kept or cannot be restarted (or a
+  doubtful one is kept but refused). Claims no followed job took
+  (`ClaimUnpaired`: no job reported within 15 s, dropped by a reset, in
+  flight in a replaced monitor, or made while no monitor runs) are recorded;
+  the health tick's `Sweep` waits until every kept printed job the loss check
+  does not follow has been seen for 60 s, then deletes them all when there
+  are as many claims, otherwise prints them all again (which one was replaced
+  cannot be told: duplicates, never a silent loss) and reports the ones it
+  cannot restart; unneeded claims are forgotten after 60 s. Nothing is
+  deleted that no claim accounts for. On Exit: the watcher is stopped and
+  waited for (2 s, so a claim past its cancellation check is reported), pairs
+  at least 2 s old that no pending job doubts are trusted
+  (`SettleForExit`), and `SettleAtExit` deletes unfollowed jobs only when
+  the claims add up; everything else stays kept and the next start prints
+  it again. A job this user may not restart or
+  delete (another user's: SetJob needs the job owner or an admin) is reported
+  (start: "... printed to LAN Fax while LANFax was not running and replaced
+  before it could be sent; print it again.") and written to
+  `spool\kept-jobs.json` (id + submit time) so no later start touches it;
+  entries for jobs gone from the queue are pruned. Deleting a kept job the
+  current job source never saw print reads as a finish (PRINTED|DELETING);
+  `DeletedHere` feeds `PrintLossMonitor.IgnoreJob` so it is not counted
+  (found live by the `-Crash` probe). Residual: a crash between a claim and
+  its delete prints that document again at the next start (a duplicate send
+  dialog, never a silent loss). An install without `KeepPrintedJobs` (older
+  script) keeps the old detect-only behaviour.
+- Loss check (`PrintLossMonitor` over `IPrintJobSource`,
+  `SpoolerJobSource`): spooler change notifications for the queue's jobs
+  (`JOB_NOTIFY_FIELD_STATUS`, needs only `PRINTER_ACCESS_USE`, so every
+  user's jobs); a job is finished the first time its status has
+  `JOB_STATUS_PRINTED` (observed: `0x84` PRINTED|DELETING then `0x184`,
+  about 5-15 ms before the watcher's claim). Matching is by count: each claim
+  pays the newest unmatched finished job (the port keeps only the last one
+  written), a claim may also wait 15 s for its job. A finished job still
+  unmatched after 15 s while no file sits at the port raises `Lost` (checked
+  every 5 s). A claim can be the file of a job whose "finished" is still on
+  its way (claim-before-finish), so the newest pending job may be the wrong
+  owner: a pair is only trusted (`Matched`, which deletes the kept job) once
+  15 s have passed and no job reported after it (within 15 s) is still
+  pending; when such a job is `Lost`, the pairs made before it within 15 s
+  are raised `Doubtful` and printed again too. A pair made after the lost job
+  finished is not doubted (the claimed file was written after the lost one). The balloon "A document printed to LAN Fax may have been
+  replaced; print it again." shows only when the printer is Installed and the
+  watcher runs (`NotificationText.ForLostJob`); otherwise printing again
+  cannot help, the port or watcher balloon names the real cause, and the
+  loss is logged. `LossCheckHost` owns the one monitor, restarts it on
+  demand, and forwards the watcher's claims to the current one without
+  blocking (with no monitor, a claim goes to the kept-job sweep). Discarded
+  notifications (`PRINTER_NOTIFY_INFO_DISCARDED`) reset the monitor: pending
+  and paired jobs stop being followed, their claims are handed to the sweep,
+  and for 15 s nothing is paired (a claim may be a job the discarded batch
+  reported); the sweep's claim count then decides. The refresh read that
+  follows reports every kept job's status: those ids are recorded but not
+  counted as finishes (they may have printed long ago, e.g. another user's
+  ledgered job). Jobs finished while the app is not running are not counted
+  by the loss check; the kept-job recovery covers that time. `FinishedJobs` dedups statuses per printing: a job leaves the set
+  on DELETED or on a status without PRINTED (restarted; measured: a
+  restarted kept job reports `0x800`, `0x0`, `0x10`, `0x2010`, then `0x80`
+  again, so it re-arms), a repeated DELETED is
+  remembered (256 ids), and kept jobs are capped at 4096, oldest ids first
+  (the old set was cleared at 4096, which fired the next `0x184` twice).
+  Winspool offsets are hand-computed for x64; `SpoolerJobSource.Start` and
+  `JobCount` throw `PlatformNotSupportedException` in a 32-bit process.
 - Phase-2 probe, result 2026-09-30 (the real `LAN Fax` printer, tray app not
   running, `Out-Printer` twice back to back): the second job **silently
   overwrites** the first. A 3-page job followed at once by a 1-page job left
   one `print.pdf` with `/Count 1` and one `%%EOF`; the 3-page job alone gives
   `/Count 3`. No spooler error, no append. The spooler runs the jobs one after
   the other, so the first file is complete and then replaced.
-  Consequences: (1) documents printed while the tray app is not running are
-  lost except the last one; (2) while it runs, a second job that finishes
-  inside the watcher's settle window (MinAge 1 s + 500 ms size check) replaces
-  the first before it is moved. The `%%EOF` >= 2 rejection stays as a
-  harmless guard but never fires for this printer. Mitigation is an open item
-  in handoff.md.
+- Burst probe after the claim-and-hold fix, 2026-09-30
+  (`client/tools/Probe-PrinterBurst.ps1`, watcher only, jobs spooled
+  concurrently with `PrintDocument` so the spooler runs them back to back):
+  5 jobs x 3 runs, 5 jobs spooled into a paused queue then resumed, and 10
+  jobs x 1 run: every run claimed exactly N files with `/Count` {1..N}, one
+  `%%EOF` each, spooler finished = claimed, loss check 0. Timing: the spooler
+  marks job N printed and starts job N+1 about 2 ms later, but job N+1
+  creates `print.pdf` about 190 ms after that; the watcher claimed 5-17 ms
+  after "printed", so the margin is roughly 175 ms. With `-NoWatch` (3 jobs,
+  no watcher) the overwrite reproduces (one file, `/Count 3`) and the loss
+  check reported exactly the 2 lost jobs. Residual risk: a claim delayed past
+  that margin (the machine stalled ~200 ms) still loses the earlier job;
+  the loss check then says so. `Out-Printer` was not used for the burst
+  (text pagination makes page counts inexact, and sequential `Print()` calls
+  never overlapped: each blocks about one job's rendering).
+- Kept-job probes, 2026-09-30 (KeepPrintedJobs set on this PC's printer by
+  its owner, non-elevated `Set-CimInstance`): `-Count 5` PASS with every
+  matched job deleted (probe jobs still kept: 0); `-Count 5 -Crash` (5 jobs
+  printed with nobody claiming, then the start-up hand-over) claimed the
+  leftover `/Count 5` plus 4 restarted jobs, page counts {1..5}, loss check 0.
+  Its first run showed the false loss fixed by `IgnoreJob` (the leftover
+  owner's delete read as a finish).
+- Round-4 probes, 2026-09-30: `-Count 3 -Crash -Runs 3` PASS with the
+  page-count owner (in run 3 the last job by position had 1 page, the
+  leftover 2); an earlier `-Crash` run under the position rule gave page
+  counts {2,2,3} (a silent loss). `-Count 5` PASS with trusted matches
+  deleted after the 15 s wait (probe jobs still kept: 0). `-KeepCheck` PASS
+  (cleared, then set back through `SetKeepPrintedJobs`). Restart statuses
+  (`-ShowStatuses`): `0x800` twice, then `0x0`, `0x10`, `0x2010`, `0x0`,
+  `0x80`, `0x84`, `0x184`.
 
 ## Send flow (phase 2)
 

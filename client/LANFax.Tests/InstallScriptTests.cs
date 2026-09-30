@@ -1,3 +1,6 @@
+using System.Security.AccessControl;
+using System.Security.Principal;
+
 namespace LANFax.Tests;
 
 public class InstallScriptTests
@@ -146,5 +149,128 @@ public class InstallScriptTests
         Assert.Matches(@"Set-Printer\s+-Name\s+\$PrinterName\s+-PortName\s+\$portName", t);
         Assert.True(t.IndexOf("Set-Printer", StringComparison.Ordinal) > t.IndexOf("Add-PrinterPort", StringComparison.Ordinal),
             "the port must exist before the printer is moved onto it");
+    }
+
+    // ---- pause and resume: the queue is paused whenever no watcher claims print.pdf ----
+
+    [Fact]
+    public void InstallScriptGrantsUsersPauseAndResumeOnThisPrinterOnly()
+    {
+        // A standard user's tray app pauses the queue on exit and resumes it on start. Only the installing user gets
+        // "Manage printers" by default, so Users get PRINTER_ACCESS_ADMINISTER on this one printer (not server-wide,
+        // not delete, not change permissions).
+        var t = File.ReadAllText(Path.Combine(Dir(), "Install-LANFaxPrinter.ps1"));
+        Assert.Matches(@"Get-Printer\s+-Name\s+\$PrinterName\s+-Full", t);
+        Assert.Matches(@"Set-Printer\s+-Name\s+\$PrinterName\s+-PermissionSDDL", t);
+        Assert.Contains("S-1-5-32-545", t); // BUILTIN\Users by SID: not localized
+        Assert.True(t.IndexOf("-PermissionSDDL", StringComparison.Ordinal) > t.IndexOf("Add-Printer ", StringComparison.Ordinal),
+            "the printer must exist before its permissions are set");
+    }
+
+    [Fact]
+    public void InstallScriptKeepsPrintedJobsSoAReplacedDocumentCanBePrintedAgain()
+    {
+        // With KEEPPRINTEDJOBS a document whose print.pdf was replaced (app killed or crashed, queue left printing)
+        // is still in the queue as "Printed", and the app restarts it at its next start.
+        var t = File.ReadAllText(Path.Combine(Dir(), "Install-LANFaxPrinter.ps1"));
+        Assert.Matches(@"\.KeepPrintedJobs\s*=\s*\$true", t);
+        Assert.Contains("Set-CimInstance", t);
+        var keep = t.IndexOf(".KeepPrintedJobs", StringComparison.Ordinal);
+        Assert.True(keep > t.IndexOf("Add-Printer ", StringComparison.Ordinal), "the printer must exist first");
+        Assert.True(keep < t.IndexOf("-MethodName Pause", StringComparison.Ordinal), "before the queue is paused");
+    }
+
+    [Fact]
+    public void UninstallScriptCountsOnlyDocumentsStillWaiting()
+    {
+        // Kept printed jobs are already sent or claimed; only unprinted ones are really discarded.
+        var t = File.ReadAllText(Path.Combine(Dir(), "Uninstall-LANFaxPrinter.ps1"));
+        Assert.Matches(@"JobStatus\S{0,3}\s+-notmatch\s+'Printed'", t);
+    }
+
+    [Fact]
+    public void InstallScriptLeavesTheQueuePausedForTheAppToResume()
+    {
+        var t = File.ReadAllText(Path.Combine(Dir(), "Install-LANFaxPrinter.ps1"));
+        var pause = t.IndexOf("-MethodName Pause", StringComparison.Ordinal);
+        Assert.True(pause > 0, "no pause");
+        Assert.True(pause > t.IndexOf("-PermissionSDDL", StringComparison.Ordinal) && pause > t.IndexOf("Set-Printer -Name $PrinterName -PortName", StringComparison.Ordinal),
+            "pause once the queue is in its final state");
+        Assert.Contains("Win32_Printer", t);
+    }
+
+    [Fact]
+    public void InstallScriptDoesNotPauseTheQueueUnderARunningLANFax()
+    {
+        // A running tray app (a repair, an upgrade the user kept it open for, another user's session) already watches
+        // the port; pausing under it would hold every later document with no word to anyone.
+        var t = File.ReadAllText(Path.Combine(Dir(), "Install-LANFaxPrinter.ps1"));
+        var running = t.IndexOf("Get-Process -Name LANFax", StringComparison.Ordinal);
+        var pause = t.IndexOf("-MethodName Pause", StringComparison.Ordinal);
+        Assert.True(running > 0 && running < pause, "check for a running LANFax before pausing");
+        Assert.Matches(@"(?s)if\s*\(\s*\$lanfaxRunning\s*\).*?else\s*\{[^}]*-MethodName Pause", t);
+    }
+
+    [Fact]
+    public void InstallScriptIsHonestAboutTheRightsItGrantsAndPrintsACleanStatus()
+    {
+        var t = File.ReadAllText(Path.Combine(Dir(), "Install-LANFaxPrinter.ps1"));
+        Assert.DoesNotContain("and nothing else", t); // PRINTER_ACCESS_ADMINISTER also covers the port, driver and settings
+        var last = t.TrimEnd().Split('\n')[^1].TrimEnd();
+        Assert.False(last.EndsWith("\\\"", StringComparison.Ordinal), "a backslash does not escape a quote in PowerShell: " + last);
+    }
+
+    [Fact]
+    public void UninstallScriptNeverLeavesAPausedQueueBehind()
+    {
+        // Removing the printer removes its paused state; if the removal fails the queue is resumed, not left paused.
+        var t = File.ReadAllText(Path.Combine(Dir(), "Uninstall-LANFaxPrinter.ps1"));
+        Assert.Matches(@"(?s)try\s*\{\s*Remove-Printer -Name \$PrinterName.*?\}\s*catch\s*\{.*?-MethodName Resume.*?throw", t);
+    }
+
+    [Fact]
+    public async Task PauseAceIsAddedOnceAndKeepsEveryExistingAce()
+    {
+        var ps51 = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
+        if (!File.Exists(ps51)) return;
+        var text = File.ReadAllText(Path.Combine(Dir(), "Install-LANFaxPrinter.ps1"));
+        var fn = System.Text.RegularExpressions.Regex.Match(text, @"(?ms)^function Add-UsersPauseAce.*?^\}").Value;
+        Assert.NotEmpty(fn);
+        // The LAN Fax printer's descriptor as Get-Printer -Full returned it on the dev PC (2026-09-30), shortened.
+        const string before = "G:SYD:(A;;LCSWSDRCWDWO;;;S-1-5-21-1-2-3-1001)(A;OIIO;RPWPSDRCWDWO;;;S-1-5-21-1-2-3-1001)(A;OIIO;GA;;;CO)(A;;SWRC;;;WD)(A;CIIO;GX;;;WD)(A;;LCSWDTSDRCWDWO;;;BA)(A;OICIIO;GA;;;BA)";
+        var tmp = Path.Combine(Path.GetTempPath(), "lanfax-sddl-" + Guid.NewGuid().ToString("N") + ".ps1");
+        File.WriteAllText(tmp, fn + "\r\n$a = Add-UsersPauseAce '" + before + "'\r\n$b = Add-UsersPauseAce $a\r\n$a\r\n$b\r\n");
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(ps51) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (var a in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp }) psi.ArgumentList.Add(a);
+            using var p = System.Diagnostics.Process.Start(psi)!;
+            var stdout = p.StandardOutput.ReadToEndAsync();
+            var stderr = p.StandardError.ReadToEndAsync();
+            await p.WaitForExitAsync();
+            Assert.True(p.ExitCode == 0, await stderr + await stdout);
+            var lines = (await stdout).Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            Assert.Equal(2, lines.Length);
+            Assert.Equal(lines[0], lines[1]); // idempotent
+            var after = new RawSecurityDescriptor(lines[0]);
+            var original = new RawSecurityDescriptor(before);
+            Assert.Equal(original.DiscretionaryAcl!.Count + 1, after.DiscretionaryAcl!.Count);
+            var users = new SecurityIdentifier("S-1-5-32-545");
+            var added = Assert.Single(after.DiscretionaryAcl.Cast<GenericAce>().OfType<CommonAce>(), a => a.SecurityIdentifier == users);
+            Assert.Equal(AceQualifier.AccessAllowed, added.AceQualifier);
+            Assert.Equal(0x0002000C, added.AccessMask); // READ_CONTROL | PRINTER_ACCESS_ADMINISTER | PRINTER_ACCESS_USE
+            Assert.Equal(AceFlags.None, added.AceFlags); // the printer only, not its jobs
+            var kept = after.DiscretionaryAcl.Cast<GenericAce>().Select(Bytes).ToList();
+            foreach (GenericAce ace in original.DiscretionaryAcl)
+                Assert.Contains(kept, k => k.SequenceEqual(Bytes(ace)));
+        }
+        finally { try { File.Delete(tmp); } catch { } }
+    }
+
+    private static byte[] Bytes(GenericAce a)
+    {
+        var b = new byte[a.BinaryLength];
+        a.GetBinaryForm(b, 0);
+        return b;
     }
 }

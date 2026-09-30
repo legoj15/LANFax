@@ -34,7 +34,18 @@ $portName = Join-Path $SpoolDir 'print.pdf'
 
 $printerRemoved = $false
 if (Get-Printer -Name $PrinterName -ErrorAction SilentlyContinue) {
-    Remove-Printer -Name $PrinterName
+    # The app keeps the queue paused while it is not running: documents still held there go with the printer.
+    # Kept printed jobs (the printer keeps them for reprinting) already reached the port and are not counted.
+    $waiting = @(Get-PrintJob -PrinterName $PrinterName -ErrorAction SilentlyContinue | Where-Object { "$($_.JobStatus)" -notmatch 'Printed' }).Count
+    if ($waiting -gt 0) { "discarding $waiting document(s) still waiting in the '$PrinterName' queue" }
+    try {
+        Remove-Printer -Name $PrinterName
+    }
+    catch {
+        # Never leave a paused queue behind.
+        $null = Get-CimInstance -ClassName Win32_Printer | Where-Object Name -eq $PrinterName | Invoke-CimMethod -MethodName Resume
+        throw
+    }
     $printerRemoved = $true
 }
 

@@ -62,10 +62,19 @@ public class PdfInfoTests
         {
             var bytes = Pdf(2);
             File.WriteAllBytes(path, bytes);
-            var caller = Environment.CurrentManagedThreadId;
-            int worker = -1;
-            var text = await PdfInfo.DescribeFileAsync(path, () => worker = Environment.CurrentManagedThreadId);
+            // The caller is a dedicated thread blocked on the result, so the read cannot run inline on it. (Awaited
+            // from a pool thread, the continuation may pick up its own queued work item: flaky, seen 19 == 19.)
+            int caller = -1, worker = -1;
+            string? text = null;
+            var t = new Thread(() =>
+            {
+                caller = Environment.CurrentManagedThreadId;
+                text = PdfInfo.DescribeFileAsync(path, () => worker = Environment.CurrentManagedThreadId).GetAwaiter().GetResult();
+            });
+            t.Start();
+            Assert.True(t.Join(TimeSpan.FromSeconds(10)));
             Assert.Equal(PdfInfo.Describe(2, bytes.Length), text);
+            Assert.NotEqual(-1, worker);
             Assert.NotEqual(caller, worker);
             Assert.Equal("unknown size", await PdfInfo.DescribeFileAsync(path + ".missing"));
         }

@@ -54,6 +54,30 @@ if (-not $spoolFull.StartsWith($dataFull, [StringComparison]::OrdinalIgnoreCase)
     Grant-UsersModify -Path $SpoolDir  # custom spool location outside the data dir
 }
 
+# Adds one allow ACE for BUILTIN\Users (by SID, so it is not localized) to a printer's security descriptor:
+# READ_CONTROL | PRINTER_ACCESS_ADMINISTER | PRINTER_ACCESS_USE, no inheritance flags. Windows has no narrower right
+# that allows pause/resume, and PRINTER_ACCESS_ADMINISTER also lets any user change THIS printer's settings (its port,
+# driver, separator page, print processor). It does not cover its jobs, deleting it, or its permissions. The tray app
+# re-reads the port every 10 s and offers a fix when it moved. Every existing ACE is kept as it is; the new one goes
+# after any deny ACEs. Returns the input unchanged when the ACE is already there.
+function Add-UsersPauseAce([string]$Sddl) {
+    $sd = New-Object Security.AccessControl.RawSecurityDescriptor($Sddl)
+    if ($null -eq $sd.DiscretionaryAcl) { throw "The printer's security descriptor has no DACL: $Sddl" }
+    $users = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
+    $mask = 0x0002000C
+    foreach ($ace in $sd.DiscretionaryAcl) {
+        if ($ace -is [Security.AccessControl.CommonAce] -and $ace.SecurityIdentifier -eq $users -and
+            $ace.AceQualifier -eq 'AccessAllowed' -and $ace.AceFlags -eq 'None' -and (($ace.AccessMask -band $mask) -eq $mask)) {
+            return $Sddl
+        }
+    }
+    $at = 0
+    while ($at -lt $sd.DiscretionaryAcl.Count -and $sd.DiscretionaryAcl[$at].AceQualifier -eq 'AccessDenied') { $at++ }
+    $allow = New-Object Security.AccessControl.CommonAce('None', 'AccessAllowed', $mask, $users, $false, $null)
+    $sd.DiscretionaryAcl.InsertAce($at, $allow)
+    $sd.GetSddlForm('All')
+}
+
 $portAdded = $false
 if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
     Add-PrinterPort -Name $portName
@@ -74,4 +98,34 @@ elseif ($existing.PortName -ne $portName) {
     $printerMoved = $true
 }
 
-"LANFax printer '$PrinterName' -> $portName (port added: $portAdded, printer added: $printerAdded, printer moved: $printerMoved)"
+# The LANFax tray app (a standard user) resumes the queue when it starts and pauses it when it exits, so documents
+# printed while it is not running wait in the queue instead of overwriting each other at the port.
+$sddl = (Get-Printer -Name $PrinterName -Full).PermissionSDDL
+$withUsers = Add-UsersPauseAce $sddl
+$permissionAdded = $withUsers -ne $sddl
+if ($permissionAdded) { Set-Printer -Name $PrinterName -PermissionSDDL $withUsers }
+
+# Printed jobs stay in the queue (as "Printed") until the app deletes them. A document whose print.pdf was replaced
+# before anyone claimed it (the app killed or crashed while the queue printed) can then be printed again: the app
+# restarts every kept job it has not dealt with when it starts.
+$wp = Get-CimInstance -ClassName Win32_Printer | Where-Object Name -eq $PrinterName
+$keepAdded = $false
+if (-not $wp.KeepPrintedJobs) {
+    $wp.KeepPrintedJobs = $true
+    Set-CimInstance -InputObject $wp
+    $keepAdded = $true
+}
+
+# Held until the app runs: it resumes the queue once it is watching print.pdf. A LANFax already running (any
+# session: a repair, an upgrade it was kept open for) watches the port now, so the queue is left printing for it.
+$lanfaxRunning = [bool](Get-Process -Name LANFax -ErrorAction SilentlyContinue)
+if ($lanfaxRunning) {
+    $queueState = 'left printing: LANFax is running'
+}
+else {
+    $paused = (Get-CimInstance -ClassName Win32_Printer | Where-Object Name -eq $PrinterName | Invoke-CimMethod -MethodName Pause).ReturnValue
+    if ($paused -ne 0) { "warning: pausing '$PrinterName' returned $paused" }
+    $queueState = 'paused until LANFax starts'
+}
+
+"LANFax printer '$PrinterName' -> $portName (port added: $portAdded, printer added: $printerAdded, printer moved: $printerMoved, users may pause: added $permissionAdded, keeps printed jobs: set $keepAdded, $queueState)"

@@ -11,23 +11,25 @@ public class SpoolWatcherTests : IDisposable
 
     public void Dispose() { try { Directory.Delete(_dir, true); } catch { } }
 
-    /// <summary>
-    /// Production timings scaled down about five times (1 s age, 500 ms recheck, 250 ms retry, 2 s poll): the same
-    /// sequence of checks without the real sleeps.
-    /// </summary>
+    private readonly List<string> _claimed = new();
+
+    /// <summary>Production retry cadence (10 ms while the file is locked); the idle poll shortened from 2 s.</summary>
     private SpoolWatcher Make()
     {
         var w = new SpoolWatcher(_dir)
         {
-            MinAge = TimeSpan.FromMilliseconds(200),
-            SizeRecheck = TimeSpan.FromMilliseconds(100),
-            RetryEvery = TimeSpan.FromMilliseconds(50),
+            RetryEvery = TimeSpan.FromMilliseconds(10),
             PollEvery = TimeSpan.FromMilliseconds(400),
         };
         w.NewPrintJob += (id, p) => { lock (_events) _events.Add((id, p, DateTime.UtcNow)); };
         w.Error += (r, e) => { lock (_errors) _errors.Add((r, e)); };
+        w.Claimed += p => { lock (_claimed) _claimed.Add(p); };
         return w;
     }
+
+    private const int SharingViolation = unchecked((int)0x80070020);
+
+    private string RejectedDir => Path.Combine(_dir, "rejected");
 
     private int Count { get { lock (_events) return _events.Count; } }
     private int ErrorCount { get { lock (_errors) return _errors.Count; } }
@@ -111,17 +113,20 @@ public class SpoolWatcherTests : IDisposable
     }
 
     [Fact]
-    public async Task FileDeletedMidCheckIsTolerated()
+    public async Task FileDeletedWhileBeingWrittenIsTolerated()
     {
         using var w = Make();
-        w.MinAge = TimeSpan.FromSeconds(1); // its own wide window: a 250 ms stall must not let the file age out first
         w.Start();
         var src = Path.Combine(_dir, "print.pdf");
-        File.WriteAllBytes(src, Pdf());
-        await Task.Delay(50); // inside the 1 s age wait
-        File.Delete(src);
-        await Task.Delay(1000);
+        using (var fs = new FileStream(src, FileMode.Create, FileAccess.Write, FileShare.Read | FileShare.Delete))
+        {
+            fs.Write(Pdf());
+            await Task.Delay(100); // the watcher is retrying against the writer's handle
+            File.Delete(src); // delete pending until the writer closes
+        }
+        await Task.Delay(500);
         Assert.Equal(0, Count);
+        Assert.Equal(0, ErrorCount);
         File.WriteAllBytes(src, Pdf(20));
         await WaitFor(() => Count == 1);
     }
@@ -141,17 +146,22 @@ public class SpoolWatcherTests : IDisposable
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
-    public async Task NonPdfIsDeletedWithErrorAndNotRaised(int kind)
+    public async Task NonPdfIsKeptAsideWithErrorAndNotRaised(int kind)
     {
         using var w = Make();
         w.Start();
         var src = Path.Combine(_dir, "print.pdf");
-        File.WriteAllBytes(src, kind == 0 ? Array.Empty<byte>() : Encoding.ASCII.GetBytes("%!PS-Adobe-3.0 postscript"));
+        var bytes = kind == 0 ? Array.Empty<byte>() : Encoding.ASCII.GetBytes("%!PS-Adobe-3.0 postscript");
+        File.WriteAllBytes(src, bytes);
         await WaitFor(() => ErrorCount >= 1);
         await WaitFor(() => !File.Exists(src), 3000);
         Assert.Equal(0, Count);
         Assert.Contains("not a PDF", _errors[0].reason);
         Assert.Empty(Directory.GetFiles(w.JobsDir));
+        // never deleted: whatever reached the port is kept for inspection
+        var kept = Assert.Single(Directory.GetFiles(RejectedDir));
+        Assert.Equal(bytes, File.ReadAllBytes(kept));
+        Assert.Equal(kept, Assert.Single(_claimed));
     }
 
     [Fact]
@@ -179,24 +189,80 @@ public class SpoolWatcherTests : IDisposable
     }
 
     [Fact]
-    public async Task StopWhileAJobIsBeingProcessedLeavesItAlone()
+    public async Task AFailingMoveKeepsThePortFileLockedUntilTheMoveWorks()
+    {
+        // jobs\ unwritable during a burst: releasing print.pdf between retries would let the spooler's next job
+        // overwrite it. The claim is kept and only the rename is retried, past the fast retries into the slow ones.
+        using var w = Make();
+        w.Start();
+        Directory.Delete(w.JobsDir);
+        File.WriteAllText(w.JobsDir, "a file where the jobs dir should be");
+        var pdf = Pdf(30);
+        File.WriteAllBytes(w.PrintPath, pdf);
+        await WaitFor(() => ErrorCount >= 1);
+        int opened = 0, tries = 0;
+        var end = DateTime.UtcNow.AddMilliseconds(2000); // 250 ms x 5 fast retries, then the 400 ms poll
+        while (DateTime.UtcNow < end)
+        {
+            tries++;
+            try
+            {
+                using var _ = new FileStream(w.PrintPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+                opened++;
+            }
+            catch (IOException) { }
+            await Task.Delay(5);
+        }
+        Assert.True(tries > 20, $"only {tries} tries"); // Task.Delay(5) is ~15 ms on Windows, slower under a loaded suite
+        Assert.Equal(0, opened);
+        File.Delete(w.JobsDir);
+        Directory.CreateDirectory(w.JobsDir);
+        await WaitFor(() => Count == 1);
+        Assert.Equal(pdf, File.ReadAllBytes(_events[0].path));
+    }
+
+    [Fact]
+    public async Task AFileCreatedAsTheCheckEndsIsNotLeftForThePoll()
+    {
+        // The loop ends when print.pdf is gone; a Created event in the gap before it is marked idle used to be
+        // dropped, leaving the next job to the (2 s) poll, far past the next job's overwrite.
+        var w = new SpoolWatcher(_dir) { RetryEvery = TimeSpan.FromMilliseconds(10), PollEvery = TimeSpan.FromHours(1) };
+        w.NewPrintJob += (id, p) => { lock (_events) _events.Add((id, p, DateTime.UtcNow)); };
+        int once = 0;
+        w.LoopEnded = () =>
+        {
+            if (Count != 1 || Interlocked.Exchange(ref once, 1) != 0) return;
+            File.WriteAllBytes(w.PrintPath, Pdf(20, (byte)'2'));
+            Thread.Sleep(300); // the watcher's events for it arrive while the loop still counts as running
+        };
+        using (w)
+        {
+            w.Start();
+            await Task.Delay(200); // the start-up check ran and ended
+            File.WriteAllBytes(w.PrintPath, Pdf(20, (byte)'1'));
+            await WaitFor(() => Count == 2, 3000);
+        }
+    }
+
+    [Fact]
+    public async Task StopWhileAJobIsBeingWrittenLeavesItAlone()
     {
         var w = Make();
-        w.MinAge = TimeSpan.FromSeconds(1); // a wide window to stop inside
         w.Start();
-        File.WriteAllBytes(w.PrintPath, Pdf());
-        await Task.Delay(300); // inside the age wait
-        w.Stop();
-        await Task.Delay(1500);
+        using (var fs = new FileStream(w.PrintPath, FileMode.Create, FileAccess.Write, FileShare.Read))
+        {
+            fs.Write(Pdf());
+            await Task.Delay(100); // the watcher is retrying against the writer's handle
+            w.Stop();
+        }
+        await Task.Delay(500);
         Assert.Equal(0, Count);
         Assert.Equal(0, ErrorCount);
         Assert.True(File.Exists(w.PrintPath));
         Assert.Empty(Directory.GetFiles(w.JobsDir));
     }
 
-    // ---- concatenated or truncated print files (the spooler probe is still pending) ----
-
-    private string RejectedDir => Path.Combine(_dir, "rejected");
+    // ---- concatenated or truncated print files ----
 
     [Fact]
     public async Task TwoDocumentsInOneFileAreRejectedNotSent()
@@ -222,68 +288,190 @@ public class SpoolWatcherTests : IDisposable
     }
 
     [Fact]
-    public async Task FileWithoutEofWaitsThenIsTreatedAsNotAPdf()
+    public async Task FileWithoutEofIsRejectedWithoutReleasingIt()
     {
+        // A successful exclusive open proves the spooler closed the file, so a PDF with no %%EOF is truncated: it is
+        // kept aside at once, and the port stays locked until it is gone (no gap for the next job to overwrite it).
         using var w = Make();
-        w.EofWait = TimeSpan.FromMilliseconds(800);
+        Exception? seen = null;
+        w.BeforeMove = () =>
+        {
+            try { using var _ = new FileStream(w.PrintPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete); }
+            catch (Exception e) { seen = e; }
+        };
         w.Start();
         var truncated = Encoding.ASCII.GetBytes("%PDF-1.7\n1 0 obj << /Type /Catalog >> endobj\n");
         File.WriteAllBytes(w.PrintPath, truncated);
-        await Task.Delay(600); // stable and unlocked, but not complete yet: still waiting
-        Assert.True(File.Exists(w.PrintPath));
-        Assert.Equal(0, ErrorCount);
-        await WaitFor(() => ErrorCount >= 1);
-        await WaitFor(() => !File.Exists(w.PrintPath), 3000);
+        await WaitFor(() => ErrorCount >= 1, 3000);
+        Assert.False(File.Exists(w.PrintPath));
+        Assert.Equal(SharingViolation, Assert.IsType<IOException>(seen).HResult);
         Assert.Equal(0, Count);
         Assert.Contains("not a PDF", _errors[0].reason);
         Assert.Contains("%%EOF", _errors[0].reason);
+        Assert.Equal(truncated, File.ReadAllBytes(Assert.Single(Directory.GetFiles(RejectedDir))));
+        Assert.Single(_claimed);
     }
 
     [Fact]
-    public async Task EofArrivingWithinTheWaitIsSentNormally()
+    public async Task APrintFileThatCannotBeOpenedIsReportedNotRetriedSilently()
     {
+        // Access denied never clears on its own (a spool dir whose ACL the tray user lacks): after a while it is an
+        // error, so the user hears about it instead of every later document overwriting this one unseen.
         using var w = Make();
-        w.EofWait = TimeSpan.FromSeconds(10);
+        w.AccessDeniedReportAfter = TimeSpan.FromMilliseconds(300);
+        Directory.CreateDirectory(_dir);
+        File.WriteAllBytes(w.PrintPath, Pdf(20));
+        var me = System.Security.Principal.WindowsIdentity.GetCurrent().User!;
+        var fi = new FileInfo(w.PrintPath);
+        var acl = fi.GetAccessControl();
+        var deny = new System.Security.AccessControl.FileSystemAccessRule(me, System.Security.AccessControl.FileSystemRights.ReadData,
+            System.Security.AccessControl.AccessControlType.Deny);
+        acl.AddAccessRule(deny);
+        fi.SetAccessControl(acl);
+        try
+        {
+            w.Start();
+            await WaitFor(() => ErrorCount >= 1, 5000);
+            Assert.Contains("access", _errors[0].reason, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(0, Count);
+            Assert.True(File.Exists(w.PrintPath)); // never deleted or moved
+        }
+        finally
+        {
+            w.Stop();
+            acl.RemoveAccessRule(deny);
+            fi.SetAccessControl(acl);
+        }
+    }
+
+    [Fact]
+    public async Task WaitIdleReturnsOnceALeftoverIsClaimed()
+    {
+        // A print.pdf left from the last run is claimed before the app resumes the queue, not in a race with the
+        // first held job.
+        Directory.CreateDirectory(_dir);
+        var pdf = Pdf(30);
+        using var w = Make();
+        File.WriteAllBytes(w.PrintPath, pdf);
         w.Start();
-        File.WriteAllBytes(w.PrintPath, Encoding.ASCII.GetBytes("%PDF-1.7\npartial"));
-        await Task.Delay(700); // past the age wait and recheck: waiting for %%EOF
-        Assert.Equal(0, Count);
-        File.AppendAllText(w.PrintPath, "\n%%EOF\n");
-        await WaitFor(() => Count == 1);
-        Assert.Equal(0, ErrorCount);
+        Assert.True(w.WaitIdle(TimeSpan.FromSeconds(5)));
+        Assert.False(File.Exists(w.PrintPath));
+        Assert.Equal(1, Count);
+        Assert.Equal(pdf, File.ReadAllBytes(_events[0].path));
+        await Task.CompletedTask;
     }
 
     [Fact]
-    public async Task FileChangedInPlaceJustBeforeTheMoveIsNotSent()
+    public void WaitIdleGivesUpWhileTheFileIsStillBeingWritten()
     {
         using var w = Make();
-        int hooked = 0;
+        w.Start();
+        using var writer = new FileStream(w.PrintPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+        writer.Write(Pdf(10));
+        Assert.False(w.WaitIdle(TimeSpan.FromMilliseconds(300)));
+    }
+
+    // ---- claim and hold: the file never leaves the watcher's exclusive handle until it is in jobs\ ----
+
+    [Fact]
+    public async Task ASecondWriterIsLockedOutWhileTheFileIsClaimed()
+    {
+        using var w = Make();
+        Exception? seen = null;
         w.BeforeMove = () =>
         {
-            // truncated and rewritten in place after the checks: the header no longer matches
-            if (Interlocked.Increment(ref hooked) == 1) File.WriteAllBytes(w.PrintPath, Encoding.ASCII.GetBytes("%!PS-Adobe"));
+            // the spooler's next job opening the port path while this one is being checked
+            try { using var _ = new FileStream(w.PrintPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete); }
+            catch (Exception e) { seen = e; }
+        };
+        w.Start();
+        var pdf = Pdf(40, (byte)'y');
+        File.WriteAllBytes(w.PrintPath, pdf);
+        await WaitFor(() => Count == 1);
+        var io = Assert.IsType<IOException>(seen);
+        Assert.Equal(SharingViolation, io.HResult);
+        Assert.Equal(pdf, File.ReadAllBytes(_events[0].path));
+    }
+
+    [Fact]
+    public async Task TheFileIsRenamedIntoJobsWhileStillHeld()
+    {
+        using var w = Make();
+        bool? portGone = null;
+        int? destLocked = null;
+        w.AfterMove = dest =>
+        {
+            portGone = !File.Exists(w.PrintPath);
+            try { using var _ = new FileStream(dest, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete); destLocked = 0; }
+            catch (IOException e) { destLocked = e.HResult; }
         };
         w.Start();
         File.WriteAllBytes(w.PrintPath, Pdf(40));
-        await WaitFor(() => ErrorCount >= 1);
-        await WaitFor(() => !File.Exists(w.PrintPath), 3000);
-        Assert.Equal(0, Count);
-        Assert.Empty(Directory.GetFiles(w.JobsDir));
-        Assert.Contains("not a PDF", _errors[0].reason);
+        await WaitFor(() => Count == 1);
+        Assert.True(portGone, "print.pdf still existed after the rename");
+        Assert.Equal(SharingViolation, destLocked); // same handle, never released between the checks and the move
+        Assert.Equal(_events[0].path, Assert.Single(_claimed));
     }
 
     [Fact]
-    public async Task SameSizeRewriteJustBeforeTheMoveIsNotSentAsTheOldDocument()
+    public async Task StopAndWaitReturnsOnlyOnceAClaimInProgressHasBeenReported()
     {
+        // Exit stops the watcher, then settles the kept jobs: a claim loop already past its last cancellation check
+        // must finish (and report its claim) first, or the kept job of a file already in jobs\ is printed again at
+        // the next start.
         using var w = Make();
-        int hooked = 0;
-        var replacement = Pdf(40, (byte)'z');
-        w.BeforeMove = () => { if (Interlocked.Increment(ref hooked) == 1) File.WriteAllBytes(w.PrintPath, replacement); };
+        using var inMove = new ManualResetEventSlim();
+        using var go = new ManualResetEventSlim();
+        w.AfterMove = _ => { inMove.Set(); go.Wait(TimeSpan.FromSeconds(10)); };
         w.Start();
-        File.WriteAllBytes(w.PrintPath, Pdf(40, (byte)'y'));
-        await WaitFor(() => Count == 1);
-        Assert.True(Volatile.Read(ref hooked) >= 2, "the changed file was moved without being checked again");
-        Assert.Equal(replacement, File.ReadAllBytes(_events[0].path));
+        File.WriteAllBytes(w.PrintPath, Pdf(40));
+        Assert.True(inMove.Wait(TimeSpan.FromSeconds(10)));
+        var stop = Task.Run(() => w.StopAndWait(TimeSpan.FromSeconds(10)));
+        await Task.Delay(200);
+        Assert.False(stop.IsCompleted, "StopAndWait returned while the claim was still in progress");
+        go.Set();
+        Assert.True(await stop);
+        lock (_claimed) Assert.Single(_claimed);
+    }
+
+    [Fact]
+    public async Task ACrashWhileHoldingLeavesThePrintFileInPlace()
+    {
+        var w = Make();
+        int hooked = 0;
+        w.BeforeMove = () =>
+        {
+            if (Interlocked.Increment(ref hooked) != 1) return;
+            w.Stop(); // nothing after this point runs for the claim: as if the process died holding the handle
+            throw new InvalidOperationException("simulated crash");
+        };
+        w.Start();
+        var pdf = Pdf(40);
+        File.WriteAllBytes(w.PrintPath, pdf);
+        await WaitFor(() => Volatile.Read(ref hooked) >= 1);
+        await Task.Delay(300);
+        Assert.Equal(0, Count);
+        Assert.True(File.Exists(w.PrintPath), "the only copy was deleted");
+        Assert.Equal(pdf, File.ReadAllBytes(w.PrintPath)); // and the handle is closed again
+        Assert.Empty(Directory.GetFiles(w.JobsDir));
+        w.Dispose();
+    }
+
+    [Fact]
+    public void ClaimFailsWhileAnotherHandleIsOpenAndSucceedsAfter()
+    {
+        Directory.CreateDirectory(_dir);
+        var p = Path.Combine(_dir, "print.pdf");
+        File.WriteAllBytes(p, Pdf());
+        using (new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            Assert.Null(ClaimedFile.TryOpen(p));
+        Assert.Null(ClaimedFile.TryOpen(Path.Combine(_dir, "missing.pdf")));
+        using var c = ClaimedFile.TryOpen(p);
+        Assert.NotNull(c);
+        var dest = Path.Combine(_dir, "moved.pdf");
+        c!.RenameTo(dest);
+        Assert.False(File.Exists(p));
+        Assert.True(File.Exists(dest));
     }
 
     [Theory]
