@@ -244,6 +244,22 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
     }
 
     /// <summary>
+    /// Read-only: documents in jobs\ with no record (and no .bad record) that are not in <paramref name="seen"/>, as
+    /// offers to open; their ids are added to <paramref name="seen"/>. For finding a document moved in while running.
+    /// </summary>
+    public IReadOnlyList<SendRequest> NewDocuments(ISet<Guid> seen)
+    {
+        var offers = new List<SendRequest>();
+        if (!Directory.Exists(JobsDir)) return offers;
+        foreach (var pdf in Directory.EnumerateFiles(JobsDir, "*.pdf"))
+        {
+            if (!Guid.TryParse(Path.GetFileNameWithoutExtension(pdf), out var id) || File.Exists(JsonPath(id)) || File.Exists(BadPath(id))) continue;
+            if (seen.Add(id)) offers.Add(new SendRequest(id, pdf, Kind: SendKind.New));
+        }
+        return offers;
+    }
+
+    /// <summary>
     /// A crash between the flushed temp write and its rename leaves <c>&lt;guid&gt;.json.tmp</c> with the newest
     /// record and no <c>&lt;guid&gt;.json</c>: rename it into place when it reads as a record. A temp file beside an
     /// existing record, or one that does not parse (a torn write), is left alone; the next write replaces it.

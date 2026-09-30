@@ -24,13 +24,21 @@ public class SessionEndTests
     }
 
     [Fact]
-    public void Session_not_ending_or_nothing_arriving_leaves_the_listener_alone()
+    public void Session_not_ending_leaves_the_listener_alone()
     {
         var cancelled = new Probe { Receiving = true };
         Assert.False(cancelled.Run(ending: false)); // WM_ENDSESSION wParam 0: the session goes on
+        Assert.Equal(0, cancelled.Stops);
+    }
+
+    [Fact]
+    public void Session_ending_with_nothing_seen_arriving_still_stops_the_listener()
+    {
+        // IsReceiving lags a job already connected to the spare instance, so idle is no reason to skip the stop.
         var idle = new Probe { Receiving = false };
-        Assert.False(idle.Run(ending: true));
-        Assert.Equal(0, cancelled.Stops + idle.Stops);
+        Assert.True(idle.Run(ending: true));
+        Assert.Equal(1, idle.Stops);
+        Assert.Contains(idle.Log, l => l.Contains("no print job in flight"));
     }
 
     [Fact]

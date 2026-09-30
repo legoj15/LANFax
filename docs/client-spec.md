@@ -189,14 +189,20 @@ client/
   the LAN Fax printer" on true and destroys it on false, and answers
   WM_QUERYENDSESSION with FALSE while `IsReceiving`, so sign-out or shutdown
   waits for the read; the user can still force it from the Windows screen,
-  and then WM_ENDSESSION (wParam != 0, still receiving) calls the listener's
-  `Stop` synchronously before returning (`SessionEnd.OnEndSession`), so the
+  and then WM_ENDSESSION (wParam != 0, receiving or not, since IsReceiving lags
+  a job already connected) calls the listener's `Stop` synchronously before returning (`SessionEnd.OnEndSession`), so the
   job gets `StopGrace` to finish into `jobs\`; one cut off after that leaves
   a `.part` the next start moves to `rejected\`. `SendDialog` uses the same
   P/Invokes for a send on the wire. Not exercised with a real sign-out.
-- Rate limiting: pipe-level failures (cannot open an instance, cannot save)
-  raise `Error` at most once per distinct reason per 60 s; rejected jobs
-  every time. The tray shows `NotificationText.PrintPipeProblem` (printer
+- Rate limiting: a pipe name already taken is reported at start and again
+  every `NameTakenRepeat` (10 min); "cannot save a print job" and "a program
+  connected and sent nothing" and a failed move of a stale `.part` raise
+  `Error` at most once per 60 s per distinct reason text (the exception
+  message is part of it); a spare-instance creation failure is only logged;
+  rejected jobs, a failed rename and "listener stopped" every time.
+  A program that creates the pipe while the listener is already serving
+  joins it undetected (the spare instance is created by joining); accepted,
+  as the client is for single-user PCs only (see the handoff). The tray shows `NotificationText.PrintPipeProblem` (printer
   name + reason, cut to 255 characters).
 - Who connects (measured with `Probe-PipePrinter.ps1 -WhoIs`): the client
   process is `spoolsv`; after the first read `GetImpersonationUserName` and
@@ -237,9 +243,10 @@ client/
     whole, in order. How long the spooler keeps retrying is NOT measured
     beyond those 4+ minutes: a job printed hours before LANFax starts may
     already sit in a non-retried "Error" (as a cut-off job does, below) and
-    need `Restart-PrintJob`. The tray checks the queue 60 s after the
-    listener starts (`PrintQueueJobs`, EnumJobs level 1, no elevation):
-    jobs submitted before the start and still in Error get one balloon
+    need `Restart-PrintJob`. The tray checks the queue on every 30 s
+    printer check from 60 s to 10 min after the listener starts
+    (`PrintQueueJobs`, EnumJobs level 1, no elevation): each job submitted
+    before the start and still in Error gets one balloon, once per job id
     ("N documents printed to "LAN Fax" before LANFax started are stuck ...")
     that opens the queue (`printui.dll,PrintUIEntry /o`). It does not
     restart them: a restart can deliver a job twice (below), so the user

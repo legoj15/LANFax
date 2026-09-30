@@ -9,8 +9,10 @@ internal sealed class TrayContext : ApplicationContext
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan ExitWait = TimeSpan.FromSeconds(30);
-    /// <summary>How long after the listener starts the queue is checked for documents stuck in Error.</summary>
+    /// <summary>No stuck-job check before this: a job the spooler is still retrying shows "Error" until it arrives.</summary>
     private static readonly TimeSpan StuckCheckDelay = TimeSpan.FromSeconds(60);
+    /// <summary>For this long after the listener starts, each printer check also looks for documents stuck in Error.</summary>
+    private static readonly TimeSpan StuckCheckWindow = TimeSpan.FromMinutes(10);
     /// <summary>How often the printer's port is re-checked (a registry read), so a printer removed or moved is reported.</summary>
     private static readonly TimeSpan PrinterCheckInterval = TimeSpan.FromSeconds(30);
     private const string ReceivingReason = "Receiving a document from the LAN Fax printer";
@@ -43,6 +45,12 @@ internal sealed class TrayContext : ApplicationContext
     private readonly InboundAnnouncer _inbound;
     /// <summary>Runs the inbound catch-up; a request while one runs is queued, not dropped.</summary>
     private readonly InboundCatchUp _catchUp;
+    /// <summary>Stuck queue job ids already announced, so each gets one balloon.</summary>
+    private readonly HashSet<int> _stuckSeen = new();
+    /// <summary>Spool ids already offered to the user (at start, as print jobs, or after an install re-scan).</summary>
+    private readonly HashSet<Guid> _offeredSpool = new();
+    private DateTime _listenerStart;
+    private bool _stuckChecking;
     private readonly ToolStripMenuItem _installItem;
     private readonly ToolStripMenuItem _unsentItem;
     private readonly ToolStripMenuItem _retryItem;
@@ -132,7 +140,7 @@ internal sealed class TrayContext : ApplicationContext
         IReadOnlyList<SendRequest> unsent = [];
         try { unsent = _tracker.Scan(); }
         catch (Exception e) { FileLog.Error(@"scanning spool\jobs failed", e); }
-        foreach (var u in unsent) FileLog.Info($"spool {u.SpoolId}: unsent document ({u.Kind})");
+        foreach (var u in unsent) { _offeredSpool.Add(u.SpoolId); FileLog.Info($"spool {u.SpoolId}: unsent document ({u.Kind})"); }
 
         _spool = new PrintPipeListener(_cfg.SpoolDir) { Log = m => FileLog.Info(m) };
         // Stop runs on the UI thread inside WM_ENDSESSION: nothing it raises while stopping needs the UI thread.
@@ -142,6 +150,7 @@ internal sealed class TrayContext : ApplicationContext
         _spool.NewPrintJob += (id, path) => OnUi(() =>
         {
             FileLog.Info($"new print job {id}");
+            _offeredSpool.Add(id);
             EnqueueSend(new SendRequest(id, path));
         });
         _spool.Error += (reason, ex) =>
@@ -150,10 +159,9 @@ internal sealed class TrayContext : ApplicationContext
             OnUi(() => Balloon(NotificationText.PrintPipeProblem(_cfg.PrinterName, reason)));
         };
         // A pipe that cannot be created (another LANFax has it) is reported through Error, not thrown.
-        var listenerStart = DateTime.UtcNow;
+        _listenerStart = DateTime.UtcNow;
         try { _spool.Start(); }
         catch (Exception e) { FileLog.Error("print pipe failed to start", e); Balloon("Cannot receive print jobs in " + _cfg.SpoolDir + ": " + e.Message); }
-        _ = AnnounceStuckPrintJobsAsync(listenerStart);
 
         _events = CreateEventStream();
         StartEventStream();
@@ -192,6 +200,8 @@ internal sealed class TrayContext : ApplicationContext
     {
         if (_exiting || _installing) return; // the install reports its own result
         if (_printerWatch.Observe(PrinterStatusNow()) is { } changed) AnnouncePrinter(changed);
+        var sinceStart = DateTime.UtcNow - _listenerStart;
+        if (sinceStart >= StuckCheckDelay && sinceStart < StuckCheckWindow && !_stuckChecking) _ = AnnounceStuckPrintJobsAsync(_listenerStart);
     }
 
     // ---- threading and notifications ----
@@ -488,23 +498,25 @@ internal sealed class TrayContext : ApplicationContext
     /// Documents printed while no LANFax listened wait in the queue; the spooler retries them and they arrive on their
     /// own once the listener runs (seen within 30 s), but a job it gave up on (cut off mid-write, or waiting longer
     /// than its retry lasts, which is unmeasured beyond 4 minutes) stays in "Error". Jobs submitted before the start
-    /// and still in Error <see cref="StuckCheckDelay"/> later get one balloon that opens the queue. No automatic
+    /// and in Error at any printer check (every 30 s) from <see cref="StuckCheckDelay"/> to <see cref="StuckCheckWindow"/> after the start get one
+    /// balloon each that opens the queue. No automatic
     /// restart: a restarted job was once delivered twice (measured), so the user decides.
     /// </summary>
     private async Task AnnounceStuckPrintJobsAsync(DateTime listenerStartUtc)
     {
+        _stuckChecking = true;
         try
         {
-            await Task.Delay(StuckCheckDelay);
             if (_exiting) return;
             var jobs = await Task.Run(() => PrintQueueJobs.List(_cfg.PrinterName));
             if (jobs == null) return; // no such printer: the printer balloons cover it
-            var stuck = PrintQueueJobs.StuckSince(jobs, listenerStartUtc);
+            var stuck = PrintQueueJobs.NewStuckSince(jobs, listenerStartUtc, _stuckSeen);
             if (stuck.Count == 0) return;
             foreach (var j in stuck) FileLog.Info($"print queue: job {j.Id} '{j.Document}' of {j.User}, submitted {j.SubmittedUtc:o}, is in error (status 0x{j.Status:x})");
             OnUi(() => Balloon(NotificationText.StuckPrintJobs(_cfg.PrinterName, stuck.Count), OpenPrinterQueue));
         }
         catch (Exception e) { FileLog.Error("checking the print queue for stuck documents failed", e); }
+        finally { _stuckChecking = false; }
     }
 
     private void OpenPrinterQueue()
@@ -548,7 +560,11 @@ internal sealed class TrayContext : ApplicationContext
         {
             FileLog.Info("printer install requested");
             var err = await _printer.InstallAsync(_cfg.SpoolDir, _cfg.PrinterName);
-            if (err == null) Balloon($"The \"{_cfg.PrinterName}\" printer is installed and prints to {PrinterSetup.ExpectedPort()}.");
+            if (err == null)
+            {
+                Balloon($"The \"{_cfg.PrinterName}\" printer is installed and prints to {PrinterSetup.ExpectedPort()}.");
+                OfferRescuedDocuments();
+            }
             else { FileLog.Error("printer install: " + err); Balloon(err); }
         }
         finally
@@ -556,6 +572,20 @@ internal sealed class TrayContext : ApplicationContext
             _installing = false;
             _installItem.Enabled = true;
         }
+    }
+
+    /// <summary>The install's migration may move a leftover print.pdf into spool\jobs; offer it (and any other new document) now.</summary>
+    private void OfferRescuedDocuments()
+    {
+        try
+        {
+            foreach (var o in _tracker.NewDocuments(_offeredSpool))
+            {
+                FileLog.Info($"spool {o.SpoolId}: document found in jobs after the printer install ({o.Kind})");
+                EnqueueSend(o);
+            }
+        }
+        catch (Exception e) { FileLog.Error("looking for rescued documents failed", e); }
     }
 
     private void OpenSettings()

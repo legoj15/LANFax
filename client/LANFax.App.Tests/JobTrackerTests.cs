@@ -29,6 +29,24 @@ public sealed class JobTrackerTests : IDisposable
 
     JsonElement Record(Guid id) => JsonDocument.Parse(File.ReadAllText(JsonOf(id))).RootElement;
 
+    [Fact]
+    public void NewDocuments_offers_only_unrecorded_pdfs_not_seen_before_and_remembers_them()
+    {
+        var t = new JobTracker(_dir);
+        var (fresh, _) = Spooled();
+        var (seenId, _) = Spooled();
+        var (recorded, recordedPdf) = Spooled();
+        File.WriteAllText(JsonOf(recorded), "{}");
+        var seen = new HashSet<Guid> { seenId };
+        var offers = t.NewDocuments(seen);
+        var o = Assert.Single(offers);
+        Assert.Equal(fresh, o.SpoolId);
+        Assert.Equal(SendKind.New, o.Kind);
+        Assert.Contains(fresh, seen);
+        Assert.Empty(t.NewDocuments(seen)); // second call: nothing new
+        Assert.True(File.Exists(recordedPdf));
+    }
+
     // ---- persisted send states ----
 
     [Fact]

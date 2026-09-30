@@ -25,6 +25,13 @@ public static class PrintQueueJobs
                         && j.SubmittedUtc < startUtc)
             .ToList();
 
+    /// <summary>
+    /// <see cref="StuckSince"/> minus the jobs already in <paramref name="seen"/>; the returned ids are added to it, so
+    /// repeated checks announce each stuck job once.
+    /// </summary>
+    public static IReadOnlyList<QueuedJob> NewStuckSince(IEnumerable<QueuedJob> jobs, DateTime startUtc, ISet<int> seen) =>
+        StuckSince(jobs, startUtc).Where(j => seen.Add(j.Id)).ToList();
+
     /// <summary>The queue's jobs in queue order, or null when the printer cannot be opened (missing, no access).</summary>
     /// <exception cref="Win32Exception">EnumJobs failed on an opened printer.</exception>
     public static IReadOnlyList<QueuedJob>? List(string printerName)
