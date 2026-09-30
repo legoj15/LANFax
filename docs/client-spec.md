@@ -96,18 +96,18 @@ client/
   at most once per distinct reason per 60 s; the file stays at `print.pdf`.
   After 5 consecutive failures the watcher retries only on the 2 s poll.
   `Stop()` cancels a check in progress before it moves or raises.
-- Phase-2 probe (do first, record the result here): print two jobs back to
-  back to the disposable printer and record whether the second overwrites,
-  appends, or fails while the first is still present. If it fails, the app
-  must move the file within ~1 s (it does) and the second job will retry via
-  the spooler's own retry; if it appends, the app must detect `%%EOF` count
-  and split, or reject and notify. **Result still pending** (needs the
-  elevated disposable printer). Until it is recorded the app defends
-  anyway: a file with two or more `%%EOF` markers is rejected (moved to
-  `spool\rejected\`, error balloon, never sent), and a file without one is not
-  sent. Caveat: a PDF with incremental updates or linearization also has
-  several `%%EOF`; Microsoft Print To PDF writes neither, so this is safe for
-  the LAN Fax printer's own output.
+- Phase-2 probe, result 2026-09-30 (the real `LAN Fax` printer, tray app not
+  running, `Out-Printer` twice back to back): the second job **silently
+  overwrites** the first. A 3-page job followed at once by a 1-page job left
+  one `print.pdf` with `/Count 1` and one `%%EOF`; the 3-page job alone gives
+  `/Count 3`. No spooler error, no append. The spooler runs the jobs one after
+  the other, so the first file is complete and then replaced.
+  Consequences: (1) documents printed while the tray app is not running are
+  lost except the last one; (2) while it runs, a second job that finishes
+  inside the watcher's settle window (MinAge 1 s + 500 ms size check) replaces
+  the first before it is moved. The `%%EOF` >= 2 rejection stays as a
+  harmless guard but never fires for this printer. Mitigation is an open item
+  in handoff.md.
 
 ## Send flow (phase 2)
 
