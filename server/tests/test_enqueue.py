@@ -20,9 +20,9 @@ class Reg:
         self.states.append((job_id, state))
         return dict(self.rows[-1], marker=1, state=state)
 
-    def find_by_client_key(self, key, client):
+    def find_by_client_key(self, key):
         for r in self.rows:
-            if key and r.get("client_key") == key and (r.get("client") or "") == (client or ""):
+            if key and r.get("client_key") == key:
                 return dict(r)
         return None
 
@@ -188,8 +188,8 @@ class EnqueueTests(unittest.TestCase):
         winner = {"id": "lfwinner00001", "client_key": "k", "state": "queued"}
         calls = []
 
-        def find(key, client):      # empty on the pre-check, the winner after the collision
-            calls.append((key, client))
+        def find(key):      # empty on the pre-check, the winner after the collision
+            calls.append(key)
             return None if len(calls) == 1 else dict(winner)
 
         def collide(job):
@@ -202,16 +202,13 @@ class EnqueueTests(unittest.TestCase):
         self.assertEqual(os.listdir(self.cfg.outbox), [])
         self.assertEqual(os.listdir(self.cfg.queue_meta), [])
 
-    def test_client_key_scoped_to_client(self):
+    def test_client_key_is_global(self):
         a = enqueue_pdf(self.cfg, self.reg, self.bus, b"%PDF-1", "000", client="10.0.0.1",
                         client_key="k")
-        b = enqueue_pdf(self.cfg, self.reg, self.bus, b"%PDF-1", "000", client="10.0.0.2",
-                        client_key="k")                  # same key, other caller: a new job
-        self.assertNotEqual(a["id"], b["id"])
-        with self.assertRaises(ExistingJob) as cm:
+        with self.assertRaises(ExistingJob) as cm:      # same key from another address
             enqueue_pdf(self.cfg, self.reg, self.bus, b"%PDF-1", "000", client="10.0.0.2",
                         client_key="k")
-        self.assertEqual(cm.exception.job["id"], b["id"])
+        self.assertEqual(cm.exception.job["id"], a["id"])
 
 
 if __name__ == "__main__":

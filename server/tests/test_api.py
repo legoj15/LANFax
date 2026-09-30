@@ -489,19 +489,19 @@ class RealRegCase(unittest.TestCase):
         return jreq(self.api, "POST", "/jobs", PDF, h)
 
     def test_idempotent_post(self):
-        s1, j1 = self.post("tray-1:abc")
-        s2, j2 = self.post("tray-1:abc")
+        s1, j1 = self.post("tray-1:abcdefghij")
+        s2, j2 = self.post("tray-1:abcdefghij")
         self.assertEqual((s1, s2), (201, 200))
         self.assertEqual(j1["id"], j2["id"])
-        self.assertEqual(j1["client_key"], "tray-1:abc")
+        self.assertEqual(j1["client_key"], "tray-1:abcdefghij")
         self.assertEqual(os.listdir(self.cfg.outbox), [j1["filename"]])
         self.assertEqual(len(self.reg.list_jobs()), 1)
-        s3, j3 = self.post("tray-1:other")
+        s3, j3 = self.post("tray-1:otherkey0001")
         self.assertEqual(s3, 201)
         self.assertNotEqual(j3["id"], j1["id"])
 
     def test_idempotent_test_send(self):
-        h = {"Idempotency-Key": "t.1"}
+        h = {"Idempotency-Key": "test.send.key-0001"}
         s1, j1 = jreq(self.api, "POST", "/test/send", {"to": "000"}, h)
         s2, j2 = jreq(self.api, "POST", "/test/send", {"to": "000"}, h)
         self.assertEqual((s1, s2), (201, 200))
@@ -509,7 +509,7 @@ class RealRegCase(unittest.TestCase):
         self.assertEqual(len(os.listdir(self.cfg.outbox)), 1)
 
     def test_bad_idempotency_key(self):
-        for bad in ("has space", "x" * 129, "semi;colon"):
+        for bad in ("has space", "x" * 129, "semi;colon", "t.1", "x" * 15):
             self.assertEqual(self.post(bad)[0], 400, bad)
             self.assertEqual(jreq(self.api, "POST", "/test/send", {"to": "000"},
                                   {"Idempotency-Key": bad})[0], 400, bad)
@@ -684,14 +684,38 @@ class ThirdPartyReviewCase(unittest.TestCase):
         self.assertEqual(read_event_full(r)[1]["id"], a)
         self.assertEqual(read_event_full(r)[1]["id"], b)
 
-    def test_idempotency_key_scoped_to_caller(self):
+    def test_short_key_error_names_minimum(self):
+        s, body = self.post("t.1")
+        self.assertEqual(s, 400)
+        self.assertIn("16", body["error"])
+
+    def test_idempotency_key_is_global_across_callers(self):
         other = self.reg.upsert_job({"id": "lfcccccccccccc", "direction": "out", "state": "queued",
-                                     "client": "10.9.9.9", "client_key": "shared:1"})
-        s1, j1 = self.post("shared:1")
-        self.assertEqual(s1, 201)                           # another caller's key is not ours
-        self.assertNotEqual(j1["id"], other["id"])
-        s2, j2 = self.post("shared:1")
-        self.assertEqual((s2, j2["id"]), (200, j1["id"]))
+                                     "client": "10.9.9.9", "client_key": "shared:1234567890",
+                                     "to_number": "000"})
+        s1, j1 = self.post("shared:1234567890")          # same key, different source ip: a repeat
+        self.assertEqual((s1, j1["id"]), (200, other["id"]))
+        self.assertEqual(os.listdir(self.cfg.outbox) if os.path.exists(self.cfg.outbox) else [], [])
+
+    def test_repeat_key_other_number_is_409(self):
+        s1, j1 = self.post("dedupe-key-0000001", to="000")
+        self.assertEqual(s1, 201)
+        n_rows = len(self.reg.list_jobs())
+        s2, body = self.post("dedupe-key-0000001", to="1234")
+        self.assertEqual(s2, 409)
+        self.assertEqual(body, {"error": "idempotency key already used for a different number"})
+        self.assertEqual(len(self.reg.list_jobs()), n_rows)
+        self.assertEqual(os.listdir(self.cfg.outbox), [j1["filename"]])
+        s3, j3 = self.post("dedupe-key-0000001", to="0-0-0")     # same number, other spelling
+        self.assertEqual((s3, j3["id"]), (200, j1["id"]))
+
+    def test_repeat_test_send_other_number_is_409(self):
+        h = {"Idempotency-Key": "test-send-key-00002"}
+        s1, j1 = jreq(self.api, "POST", "/test/send", {"to": "000"}, h)
+        s2, body = jreq(self.api, "POST", "/test/send", {"to": "1234"}, h)
+        self.assertEqual((s1, s2), (201, 409))
+        self.assertEqual(body["error"], "idempotency key already used for a different number")
+        self.assertEqual(len(os.listdir(self.cfg.outbox)), 1)
 
     def test_web_page_resync_and_receiving_expiry(self):
         from faxd import api as api_mod

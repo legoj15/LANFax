@@ -59,16 +59,23 @@ CREATE INDEX IF NOT EXISTS job_events_ts ON job_events(ts);
 """
 
 # Run after the column migration: an existing db gains the columns first. An Idempotency-Key
-# is unique per caller: the old global index `jobs_client_key` is dropped (a no-op once gone).
-# ifnull() so a row without a client still collides with another one without a client.
+# is unique globally (a client that resumes from another ip must dedupe): the per-caller index
+# `jobs_client_scoped_key` is dropped (a no-op once gone) and _DEDUPE_CLIENT_KEYS runs before
+# the global `jobs_client_key` is created, so a db holding either shape starts cleanly.
 _INDEXES = """
-DROP INDEX IF EXISTS jobs_client_key;
-CREATE UNIQUE INDEX IF NOT EXISTS jobs_client_scoped_key ON jobs(ifnull(client, ''), client_key);
+DROP INDEX IF EXISTS jobs_client_scoped_key;
+"""
+_DEDUPE_CLIENT_KEYS = """
+UPDATE jobs SET client_key=NULL WHERE client_key IS NOT NULL AND rowid NOT IN
+  (SELECT MIN(rowid) FROM jobs WHERE client_key IS NOT NULL GROUP BY client_key)
+"""
+_INDEXES_AFTER = """
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_client_key ON jobs(client_key);
 CREATE INDEX IF NOT EXISTS jobs_updated ON jobs(updated_at);
 """
 
 # Columns added after the first deployment: (name, type). SQLite cannot ADD a UNIQUE
-# column, so uniqueness comes from the jobs_client_scoped_key index (NULL keys never collide).
+# column, so uniqueness comes from the jobs_client_key index (NULL keys never collide).
 # `detail` is the latest progress note (AMI Status text, "dial attempt failed", ...).
 _ADDED_COLUMNS = (("client_key", "TEXT"), ("detail", "TEXT"))
 
@@ -105,6 +112,10 @@ class Registry:
                 db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {typ}")
                 log.info("migrated jobs table: added column %s", name)
         db.executescript(_INDEXES)
+        # keys that were unique per caller may repeat across callers: the earliest row keeps
+        # the key, later duplicates lose it (rows are kept) so the global unique index can build
+        db.execute(_DEDUPE_CLIENT_KEYS)
+        db.executescript(_INDEXES_AFTER)
         self._db: Optional[sqlite3.Connection] = db
 
     def _conn(self) -> sqlite3.Connection:
@@ -267,14 +278,12 @@ class Registry:
             "ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (filename, *TERMINAL_STATES))
 
-    def find_by_client_key(self, client_key: Optional[str],
-                           client: Optional[str]) -> Optional[dict]:
-        """The row this caller (`client`) created with this Idempotency-Key, if any. Keys are
-        scoped per caller: another client's identical key is a different request."""
+    def find_by_client_key(self, client_key: Optional[str]) -> Optional[dict]:
+        """The row created with this Idempotency-Key, if any. Keys are global: a client that
+        resumes from another ip must still find its job."""
         if not client_key:
             return None
-        return self._one("SELECT * FROM jobs WHERE ifnull(client, '')=? AND client_key=?",
-                         (client or "", client_key))
+        return self._one("SELECT * FROM jobs WHERE client_key=?", (client_key,))
 
     def find_by_ast_jobid(self, ast_jobid: Optional[str]) -> Optional[dict]:
         if not ast_jobid:

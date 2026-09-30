@@ -107,7 +107,7 @@ class Registry:
                                                  # pages/detail on an unfinished job, no state change and
                                                  # no job_events row; None if missing, finished or unchanged
     def get_jobs(self, ids) -> list[dict]        # one IN (...) query (per 500 ids); missing ids skipped
-    def find_by_client_key(self, client_key, client) -> dict | None  # the row this caller's Idempotency-Key created
+    def find_by_client_key(self, client_key) -> dict | None  # the row this Idempotency-Key created (global)
     def find_by_filename(self, filename) -> dict | None       # newest row, any state; filename = basename in the share
     def find_active_by_filename(self, filename) -> dict | None  # newest non-terminal row (names are reused)
     def count_by_state(self, *, direction=None) -> dict[str, int]
@@ -131,11 +131,13 @@ Schema migration: columns added after the first deployment are added with
 `ALTER TABLE jobs ADD COLUMN` when `PRAGMA table_info(jobs)` lacks them
 (currently `client_key`, `detail`). Indexes: `filename`, `ast_jobid`,
 `created_at`, `updated_at`, `job_events(ts)`, and UNIQUE
-`jobs_client_scoped_key` on `(ifnull(client,''), client_key)`: an
-Idempotency-Key is unique per caller (SQLite cannot add a UNIQUE column, so
-uniqueness is the index; NULL keys never collide). Every start drops the old
-global UNIQUE `jobs_client_key` index if present (the live database migrates
-itself on the first start after deploy).
+`jobs_client_key` on `(client_key)`: an Idempotency-Key is globally
+unique (SQLite cannot add a UNIQUE column, so uniqueness is the index; NULL
+keys never collide). Every start drops the per-caller index
+`jobs_client_scoped_key` if present, clears the key on any later duplicate
+row (the earliest keeps it; rows are never deleted), then creates the global
+index if missing, so a db in either historical shape migrates itself on the
+first start after deploy.
 
 Job dict columns: `id` (text pk, faxd's own: `lf`+12 hex for api-originated,
 `sh`+12 hex for share-dropped, `in`+12 hex for inbound), `direction`
@@ -145,7 +147,7 @@ Job dict columns: `id` (text pk, faxd's own: `lf`+12 hex for api-originated,
 bash pipeline, nullable), `pages` (int, nullable), `error` (text, nullable),
 `pdf_path` (current absolute path of the pdf, nullable), `created_at`,
 `updated_at`, `finished_at` (iso8601 UTC), `client_key` (the POST's
-`Idempotency-Key`, nullable, unique per `client`), `detail` (latest progress
+`Idempotency-Key`, nullable, globally unique), `detail` (latest progress
 note: the AMI `Status` text, "sent 2 page(s) at 14400", "dial attempt failed";
 set by `annotate` and by `set_state*` when given a detail). `job_events`: id,
 job_id, ts, state, detail; one row per state transition only (annotations
@@ -445,11 +447,11 @@ Routes:
 | `GET /jobs?direction=out&state=sent,failed&limit=50` | `{"jobs":[…]}` newest first. `since=` filters `created_at >=` (raw text compare); `updated_since=<iso8601>` filters `updated_at >=` (normalized to UTC `…Z`, naive = UTC, 400 if unparseable). A reconnecting client polls `updated_since=<last sync>` to catch up. |
 | `GET /jobs/<id>` | job dict + `"events": [...]` |
 | `GET /jobs/<id>/pdf` | streams `pdf_path` as `application/pdf`, `Content-Disposition: inline; filename="<filename>"`; 404 if missing |
-| `POST /jobs` | body is the PDF (`Content-Type: application/pdf`), headers `X-Fax-To` (required), `X-Fax-Subject` (optional), `Idempotency-Key` (optional, 1-128 chars `[A-Za-z0-9._:-]`, else 400; scoped to the caller's ip: another client's identical key is a new job). Returns 201 with the new job dict; a repeated key from the same caller returns 200 with the job it created first and writes nothing (the body is read and discarded). Max body 25 MB (413 before reading; read into one preallocated buffer, no extra copy). At most 2 bodies are read at once: a third upload gets 503 `Retry-After: 2` without its body being read, and the connection is closed (a client that already sent the body may see a reset instead: retry with the same key). |
+| `POST /jobs` | body is the PDF (`Content-Type: application/pdf`), headers `X-Fax-To` (required), `X-Fax-Subject` (optional), `Idempotency-Key` (optional, 16-128 chars `[A-Za-z0-9._:-]`, else 400 naming the minimum; clients send a random GUID). Keys are global, not per caller ip: a laptop that lost the response and resumes from another ip (Wi-Fi vs Ethernet, new DHCP lease) must dedupe, and random GUIDs do not collide between honest callers. Returns 201 with the new job dict; a repeated key returns 200 with the job it created first and writes nothing (the body is read and discarded), unless the stored job's `to_number` differs from the normalized `X-Fax-To`: then 409 `{"error": "idempotency key already used for a different number"}` and nothing is written. Max body 25 MB (413 before reading; read into one preallocated buffer, no extra copy). At most 2 bodies are read at once: a third upload gets 503 `Retry-After: 2` without its body being read, and the connection is closed (a client that already sent the body may see a reset instead: retry with the same key). |
 | `GET /inbox?limit=50` | inbound jobs newest first |
 | `POST /arm` | JSON `{"minutes": 60}` -> arm state |
 | `POST /disarm` | -> arm state |
-| `POST /test/send` | JSON `{"to": "…", "note": ""}` -> builds a test page, enqueues with origin `test`, subject `test page`; returns job (201). Accepts `Idempotency-Key` like `POST /jobs` (repeat -> 200, same job). |
+| `POST /test/send` | JSON `{"to": "…", "note": ""}` -> builds a test page, enqueues with origin `test`, subject `test page`; returns job (201). Accepts `Idempotency-Key` like `POST /jobs` (repeat -> 200, same job; 409 if the JSON `to` differs from the stored number). |
 | `POST /test/receive` | JSON `{"minutes": 20}` -> arms and returns arm state (alias of /arm with default 20) |
 | `GET /events` | Server-Sent Events: `event: <type>\n[id: <n>\n]data: <json>\n\n`; `: keepalive\n\n` every 15 s; on connect sends one `status` and one `arm` event. See "Event ids and replay" below. |
 

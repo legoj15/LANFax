@@ -140,9 +140,9 @@ class RegistryTests(unittest.TestCase):
     def test_client_key_unique(self):
         a = self.reg.upsert_job(self._job(1, client_key="k-1"))
         self.assertEqual(a["client_key"], "k-1")
-        self.assertEqual(self.reg.find_by_client_key("k-1", None)["id"], a["id"])
-        self.assertIsNone(self.reg.find_by_client_key("nope", None))
-        self.assertIsNone(self.reg.find_by_client_key("", None))
+        self.assertEqual(self.reg.find_by_client_key("k-1")["id"], a["id"])
+        self.assertIsNone(self.reg.find_by_client_key("nope"))
+        self.assertIsNone(self.reg.find_by_client_key(""))
         self.reg.upsert_job(self._job(2))          # NULL keys never collide
         self.reg.upsert_job(self._job(3))
         with self.assertRaises(sqlite3.IntegrityError):
@@ -247,44 +247,71 @@ class RegistryTests(unittest.TestCase):
         e = self.reg.set_state(j, "queued")["event_id"]
         self.assertEqual(self.reg.max_event_id(), e)
 
-    def test_client_key_scoped_to_client(self):
+    def test_client_key_is_global(self):
         a = self.reg.upsert_job(self._job(1, client_key="k", client="10.0.0.1"))
-        b = self.reg.upsert_job(self._job(2, client_key="k", client="10.0.0.2"))
-        self.assertEqual(self.reg.find_by_client_key("k", "10.0.0.1")["id"], a["id"])
-        self.assertEqual(self.reg.find_by_client_key("k", "10.0.0.2")["id"], b["id"])
-        self.assertIsNone(self.reg.find_by_client_key("k", "10.0.0.3"))
+        self.assertEqual(self.reg.find_by_client_key("k")["id"], a["id"])
         with self.assertRaises(sqlite3.IntegrityError):
-            self.reg.upsert_job(self._job(3, client_key="k", client="10.0.0.1"))
+            self.reg.upsert_job(self._job(2, client_key="k", client="10.0.0.2"))
 
-    def test_migration_scopes_old_unique_client_key_index(self):
-        path = os.path.join(self.tmp.name, "v2.db")
+    _OLD = """
+        CREATE TABLE jobs (id TEXT PRIMARY KEY, direction TEXT NOT NULL DEFAULT 'out',
+          state TEXT NOT NULL DEFAULT 'queued', filename TEXT, to_number TEXT,
+          from_number TEXT, subject TEXT, origin TEXT, client TEXT, ast_jobid TEXT,
+          pages INTEGER, error TEXT, pdf_path TEXT, created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL, finished_at TEXT, client_key TEXT);
+        CREATE TABLE job_events (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+          ts TEXT NOT NULL, state TEXT, detail TEXT);
+    """
+
+    def _migrate(self, name, extra_sql):
+        path = os.path.join(self.tmp.name, name)
         db = sqlite3.connect(path)
-        db.executescript("""
-            CREATE TABLE jobs (id TEXT PRIMARY KEY, direction TEXT NOT NULL DEFAULT 'out',
-              state TEXT NOT NULL DEFAULT 'queued', filename TEXT, to_number TEXT,
-              from_number TEXT, subject TEXT, origin TEXT, client TEXT, ast_jobid TEXT,
-              pages INTEGER, error TEXT, pdf_path TEXT, created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL, finished_at TEXT, client_key TEXT);
-            CREATE TABLE job_events (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
-              ts TEXT NOT NULL, state TEXT, detail TEXT);
-            CREATE UNIQUE INDEX jobs_client_key ON jobs(client_key);
-            INSERT INTO jobs (id, created_at, updated_at, client, client_key)
-              VALUES ('lfold', 'x', 'x', '10.0.0.1', 'k');
-        """)
+        db.executescript(self._OLD + extra_sql)
         db.close()
+        return path
+
+    def _index_names(self, reg):
+        return {r[0] for r in reg._conn().execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+
+    def test_migration_from_per_caller_index_to_global(self):
+        path = self._migrate("v3.db", """
+            CREATE UNIQUE INDEX jobs_client_scoped_key ON jobs(ifnull(client, ''), client_key);
+            INSERT INTO jobs (id, created_at, updated_at, client, client_key)
+              VALUES ('lfa', '2026-01-01', 'x', '10.0.0.1', 'k'),
+                     ('lfb', '2026-01-02', 'x', '10.0.0.2', 'k'),
+                     ('lfc', '2026-01-03', 'x', '10.0.0.3', 'other');
+        """)
         reg = Registry(path)
         try:
-            names = {r[0] for r in reg._conn().execute(
-                "SELECT name FROM sqlite_master WHERE type='index'")}
-            self.assertNotIn("jobs_client_key", names)
-            self.assertEqual(reg.find_by_client_key("k", "10.0.0.1")["id"], "lfold")
-            reg.upsert_job(self._job(1, client_key="k", client="10.0.0.2"))   # other client: fine
+            names = self._index_names(reg)
+            self.assertNotIn("jobs_client_scoped_key", names)
+            self.assertIn("jobs_client_key", names)
+            self.assertEqual(reg.find_by_client_key("k")["id"], "lfa")     # earliest keeps the key
+            self.assertIsNone(reg.get_job("lfb")["client_key"])            # duplicate row kept, key cleared
+            self.assertEqual(reg.find_by_client_key("other")["id"], "lfc")
             with self.assertRaises(sqlite3.IntegrityError):
-                reg.upsert_job(self._job(2, client_key="k", client="10.0.0.1"))
-            self.assertIsNone(reg.get_job("lfold")["detail"])                  # detail column added
+                reg.upsert_job(self._job(1, client_key="k", client="10.0.0.9"))
         finally:
             reg.close()
         Registry(path).close()
+
+    def test_migration_from_old_global_index_and_no_index(self):
+        for name, ddl in (("g.db", "CREATE UNIQUE INDEX jobs_client_key ON jobs(client_key);"),
+                          ("n.db", "")):
+            path = self._migrate(name, ddl + """
+                INSERT INTO jobs (id, created_at, updated_at, client, client_key)
+                  VALUES ('lfold', 'x', 'x', '10.0.0.1', 'k');""")
+            reg = Registry(path)
+            try:
+                self.assertEqual(reg.find_by_client_key("k")["id"], "lfold")
+                self.assertNotIn("jobs_client_scoped_key", self._index_names(reg))
+                with self.assertRaises(sqlite3.IntegrityError):
+                    reg.upsert_job(self._job(1, client_key="k", client="10.0.0.2"))
+                self.assertIsNone(reg.get_job("lfold")["detail"])
+            finally:
+                reg.close()
+            Registry(path).close()
 
 
 if __name__ == "__main__":

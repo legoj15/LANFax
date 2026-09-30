@@ -75,15 +75,15 @@ def enqueue_pdf(cfg, reg, bus, pdf_bytes: bytes, to: str, *, subject="", origin=
     """Queue a PDF (bytes or bytearray). The row and queue-meta exist before the final
     outbox name appears, so the observer never sees a file without its row.
 
-    `client_key` (the Idempotency-Key) is stored on the row, unique per `client`. A key this
-    caller used before raises ExistingJob with that row, also when two requests race to
-    insert it; another caller's identical key is a separate job."""
+    `client_key` (the Idempotency-Key) is stored on the row, globally unique. A key used
+    before (from any address) raises ExistingJob with that row, also when two requests race
+    to insert it; the caller decides whether the number matches."""
     if not pdf_bytes.startswith(b"%PDF"):
         raise ValueError("body is not a PDF")
     number = check_number(normalize_number(to), getattr(cfg, "allowed_numbers", DEFAULT_ALLOWED))
     client_key = client_key or None
     if client_key:
-        prior = reg.find_by_client_key(client_key, client)
+        prior = reg.find_by_client_key(client_key)
         if prior is not None:
             raise ExistingJob(prior)
     job_id = "lf" + secrets.token_hex(6)
@@ -114,7 +114,7 @@ def enqueue_pdf(cfg, reg, bus, pdf_bytes: bytes, to: str, *, subject="", origin=
         if row is None and client_key:
             winner = None
             try:
-                winner = reg.find_by_client_key(client_key, client)
+                winner = reg.find_by_client_key(client_key)
             except Exception:  # noqa: BLE001
                 log.exception("idempotency lookup failed for a collided insert")
             if winner is not None:  # a concurrent request with the same key inserted first

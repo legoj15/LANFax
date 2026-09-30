@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .arm import ArmError
-from .enqueue import ExistingJob
+from .enqueue import ExistingJob, normalize_number
 
 log = logging.getLogger("faxd.api")
 
@@ -24,7 +24,7 @@ REPLAY_MAX = 200              # missed job_events rows replayed on reconnect; mo
 CHUNK = 64 * 1024
 _TOKEN_RE = re.compile(r"(token=)[^&\s]*", re.IGNORECASE)
 _ID = r"([A-Za-z0-9_-]+)"
-_CLIENT_KEY = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_CLIENT_KEY = re.compile(r"[A-Za-z0-9._:-]{16,128}")
 _WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")
 
 
@@ -158,13 +158,13 @@ class _Handler(BaseHTTPRequestHandler):
         self._drain(max(0, n), self.api.max_body)
 
     def _client_key(self):
-        """The optional Idempotency-Key header: None, or 1-128 chars [A-Za-z0-9._:-]."""
+        """The optional Idempotency-Key header: None, or 16-128 chars [A-Za-z0-9._:-]."""
         raw = self.headers.get("Idempotency-Key")
         if raw is None:
             return None
         key = raw.strip()
         if not _CLIENT_KEY.fullmatch(key):
-            raise _HttpError(400, "Idempotency-Key must be 1-128 chars of A-Z a-z 0-9 . _ : -")
+            raise _HttpError(400, "Idempotency-Key must be 16-128 chars of A-Z a-z 0-9 . _ : - (minimum 16)")
         return key
 
     def _json_body(self, required=True):
@@ -336,14 +336,24 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _prior(self, key):
         """The job an earlier request with this Idempotency-Key created, else None."""
-        return self.api.reg.find_by_client_key(key, self.client_ip) if key else None
+        return self.api.reg.find_by_client_key(key) if key else None
+
+    def _repeat(self, job, to):
+        """Answer a repeated key: 200 with the job, or 409 when it was for another number."""
+        try:
+            same = normalize_number(to) == job.get("to_number")
+        except ValueError:
+            same = False
+        if not same:
+            return self._json(409, {"error": "idempotency key already used for a different number"})
+        return self._json(200, job)
 
     def r_post_job(self, query):
         key = self._client_key()
         prior = self._prior(key)
         if prior is not None:
             self._discard_body()
-            return self._json(200, prior)
+            return self._repeat(prior, self.headers.get("X-Fax-To") or "")
         if not self.api.uploads.acquire(blocking=False):
             # not reading the (up to 25 MB) body is the point: answer and close
             self.close_connection = True
@@ -361,7 +371,7 @@ class _Handler(BaseHTTPRequestHandler):
                 job = self.api.enqueue_fn(body, to, subject=subject, origin="api",
                                           client=self.client_ip, client_key=key)
             except ExistingJob as e:
-                return self._json(200, e.job)
+                return self._repeat(e.job, to)
             except ValueError as e:
                 raise _HttpError(400, str(e) or "invalid request")
             del body
@@ -396,7 +406,8 @@ class _Handler(BaseHTTPRequestHandler):
         obj = self._json_body()
         prior = self._prior(key)
         if prior is not None:
-            return self._json(200, prior)
+            to = obj.get("to")
+            return self._repeat(prior, to if isinstance(to, str) else "")
         to = obj.get("to")
         note = obj.get("note", "")
         if not isinstance(to, str) or not to.strip():
@@ -410,7 +421,7 @@ class _Handler(BaseHTTPRequestHandler):
             job = self.api.enqueue_fn(pdf, to, subject="test page", origin="test",
                                       client=self.client_ip, client_key=key)
         except ExistingJob as e:
-            return self._json(200, e.job)
+            return self._repeat(e.job, to)
         except ValueError as e:
             raise _HttpError(400, str(e) or "invalid request")
         self._json(201, job)

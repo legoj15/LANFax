@@ -164,8 +164,7 @@ class SpoolObserver:
         for key in ("subject", "origin", "client", "client_key", "created_at"):
             if isinstance(meta.get(key), str) and meta[key]:
                 out[key] = meta[key]
-        if out.get("client_key") and self.reg.find_by_client_key(out["client_key"],
-                                                                 out.get("client")):
+        if out.get("client_key") and self.reg.find_by_client_key(out["client_key"]):
             del out["client_key"]
         return out
 

@@ -27,7 +27,7 @@ class FakeRegistry:
     def get_jobs(self, ids):
         return [self.jobs[i] for i in ids if i in self.jobs]
 
-    def find_by_client_key(self, key, client):
+    def find_by_client_key(self, key):
         return None
 
     def last_event_id(self, job_id):
