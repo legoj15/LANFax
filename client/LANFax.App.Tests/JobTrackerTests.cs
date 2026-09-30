@@ -49,6 +49,15 @@ public sealed class JobTrackerTests : IDisposable
     }
 
     [Fact]
+    public void BeginSend_records_the_server_authority()
+    {
+        var t = new JobTracker(_dir);
+        var (id, pdf) = Spooled();
+        t.BeginSend(Plan(id, pdf, keep: false, key: "K1"), new Uri("http://10.0.0.5:9090/"));
+        Assert.Equal("10.0.0.5:9090", Record(id).GetProperty("server").GetString());
+    }
+
+    [Fact]
     public void BeginSend_failure_throws_so_the_caller_does_not_send()
     {
         var blocked = Path.Combine(_dir, "blocked");
@@ -121,7 +130,7 @@ public sealed class JobTrackerTests : IDisposable
         t1.BeginSend(plan);
         if (state == "uncertain")
         {
-            var s = SendSession.Resume(plan);
+            var s = SendSession.Resume(plan, null);
             s.Started(plan); s.Failed(AttemptOutcome.Uncertain);
             t1.RecordFailure(s, plan);
         }
@@ -131,7 +140,7 @@ public sealed class JobTrackerTests : IDisposable
         Assert.Equal(id, req.SpoolId);
         Assert.Equal(pdf, req.PdfPath);
         Assert.Equal(plan, req.LockedPlan); // record equality: same key, number, subject, route, file action
-        var s2 = SendSession.Resume(req.LockedPlan!);
+        var s2 = SendSession.For(req);
         Assert.True(s2.FieldsLocked);
         Assert.Equal("K-stored", s2.IdempotencyKey);
         Assert.True(File.Exists(pdf) && File.Exists(JsonOf(id))); // nothing is deleted by the scan
@@ -197,18 +206,62 @@ public sealed class JobTrackerTests : IDisposable
     }
 
     [Fact]
-    public async Task Briefly_locked_json_is_read_after_a_retry_not_treated_as_corrupt()
+    public void Briefly_locked_json_is_read_after_a_retry_not_treated_as_corrupt()
     {
         var t0 = new JobTracker(_dir);
         var (id, pdf) = Spooled();
         t0.BeginSend(Plan(id, pdf, keep: false, key: "K1"));
         var hold = new FileStream(JsonOf(id), FileMode.Open, FileAccess.Read, FileShare.None);
-        var release = Task.Run(async () => { await Task.Delay(300); hold.Dispose(); });
-        var req = Assert.Single(new JobTracker(_dir).Scan());
-        await release;
-        Assert.Equal(SendKind.Resume, req.Kind);
-        Assert.Equal("K1", req.LockedPlan!.IdempotencyKey);
-        Assert.False(File.Exists(JsonOf(id) + ".bad"));
+        int reads = 0;
+        // The first read hits the real sharing violation; the holder lets go right before the retry.
+        var t = new JobTracker(_dir)
+        {
+            ReadRetryDelay = TimeSpan.Zero,
+            ReadAllText = p => { if (++reads == 2) hold.Dispose(); return File.ReadAllText(p); },
+        };
+        try
+        {
+            var req = Assert.Single(t.Scan());
+            Assert.Equal(2, reads);
+            Assert.Equal(SendKind.Resume, req.Kind);
+            Assert.Equal("K1", req.LockedPlan!.IdempotencyKey);
+            Assert.False(File.Exists(JsonOf(id) + ".bad"));
+        }
+        finally { hold.Dispose(); }
+    }
+
+    [Fact]
+    public void A_record_deleted_between_listing_and_reading_is_no_record_and_its_pdf_is_new()
+    {
+        var (id, pdf) = Spooled();
+        new JobTracker(_dir).BeginSend(Plan(id, pdf, keep: false, key: "K1"));
+        var logs = new List<string>();
+        var t = new JobTracker(_dir, logs.Add) { ReadAllText = p => { File.Delete(p); return File.ReadAllText(p); } };
+        var req = Assert.Single(t.Scan());
+        Assert.Equal(SendKind.New, req.Kind);
+        Assert.Equal(id, req.SpoolId);
+        Assert.DoesNotContain(logs, l => l.Contains("skipped"));
+    }
+
+    [Fact]
+    public void Only_accepted_records_are_pollable()
+    {
+        foreach (var state in new[] { "accepted" })
+            Assert.True(new TrackedJob(Guid.NewGuid(), "lf1", "1", null, false, state).IsPollable);
+        foreach (var state in new[] { "sending", "uncertain", "draft", "unknown", "sent", "failed", "cancelled", "bogus", "" })
+            Assert.False(new TrackedJob(Guid.NewGuid(), "lf1", "1", null, false, state).IsPollable, state);
+        Assert.False(new TrackedJob(Guid.NewGuid(), null, "1", null, false, "accepted").IsPollable);
+    }
+
+    [Fact]
+    public void A_record_in_a_state_this_version_does_not_know_is_offered_with_the_warning()
+    {
+        var (id, _) = Spooled();
+        File.WriteAllText(JsonOf(id),
+            $$"""{"spoolId":"{{id}}","serverId":"lfx","number":"15552345678","subject":null,"keepLocalCopies":false,"state":"parked-by-v9"}""");
+        var t = new JobTracker(_dir);
+        Assert.Equal(SendKind.Suspect, Assert.Single(t.Scan()).Kind);
+        Assert.Empty(t.Pending);
     }
 
     [Fact]
@@ -219,7 +272,7 @@ public sealed class JobTrackerTests : IDisposable
         new JobTracker(_dir).BeginSend(Plan(id, pdf, keep: false, key: "K1"));
         using (new FileStream(JsonOf(id), FileMode.Open, FileAccess.Read, FileShare.None))
         {
-            Assert.Empty(new JobTracker(_dir, logs.Add).Scan());
+            Assert.Empty(new JobTracker(_dir, logs.Add) { ReadRetryDelay = TimeSpan.Zero }.Scan());
             Assert.True(File.Exists(JsonOf(id)));
             Assert.False(File.Exists(JsonOf(id) + ".bad"));
         }

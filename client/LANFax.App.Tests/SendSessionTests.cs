@@ -125,7 +125,7 @@ public class SendSessionTests
     public void Resume_is_locked_with_the_stored_key_and_plan()
     {
         var stored = SendPlan.Create(Spool, @"C:\spool\jobs\x.pdf", "5552345678", "subj", false, true, "stored-key");
-        var s = SendSession.Resume(stored, () => throw new InvalidOperationException("no new key when resuming"));
+        var s = SendSession.Resume(stored, null, () => throw new InvalidOperationException("no new key when resuming"));
         Assert.True(s.FieldsLocked);
         Assert.True(s.Resumed);
         Assert.Equal("stored-key", s.IdempotencyKey);
@@ -140,7 +140,7 @@ public class SendSessionTests
     public void Resumed_session_unlocks_and_rotates_after_a_definite_rejection()
     {
         var stored = SendPlan.Create(Spool, @"C:\spool\jobs\x.pdf", "5552345678", "subj", false, true, "stored-key");
-        var s = SendSession.Resume(stored, () => Guid.Parse("00000000-0000-0000-0000-000000000009"));
+        var s = SendSession.Resume(stored, null, () => Guid.Parse("00000000-0000-0000-0000-000000000009"));
         s.Started(stored);
         Assert.Equal(AttemptOutcome.Rejected, s.Failed(new FaxApiException(422, "bad number")));
         Assert.False(s.FieldsLocked);
@@ -175,7 +175,7 @@ public class SendSessionTests
     {
         var pdf = hasPdf ? @"C:\spool\jobs\x.pdf" : null;
         var s = resumed
-            ? SendSession.Resume(SendPlan.Create(Spool, pdf!, "5552345678", null, false, false, "stored-key"), () => Guid.NewGuid())
+            ? SendSession.Resume(SendPlan.Create(Spool, pdf!, "5552345678", null, false, false, "stored-key"), null, () => Guid.NewGuid())
             : New(pdf);
         Run(s, steps, new List<SendPlan>());
         Assert.Equal(keeps, s.CancelKeepsDocument);
@@ -230,6 +230,42 @@ public class SendSessionTests
         Assert.False(s.FieldsLocked);
         Assert.Equal(key, s.IdempotencyKey);
     }
+
+    [Fact]
+    public void A_409_locks_a_fresh_session_and_keeps_a_locked_one_locked_with_the_same_key()
+    {
+        var s = New();
+        var p = s.Build("5552345678", null, false, false);
+        s.Started(p);
+        Assert.Equal(AttemptOutcome.Uncertain, s.Failed(new FaxApiException(409, "idempotency key already used for a different number")));
+        Assert.True(s.FieldsLocked);
+        Assert.Equal(K(1), s.IdempotencyKey);
+        s.Started(p);
+        Assert.Equal(AttemptOutcome.Uncertain, s.Failed(new FaxApiException(409, "idempotency key already used for a different number")));
+        Assert.True(s.FieldsLocked);
+        Assert.Equal(K(1), s.IdempotencyKey);
+    }
+
+    [Fact]
+    public void A_resumed_session_is_pinned_to_the_recorded_server()
+    {
+        var stored = SendPlan.Create(Spool, @"C:\spool\jobs\x.pdf", "5552345678", null, false, false, "stored-key");
+        var s = SendSession.Resume(stored, "127.0.0.1:8081");
+        Assert.Equal("127.0.0.1:8081", s.LockedServer!.Authority);
+        Assert.False(s.ServerNotRecorded);
+        Assert.Equal(SendSession.ResumeNote, s.ResumeText);
+    }
+
+    [Fact]
+    public void A_resumed_session_from_an_older_record_is_unpinned_and_says_so()
+    {
+        var stored = SendPlan.Create(Spool, @"C:\spool\jobs\x.pdf", "5552345678", null, false, false, "stored-key");
+        var s = SendSession.Resume(stored, null);
+        Assert.Null(s.LockedServer);
+        Assert.True(s.ServerNotRecorded);
+        Assert.Contains("sent from an earlier version; server not recorded", s.ResumeText);
+        Assert.False(new SendSession(Spool, @"C:\spool\jobs\x.pdf").ServerNotRecorded); // only resumed sessions
+    }
 }
 
 public class SendOutcomeTests
@@ -248,6 +284,8 @@ public class SendOutcomeTests
     [InlineData(401, AttemptOutcome.Rejected)]
     [InlineData(404, AttemptOutcome.Rejected)]
     [InlineData(413, AttemptOutcome.Rejected)]
+    // faxd answers 409 when the key already holds a job for another number: a job exists under the key.
+    [InlineData(409, AttemptOutcome.Uncertain)]
     public void Classifies_status_codes(int? status, AttemptOutcome expected) =>
         Assert.Equal(expected, SendOutcome.Classify(status));
 

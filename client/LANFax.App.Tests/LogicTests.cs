@@ -420,3 +420,89 @@ public class InstallerScriptTests
         finally { try { Directory.Delete(tmp, true); } catch { } }
     }
 }
+
+/// <summary>Shared-PC hazard: a document printed by another Windows user says so in the send dialog.</summary>
+public class PrintedByTests
+{
+    const string Me = "S-1-5-21-1-2-3-1001";
+    const string Bob = "S-1-5-21-1-2-3-1002";
+    const string Admins = "S-1-5-32-544";
+
+    static PrintedBy For(FileOwner? owner) => new(_ => owner, Me, [Admins, "S-1-5-32-545"]);
+
+    [Fact]
+    public void Another_users_document_names_its_owner() =>
+        Assert.Equal(@"PC\bob", For(new FileOwner(Bob, @"PC\bob")).OtherOwner(@"C:\spool\jobs\x.pdf"));
+
+    [Theory]
+    [InlineData(Me)]        // mine
+    [InlineData(Admins)]    // an elevated admin's files are owned by Administrators, a group this user is in
+    [InlineData("S-1-5-18")] // SYSTEM: the spooler did not impersonate anyone, so there is no one to name
+    [InlineData("S-1-5-19")]
+    [InlineData("S-1-5-20")]
+    public void Owners_that_are_not_another_user_are_not_shown(string sid) =>
+        Assert.Null(For(new FileOwner(sid, "whoever")).OtherOwner("x.pdf"));
+
+    [Fact]
+    public void An_owner_that_cannot_be_read_is_not_shown()
+    {
+        Assert.Null(For(null).OtherOwner("x.pdf"));
+        Assert.Null(new PrintedBy(_ => throw new UnauthorizedAccessException(), Me, []).OtherOwner("x.pdf"));
+    }
+
+    [Fact]
+    public void The_document_line_says_who_printed_it()
+    {
+        Assert.Equal("PDF, 2 pages, 14 KB", PrintedBy.DocumentLine("2 pages, 14 KB", null));
+        Assert.Equal(@"PDF, 2 pages, 14 KB. Printed by PC\bob", PrintedBy.DocumentLine("2 pages, 14 KB", @"PC\bob"));
+    }
+
+    [Fact]
+    public void A_file_this_user_created_is_not_someone_elses()
+    {
+        var f = Path.GetTempFileName();
+        try
+        {
+            var owner = PrintedBy.ReadOwner(f);
+            Assert.NotNull(owner);
+            Assert.StartsWith("S-1-", owner!.Sid);
+            Assert.Null(PrintedBy.ForCurrentUser().OtherOwner(f));
+        }
+        finally { File.Delete(f); }
+    }
+}
+
+/// <summary>The elevated relaunch is one command-line string: a quote in a value would end the argument early.</summary>
+public class ElevatedArgumentTests
+{
+    [Theory]
+    [InlineData(@"C:\spool", "LAN \"Fax")]
+    [InlineData(@"C:\sp""ool", "LAN Fax")]
+    public void A_quote_in_the_printer_name_or_spool_dir_is_refused(string spool, string printer) =>
+        Assert.Throws<ArgumentException>(() => PrinterSetup.BuildArguments(@"C:\s.ps1", spool, printer));
+
+    [Fact]
+    public void A_root_spool_dir_keeps_its_backslash_without_escaping_the_quote()
+    {
+        var a = PrinterSetup.BuildArguments(@"C:\s.ps1", @"D:\", "LAN Fax");
+        Assert.Contains(@"-SpoolDir ""D:\\"" ", a); // argv parsing turns "D:\\" back into D:\
+    }
+
+    [Fact]
+    public async Task Install_reports_a_refused_value_instead_of_running()
+    {
+        var script = Path.GetTempFileName();
+        try
+        {
+            var ps = new PrinterSetup(new NoPrinter(), _ => throw new InvalidOperationException("must not run"));
+            Assert.Contains("\"", await ps.InstallAsync(@"C:\spool", "LAN \"Fax", script));
+        }
+        finally { File.Delete(script); }
+    }
+
+    sealed class NoPrinter : IPrinterKeyReader
+    {
+        public bool Exists(string printerName) => false;
+        public string? Port(string printerName) => null;
+    }
+}

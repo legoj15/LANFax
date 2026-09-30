@@ -20,6 +20,7 @@ internal sealed class SettingsDialog : Form
     private bool _tokenCleared;
 
     public const string WaitForSendText = "Wait for the current fax to finish before saving settings.";
+    public const string TokenRuleText = ClientConfig.TokenRule + " (paste it exactly as the server printed it).";
 
     /// <param name="sendInFlight">True while a fax is on the wire: saving then could move its retries to another server.</param>
     public SettingsDialog(ClientConfig cfg, ConfigLocation loc, Func<bool> sendInFlight)
@@ -94,7 +95,7 @@ internal sealed class SettingsDialog : Form
     {
         Server = _host.Text.Trim(),
         Port = (int)_port.Value,
-        Token = _token.Text.Length > 0 ? _token.Text : _tokenCleared ? null : _cfg.Token,
+        Token = _token.Text.Trim().Length > 0 ? _token.Text.Trim() : _tokenCleared ? null : _cfg.Token,
         PrinterName = _cfg.PrinterName,
         SpoolDir = _cfg.SpoolDir,
         KeepLocalCopies = _keep.Checked,
@@ -110,6 +111,7 @@ internal sealed class SettingsDialog : Form
         {
             var cand = Candidate();
             if (cand.Validate() is { } invalid) { _result.ForeColor = Color.Firebrick; _result.Text = "Cannot use these settings: " + invalid + "."; return; }
+            if (ClientConfig.TokenError(cand.Token) != null) { _result.ForeColor = Color.Firebrick; _result.Text = TokenRuleText; return; }
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
             var st = await new FaxApi(cand, http).GetStatusAsync();
             var regs = st.Registrations.Count == 0
@@ -148,6 +150,11 @@ internal sealed class SettingsDialog : Form
         if (c.Validate() is { } invalid)
         {
             MessageBox.Show(this, "These settings cannot be used: " + invalid + ".", "LANFax", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+        if (ClientConfig.TokenError(c.Token) != null)
+        {
+            MessageBox.Show(this, TokenRuleText, "LANFax", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
         try { c.Save(_loc.Path, ClientConfig.DefaultTokenPath); }

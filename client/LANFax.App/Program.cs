@@ -4,19 +4,16 @@ namespace LANFax.App;
 
 internal static class Program
 {
-    internal const string ShowEventName = InstanceGuard.ShowEventName;
-
     [STAThread]
     private static void Main()
     {
-        using var mutex = TryOwnMachineMutex(out bool first);
-        if (!first)
+        // The show signal exists as soon as the mutex is owned, so a second start during this one's startup reaches it.
+        using var claim = InstanceGuard.Acquire(InstanceGuard.MutexName, InstanceGuard.ShowEventName, InstanceGuard.SignalPatience);
+        if (claim.Role != InstanceRole.Run)
         {
-            // Same session: ask the running tray to show its "already running" balloon. Otherwise another session
-            // owns the machine-wide spool: say so here and leave.
-            bool signalled = false;
-            try { using var ev = EventWaitHandle.OpenExisting(ShowEventName); signalled = ev.Set(); } catch (Exception) { }
-            if (InstanceGuard.Decide(false, signalled) == InstanceRole.RunningInAnotherSession)
+            // Same session: the running tray was asked to show its "already running" balloon. Otherwise another
+            // session owns the machine-wide spool: say so here and leave.
+            if (claim.Role == InstanceRole.RunningInAnotherSession)
             {
                 FileLog.Info("LANFax is already running in another session; exiting");
                 ApplicationConfiguration.Initialize();
@@ -31,19 +28,9 @@ internal static class Program
             FileLog.Error("Unhandled exception", e.ExceptionObject as Exception);
 
         FileLog.Info("LANFax starting");
-        using var ctx = new TrayContext();
+        using var ctx = new TrayContext(claim.ShowSignal!);
         Application.Run(ctx);
         FileLog.Info("LANFax exiting");
-    }
-
-    /// <summary>
-    /// The Global\ mutex. Another user's instance created it with a DACL this user may not open: that is "not first"
-    /// too, never a crash.
-    /// </summary>
-    private static Mutex? TryOwnMachineMutex(out bool first)
-    {
-        try { return new Mutex(true, InstanceGuard.MutexName, out first); }
-        catch (UnauthorizedAccessException) { first = false; return null; }
     }
 
     /// <summary>A short-lived tray icon whose balloon says why nothing else happens, then the process exits.</summary>

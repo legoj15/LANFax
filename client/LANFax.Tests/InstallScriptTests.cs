@@ -31,7 +31,7 @@ public class InstallScriptTests
         Assert.Matches(@"\[string\]\$DataDir\s*=\s*\(Join-Path \$env:ProgramData 'LANFax'\)", t);
         Assert.Matches(@"Grant-UsersModify\s+-Path\s+\$DataDir", t);
         Assert.Contains("'ContainerInherit,ObjectInherit'", t);
-        Assert.Contains("-DataDir `\"$DataDir`\"", t); // forwarded through the self-elevation relaunch
+        Assert.Contains("-DataDir $(ConvertTo-QuotedArg $DataDir)", t); // forwarded through the self-elevation relaunch
         Assert.DoesNotMatch(@"Set-Acl\s+-Path\s+\$SpoolDir", t);
     }
 
@@ -44,10 +44,23 @@ public class InstallScriptTests
         // "C:\Program Files\LANFax\..." into several arguments. One command-line string behaves the same on 5.1 and 7.
         var t = File.ReadAllText(Path.Combine(Dir(), script));
         Assert.DoesNotContain("'\"{0}\"' -f", t);
-        Assert.Matches(@"(?m)^\s*\$argLine = ""-NoProfile -ExecutionPolicy Bypass -File `""\$PSCommandPath`"".*""\s*$", t);
+        Assert.Matches(@"(?m)^\s*\$argLine = ""-NoProfile -ExecutionPolicy Bypass -File \$\(ConvertTo-QuotedArg \$PSCommandPath\).*""\s*$", t);
         Assert.Contains("-ArgumentList $argLine", t);
-        Assert.Contains("-PrinterName `\"$PrinterName`\"", t);
-        Assert.Contains("-SpoolDir `\"$SpoolDir`\"", t);
+        Assert.Contains("-PrinterName $(ConvertTo-QuotedArg $PrinterName)", t);
+        Assert.Contains("-SpoolDir $(ConvertTo-QuotedArg $SpoolDir)", t);
+    }
+
+    [Theory]
+    [InlineData("Install-LANFaxPrinter.ps1")]
+    [InlineData("Uninstall-LANFaxPrinter.ps1")]
+    public void SelfElevationRefusesQuotesAndProtectsTheClosingQuote(string script)
+    {
+        // A quote inside a value would end its argument early in the one-string relaunch; a trailing backslash would
+        // escape the closing quote. Values are checked before anything runs, and quoted by one helper.
+        var t = File.ReadAllText(Path.Combine(Dir(), script));
+        Assert.Matches(@"(?ms)^function ConvertTo-QuotedArg\(\[string\]\$Value\) \{.*?\$Value\.Contains\('""'\).*?throw.*?-replace '\(\\\\\+\)\$', '\$1\$1'.*?^\}", t);
+        var check = t.IndexOf("foreach ($value in", StringComparison.Ordinal);
+        Assert.True(check > 0 && check < t.IndexOf("$isAdmin", StringComparison.Ordinal), "values must be checked before the relaunch");
     }
 
     [Theory]
@@ -57,9 +70,11 @@ public class InstallScriptTests
     {
         var ps51 = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
         if (!File.Exists(ps51)) return; // not Windows PowerShell 5.1: the static check above still runs
-        var line = System.Text.RegularExpressions.Regex.Match(File.ReadAllText(Path.Combine(Dir(), script)),
-            @"(?m)^\s*(\$argLine = .*)$").Groups[1].Value.TrimEnd();
+        var text = File.ReadAllText(Path.Combine(Dir(), script));
+        var line = System.Text.RegularExpressions.Regex.Match(text, @"(?m)^\s*(\$argLine = .*)$").Groups[1].Value.TrimEnd();
+        var quoter = System.Text.RegularExpressions.Regex.Match(text, @"(?ms)^function ConvertTo-QuotedArg.*?^\}").Value;
         Assert.NotEmpty(line);
+        Assert.NotEmpty(quoter);
 
         // A driver in a folder with a space runs the script's own $argLine through Start-Process (as the relaunch
         // does, minus -Verb RunAs) into a child of the same powershell.exe, which writes back the parameters it got.
@@ -73,11 +88,13 @@ public class InstallScriptTests
                 "param([string]$DataDir, [string]$SpoolDir, [string]$PrinterName)",
                 "if ($env:LANFAX_PROBE_CHILD) { Set-Content -LiteralPath $env:LANFAX_PROBE_OUT -Encoding UTF8 -Value @($DataDir, $SpoolDir, $PrinterName); exit 0 }",
                 "$env:LANFAX_PROBE_CHILD = '1'",
+                quoter,
                 line,
                 "$p = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $argLine -Wait -PassThru -NoNewWindow",
                 "exit $p.ExitCode",
                 ""));
-            string dataDir = @"C:\Program Files\LAN Fax Data", spoolDir = @"C:\Program Files\LAN Fax Data\spool dir";
+            // The spool dir ends in a backslash: it must survive without escaping the closing quote.
+            string dataDir = @"C:\Program Files\LAN Fax Data", spoolDir = @"C:\Program Files\LAN Fax Data\spool dir\";
             var psi = new System.Diagnostics.ProcessStartInfo(ps51)
             {
                 UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,

@@ -32,6 +32,8 @@ internal sealed class TrayContext : ApplicationContext
     private readonly HashSet<string> _submitted = new();
     /// <summary>Which received faxes were already announced (live or by a catch-up); persisted per user.</summary>
     private readonly InboundAnnouncer _inbound;
+    /// <summary>Runs the inbound catch-up; a request while one runs is queued, not dropped.</summary>
+    private readonly InboundCatchUp _catchUp;
     private readonly ToolStripMenuItem _installItem;
     private readonly ToolStripMenuItem _unsentItem;
     private readonly ToolStripMenuItem _retryItem;
@@ -47,13 +49,13 @@ internal sealed class TrayContext : ApplicationContext
     private long _noticeId;
     private bool _everConnected;
     private bool _polling;
-    private bool _catchingUp;
     private bool _installing;
     private bool _settingsOpen;
     private bool _exiting;
     private bool _exitPending;
 
-    public TrayContext()
+    /// <param name="showSignal">The per-session "show yourself" event, created with the instance mutex (owned by Program).</param>
+    public TrayContext(EventWaitHandle showSignal)
     {
         _ = _ui.Handle; // force handle creation on the UI thread so BeginInvoke works from workers
         _loc = ConfigLocation.Default();
@@ -61,6 +63,21 @@ internal sealed class TrayContext : ApplicationContext
         _api = new FaxApi(_cfg, _http) { Log = m => FileLog.Info("api: " + m) };
         _tracker = new JobTracker(_cfg.SpoolDir, m => FileLog.Info("tracker: " + m));
         _inbound = new InboundAnnouncer(InboundAnnouncer.DefaultPath, m => FileLog.Info("inbound: " + m));
+        _catchUp = new InboundCatchUp(_inbound,
+            (since, limit) => _api.GetJobsAsync(direction: "in", states: ["received"], limit: limit, updatedSince: since),
+            news =>
+            {
+                FileLog.Info($"inbound catch-up: {news.Count} fax(es) not announced yet");
+                foreach (var text in NotificationText.ForCaughtUp(news)) Balloon(text);
+            },
+            e => FileLog.Info(e switch
+            {
+                FaxApiConfigException => $"inbound catch-up: not sent, settings unusable ({e.Message})",
+                FaxApiException f => $"inbound catch-up: {f.StatusCode} {f.Message}",
+                JsonException => $"inbound catch-up: unreadable answer ({e.Message})",
+                _ => $"inbound catch-up failed: {e.GetType().Name}: {e.Message}",
+            }),
+            m => FileLog.Info(m));
         FileLog.Info($"config: {_loc.ReadPath} (save to {_loc.Path}, fallback={_loc.IsFallback}), server {_cfg.Server}:{_cfg.Port}, token set={!string.IsNullOrEmpty(_cfg.Token)}");
         if (_cfg.LoadError != null) FileLog.Error("config: " + _cfg.LoadError);
 
@@ -98,7 +115,7 @@ internal sealed class TrayContext : ApplicationContext
         _tray.BalloonTipClosed += (_, _) => _notices.OnClosed();
         UpdateConnectionState(false);
 
-        _showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ShowEventName);
+        _showEvent = showSignal;
         _showWait = ThreadPool.RegisterWaitForSingleObject(_showEvent,
             (_, _) => OnUi(() => Balloon("LANFax is already running")), null, Timeout.Infinite, false);
 
@@ -254,7 +271,8 @@ internal sealed class TrayContext : ApplicationContext
         var oldTask = _sseTask;
         oldCts?.Cancel();
         UpdateConnectionState(false);
-        bool run = !string.IsNullOrEmpty(_cfg.Token) && _cfg.Validate() == null; // nothing to authenticate with, or nowhere to connect
+        // Nothing to authenticate with, a token that cannot be sent, or nowhere to connect: do not run.
+        bool run = !string.IsNullOrEmpty(_cfg.Token) && ClientConfig.TokenError(_cfg.Token) == null && _cfg.EndpointError() == null;
         var cts = run ? new CancellationTokenSource() : null;
         _sseCts = cts;
         _sseTask = Task.Run(async () =>
@@ -304,6 +322,11 @@ internal sealed class TrayContext : ApplicationContext
             foreach (var id in ids)
             {
                 try { OnJobChanged(await _api.GetJobAsync(id)); }
+                catch (FaxApiConfigException e)
+                {
+                    FileLog.Info($"poll: settings unusable ({e.Message}); next tick");
+                    break; // nothing was sent; the same settings would fail for every job
+                }
                 catch (FaxApiException e) when (e.StatusCode == 404)
                 {
                     OnJobUnknown(id);
@@ -324,21 +347,8 @@ internal sealed class TrayContext : ApplicationContext
     /// already seen, and announces those not announced yet. Covers faxes the event stream never delivered: a resync
     /// gap, a disconnection, or time the app was not running.
     /// </summary>
-    private async Task CatchUpInboundAsync(DateTimeOffset? since)
-    {
-        if (_catchingUp || _exiting || string.IsNullOrEmpty(_cfg.Token)) return;
-        _catchingUp = true;
-        try
-        {
-            var jobs = await _api.GetJobsAsync(direction: "in", states: ["received"], limit: 100, updatedSince: _inbound.SinceFor(since));
-            var news = _inbound.Absorb(jobs);
-            if (news.Count > 0) FileLog.Info($"inbound catch-up: {news.Count} fax(es) not announced yet");
-            foreach (var text in NotificationText.ForCaughtUp(news)) Balloon(text);
-        }
-        catch (FaxApiException e) { FileLog.Info($"inbound catch-up: {e.StatusCode} {e.Message}"); }
-        catch (JsonException e) { FileLog.Info($"inbound catch-up: unreadable answer ({e.Message})"); }
-        finally { _catchingUp = false; }
-    }
+    private Task CatchUpInboundAsync(DateTimeOffset? since) =>
+        _exiting || string.IsNullOrEmpty(_cfg.Token) ? Task.CompletedTask : _catchUp.RunAsync(since);
 
     /// <summary>The server has no such job (its database was reset): stop polling and give the document back to the user.</summary>
     private void OnJobUnknown(string serverId)
@@ -541,7 +551,6 @@ internal sealed class TrayContext : ApplicationContext
             _poll.Dispose();
             _noticeTimer.Dispose();
             _showWait?.Unregister(null);
-            _showEvent.Dispose();
             _sseCts?.Cancel();
             _spool.Dispose();
             var open = _openDialog; _openDialog = null;

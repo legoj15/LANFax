@@ -7,12 +7,15 @@ public enum AttemptOutcome
     /// <summary>Nothing reached the server (bad number, unreadable file). Key and fields unchanged.</summary>
     NotSent,
     /// <summary>
-    /// A 4xx: the server refused the request. faxd looks the Idempotency-Key up before it validates or reads the
-    /// body, so any 4xx but 401 proves it holds nothing under the key: rotate it (and unlock a locked session).
-    /// A 401 fails before the lookup, so it proves nothing about a job the key may already have.
+    /// A 4xx other than 409: the server refused the request. faxd looks the Idempotency-Key up before it validates or
+    /// reads the body, so any such 4xx but 401 proves it holds nothing under the key: rotate it (and unlock a locked
+    /// session). A 401 fails before the lookup, so it proves nothing about a job the key may already have.
     /// </summary>
     Rejected,
-    /// <summary>Timeout, connection error, 3xx, 5xx, an unreadable 2xx or anything unexpected: the server may have queued the job.</summary>
+    /// <summary>
+    /// Timeout, connection error, 3xx, 5xx, an unreadable 2xx, anything unexpected, or a 409 (the key already holds a
+    /// job for another number, so a job exists under it): the server may have queued the job.
+    /// </summary>
     Uncertain,
 }
 
@@ -26,6 +29,7 @@ public static class SendOutcome
     public static AttemptOutcome Classify(int? statusCode) => statusCode switch
     {
         null => AttemptOutcome.NotSent,
+        409 => AttemptOutcome.Uncertain, // faxd: "idempotency key already used for a different number": a job exists
         >= 400 and < 500 => AttemptOutcome.Rejected,
         _ => AttemptOutcome.Uncertain,
     };
@@ -71,6 +75,8 @@ public sealed class SendSession
         "This document may already have been sent; Send will not create a duplicate. Cancel keeps the document.";
     public const string SuspectNote =
         "This document may already have been sent. Sending it again may fax it a second time.";
+    /// <summary>Added to <see cref="ResumeNote"/> for a record written before the server was recorded.</summary>
+    public const string ServerNotRecordedNote = "(It was sent from an earlier version; server not recorded.)";
 
     private readonly Func<Guid> _newKey;
     private SendPlan? _inFlight;
@@ -84,18 +90,32 @@ public sealed class SendSession
         IdempotencyKey = _newKey().ToString();
     }
 
-    private SendSession(SendPlan locked, Func<Guid> newKey)
+    private SendSession(SendPlan locked, Uri? server, Func<Guid> newKey)
     {
         SpoolId = locked.JobId;
         PdfPath = locked.PdfPath;
         _newKey = newKey;
         IdempotencyKey = locked.IdempotencyKey;
         LockedPlan = locked;
+        LockedServer = server;
         Resumed = true;
     }
 
-    /// <summary>A send that may have reached the server before the app stopped: locked to the stored key and plan.</summary>
-    public static SendSession Resume(SendPlan locked, Func<Guid>? newKey = null) => new(locked, newKey ?? Guid.NewGuid);
+    /// <summary>
+    /// A send that may have reached the server before the app stopped: locked to the stored key and plan, and pinned
+    /// to <paramref name="server"/> (the recorded authority, host:port). A record from an older version has no server:
+    /// the session is then unpinned (<see cref="ServerNotRecorded"/>).
+    /// </summary>
+    public static SendSession Resume(SendPlan locked, string? server, Func<Guid>? newKey = null) =>
+        new(locked, ServerUri(server), newKey ?? Guid.NewGuid);
+
+    /// <summary>The session a dialog opens for <paramref name="request"/>: resumed (locked and pinned) or fresh.</summary>
+    public static SendSession For(SendRequest request) => request.LockedPlan is { } locked
+        ? Resume(locked, request.Server)
+        : new SendSession(request.SpoolId, request.PdfPath);
+
+    private static Uri? ServerUri(string? authority) =>
+        !string.IsNullOrEmpty(authority) && Uri.TryCreate("http://" + authority + "/", UriKind.Absolute, out var u) ? u : null;
 
     public Guid SpoolId { get; }
     public string? PdfPath { get; }
@@ -121,6 +141,10 @@ public sealed class SendSession
     public bool CancelKeepsDocumentFor(SendKind kind) => PdfPath != null && (FieldsLocked || kind == SendKind.Suspect);
     /// <summary>Locked from a record on disk (a previous run), not by a failure in this dialog.</summary>
     public bool Resumed { get; }
+    /// <summary>Resumed from a record written before the server was recorded: nothing pins it to one server.</summary>
+    public bool ServerNotRecorded => Resumed && LockedPlan != null && LockedServer == null;
+    /// <summary>The note a resumed dialog shows.</summary>
+    public string ResumeText => ServerNotRecorded ? ResumeNote + " " + ServerNotRecordedNote : ResumeNote;
     public bool InFlight => _inFlight != null;
     public Job? Accepted { get; private set; }
     public SendPlan? AcceptedPlan { get; private set; }

@@ -13,14 +13,10 @@ namespace LANFax.Core;
 /// </summary>
 public sealed class SpoolWatcher(string spoolDir) : IDisposable
 {
-    public static readonly TimeSpan MinAge = TimeSpan.FromSeconds(1);
-    public static readonly TimeSpan SizeRecheck = TimeSpan.FromMilliseconds(500);
     /// <summary>The same <see cref="Error"/> reason is raised at most once per this window.</summary>
     public static readonly TimeSpan ErrorRepeatAfter = TimeSpan.FromSeconds(60);
     /// <summary>After this many consecutive move failures, retry only on the 2 s poll (not every 250 ms).</summary>
     public const int FastRetryLimit = 5;
-    private static readonly TimeSpan RetryEvery = TimeSpan.FromMilliseconds(250);
-    private static readonly TimeSpan PollEvery = TimeSpan.FromSeconds(2);
     /// <summary>Bytes compared again before the move, to catch a file rewritten or truncated in place after the check.</summary>
     private const int HeaderBytes = 1024;
     private static readonly byte[] EofMarker = "%%EOF"u8.ToArray();
@@ -49,6 +45,15 @@ public sealed class SpoolWatcher(string spoolDir) : IDisposable
     /// PDF (a truncated document must not be faxed).
     /// </summary>
     public TimeSpan EofWait { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>How long print.pdf must have existed before it is checked. Set before <see cref="Start"/> (tests shorten the timings).</summary>
+    public TimeSpan MinAge { get; set; } = TimeSpan.FromSeconds(1);
+    /// <summary>The gap between the two size checks that must agree.</summary>
+    public TimeSpan SizeRecheck { get; set; } = TimeSpan.FromMilliseconds(500);
+    /// <summary>The wait before checking again while the file is too young, locked, growing or failing to move.</summary>
+    public TimeSpan RetryEvery { get; set; } = TimeSpan.FromMilliseconds(250);
+    /// <summary>The polling fallback beside the FileSystemWatcher (and the only retry after <see cref="FastRetryLimit"/> move failures).</summary>
+    public TimeSpan PollEvery { get; set; } = TimeSpan.FromSeconds(2);
 
     /// <summary>Test hook: runs after the checks, right before the size and header are compared again and the file moves.</summary>
     internal Action? BeforeMove { get; set; }
@@ -220,7 +225,7 @@ public sealed class SpoolWatcher(string spoolDir) : IDisposable
                     Report($"cannot move print.pdf into {destDir}: {e.Message}", e, rateLimited: true);
                     if (n >= FastRetryLimit)
                     {
-                        if (n == FastRetryLimit) Log?.Invoke($"spool: {n} move failures in a row; retrying on the 2 s poll only");
+                        if (n == FastRetryLimit) Log?.Invoke($"spool: {n} move failures in a row; retrying on the {PollEvery.TotalSeconds:0.#} s poll only");
                         return;
                     }
                     await Task.Delay(RetryEvery, ct);

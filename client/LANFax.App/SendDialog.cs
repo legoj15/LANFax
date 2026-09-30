@@ -66,7 +66,7 @@ internal sealed class SendDialog : Form
         _executor = new SendExecutor(api, cfg, request.PdfPath != null ? journal : null,
             (m, e) => { if (e == null) FileLog.Info(m); else FileLog.Error(m, e); });
         Request = request;
-        Session = request.LockedPlan is { } locked ? SendSession.Resume(locked) : new SendSession(request.SpoolId, request.PdfPath);
+        Session = SendSession.For(request);
         var pdfPath = request.PdfPath;
 
         BaseTitle = pdfPath == null ? "Send a test page" : request.Kind switch
@@ -133,7 +133,7 @@ internal sealed class SendDialog : Form
             _number.Input.Text = plan.Number;
             _subject.Text = plan.Subject ?? "";
             _testPage.Checked = plan.Route == SendRoute.TestPage;
-            _lockNote.Text = SendSession.ResumeNote;
+            _lockNote.Text = Session.ResumeText; // notes a record from an older version that did not pin the server
             ApplyLock();
         }
         else
@@ -161,7 +161,9 @@ internal sealed class SendDialog : Form
     private async Task DescribeDocumentAsync(string pdfPath)
     {
         var text = await PdfInfo.DescribeFileAsync(pdfPath); // off the UI thread; resumes on it
-        if (!IsDisposed) _document.Text = "PDF, " + text;
+        // Shared PC: every user prints into the one spool, so say when someone else printed this.
+        var other = await Task.Run(() => PrintedBy.ForCurrentUser().OtherOwner(pdfPath));
+        if (!IsDisposed) _document.Text = PrintedBy.DocumentLine(text, other);
     }
 
     private void UpdateEnabled() => _send.Enabled =

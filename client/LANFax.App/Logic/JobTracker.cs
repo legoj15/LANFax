@@ -22,14 +22,16 @@ public static class SendState
 
 /// <summary>
 /// The record for one spooled PDF. <see cref="State"/> is a <see cref="SendState"/> or, once the server reports it,
-/// a terminal server state (sent, failed, cancelled). Older records may hold another server state (e.g. queued).
+/// a terminal server state (sent, failed, cancelled). Older records may hold a live server state (queued, dialing),
+/// read as <see cref="SendState.Accepted"/>. <see cref="Server"/> is the authority (host:port) the key was sent to;
+/// null in records written before it was recorded.
 /// </summary>
 public sealed record TrackedJob(Guid SpoolId, string? ServerId, string Number, string? Subject, bool KeepLocalCopies,
-    string State, string? IdempotencyKey = null, bool TestPage = false)
+    string State, string? IdempotencyKey = null, bool TestPage = false, string? Server = null)
 {
     [JsonIgnore] public bool IsTerminal => State is "sent" or "failed" or "cancelled" or "received";
-    [JsonIgnore] public bool IsPollable => ServerId != null && !IsTerminal && State is not (SendState.Unknown
-        or SendState.Sending or SendState.Uncertain or SendState.Draft);
+    /// <summary>Only an accepted job with a server id is polled; any other or unknown state is never asked about.</summary>
+    [JsonIgnore] public bool IsPollable => ServerId != null && State == SendState.Accepted;
 }
 
 public enum TerminalOutcome { Removed, MovedToSent, KeptForRetry }
@@ -48,9 +50,14 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
     private static readonly JsonSerializerOptions Opts = new(JsonSerializerDefaults.Web);
     /// <summary>A record another process holds open (antivirus, backup) is read again this many times before giving up.</summary>
     private const int ReadRetries = 3;
-    private static readonly TimeSpan ReadRetryDelay = TimeSpan.FromMilliseconds(200);
 
-    private enum LoadStatus { Ok, BadContent, Unavailable }
+    /// <summary>The wait between reads of a record another process holds open (tests set it to zero).</summary>
+    public TimeSpan ReadRetryDelay { get; init; } = TimeSpan.FromMilliseconds(200);
+    /// <summary>Reads a record's text (tests wrap it to hold, release or delete the file at an exact moment).</summary>
+    public Func<string, string> ReadAllText { get; init; } = File.ReadAllText;
+
+    /// <summary>Ok, not a record (BadContent), held by another process (Unavailable), or gone since it was listed (Missing).</summary>
+    private enum LoadStatus { Ok, BadContent, Unavailable, Missing }
     private readonly Dictionary<string, TrackedJob> _byServerId = new(StringComparer.Ordinal);
 
     public string JobsDir => Path.Combine(spoolDir, "jobs");
@@ -63,16 +70,21 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
     public IReadOnlyList<TrackedJob> Pending => _byServerId.Values.Where(t => t.IsPollable).ToList();
 
     /// <summary>
-    /// Persists <c>sending</c> with the key and plan. Throws (IOException, UnauthorizedAccessException) when the
-    /// record cannot be written: the caller must then not send.
+    /// Persists <c>sending</c> with the key, plan and the server it goes to (<paramref name="server"/>, the endpoint
+    /// snapshot). Throws (IOException, UnauthorizedAccessException) when the record cannot be written: the caller must
+    /// then not send.
     /// </summary>
-    public void BeginSend(SendPlan plan) => Write(FromPlan(plan, SendState.Sending, plan.IdempotencyKey));
+    public void BeginSend(SendPlan plan, Uri? server = null) =>
+        Write(FromPlan(plan, SendState.Sending, plan.IdempotencyKey) with { Server = server?.Authority });
 
-    /// <summary>After a failed attempt: <c>uncertain</c> with the locked plan and key, else <c>draft</c> without a key.</summary>
+    /// <summary>
+    /// After a failed attempt: <c>uncertain</c> with the locked plan, key and pinned server
+    /// (<see cref="SendSession.LockedServer"/>), else <c>draft</c> without a key.
+    /// </summary>
     public void RecordFailure(SendSession session, SendPlan attempted)
     {
         var t = session.LockedPlan is { } locked
-            ? FromPlan(locked, SendState.Uncertain, locked.IdempotencyKey)
+            ? FromPlan(locked, SendState.Uncertain, locked.IdempotencyKey) with { Server = session.LockedServer?.Authority }
             : FromPlan(attempted, SendState.Draft, null);
         Save(t);
     }
@@ -144,6 +156,12 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
             if (!Guid.TryParse(Path.GetFileNameWithoutExtension(json), out var id)) continue;
             var pdf = PdfPath(id);
             var (t, status) = Load(json);
+            if (status == LoadStatus.Missing)
+            {
+                // Removed since it was listed (a Discard, a finished job): no record, so its PDF, if any, is new.
+                log?.Invoke($"record {id} disappeared before it was read; treated as no record");
+                continue;
+            }
             if (status == LoadStatus.Unavailable)
             {
                 // Held open by another process: not corrupt. Leave it for the next start rather than guess.
@@ -176,7 +194,7 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
             switch (t.State)
             {
                 case SendState.Sending or SendState.Uncertain when !string.IsNullOrEmpty(t.IdempotencyKey):
-                    offers.Add(new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Resume, ToPlan(t, pdf)));
+                    offers.Add(new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Resume, ToPlan(t, pdf), t.Server));
                     break;
                 case SendState.Draft:
                     offers.Add(new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Draft));
@@ -184,10 +202,13 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
                 case "failed":
                     offers.Add(new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Retry));
                     break;
+                case SendState.Accepted when t.IsPollable:
+                    _byServerId[t.ServerId!] = t;
+                    break;
                 default:
-                    if (t.IsPollable) _byServerId[t.ServerId!] = t;
-                    // unknown, a sending record without a key, or an accepted one without a server id.
-                    else offers.Add(new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Suspect));
+                    // unknown, a sending record without a key, an accepted one without a server id, or a state this
+                    // version does not know: it may have been sent, so the user decides.
+                    offers.Add(new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Suspect));
                     break;
             }
         }
@@ -302,10 +323,10 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
         string text;
         for (int attempt = 0; ; attempt++)
         {
-            try { text = File.ReadAllText(path); break; }
+            try { text = ReadAllText(path); break; }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
-                if (e is FileNotFoundException or DirectoryNotFoundException) return (null, LoadStatus.Unavailable);
+                if (e is FileNotFoundException or DirectoryNotFoundException) return (null, LoadStatus.Missing);
                 if (attempt >= ReadRetries)
                 {
                     log?.Invoke($"tracker record {Path.GetFileName(path)} unreadable after {ReadRetries} retries ({e.GetType().Name}: {e.Message})");
@@ -317,7 +338,10 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
         try
         {
             var t = JsonSerializer.Deserialize<TrackedJob>(text, Opts);
-            return t is { Number: not null, State: not null } ? (t, LoadStatus.Ok) : (null, LoadStatus.BadContent);
+            if (t is not { Number: not null, State: not null }) return (null, LoadStatus.BadContent);
+            // Older versions stored the server's live state; with a server id that is an accepted job.
+            if (t.ServerId != null && t.State is "queued" or "dialing") t = t with { State = SendState.Accepted };
+            return (t, LoadStatus.Ok);
         }
         catch (Exception e) when (e is JsonException or NotSupportedException)
         {

@@ -177,19 +177,28 @@ public sealed class SendExecutorTests : IDisposable
         Assert.False(session.FieldsLocked);
     }
 
-    [Fact]
-    public async Task A_config_error_thrown_after_Started_is_still_not_sent()
+    [Theory]
+    [InlineData("tok en")]
+    [InlineData("t\u00f6ken")]
+    [InlineData("tok\"en")]
+    public async Task A_token_that_cannot_be_a_bearer_parameter_is_not_sent_never_uncertain(string token)
     {
+        // Real FaxApi: the endpoint snapshot refuses the token before Started, so nothing goes out and nothing locks.
         var (id, pdf) = Spooled();
-        var api = new FakeApi(() => throw new FaxApiConfigException("bad server"));
+        var cfg = new ClientConfig { Server = "127.0.0.1", Port = 8081, Token = token };
+        var handler = new StubHandler(_ => Json201());
+        using var http = new HttpClient(handler);
         var session = new SendSession(id, pdf);
         var key = session.IdempotencyKey;
-        var r = await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, false, false));
+        var r = await new SendExecutor(new FaxApi(cfg, http), cfg, new JobTracker(_dir))
+            .RunAsync(session, session.Build("5552345678", null, false, false));
         Assert.Equal(SendAttemptStatus.NotSent, r.Status);
+        Assert.Contains(ClientConfig.TokenRule, r.Message);
+        Assert.Empty(handler.Requests);
+        Assert.Equal(0, session.Attempts);
         Assert.False(session.FieldsLocked);
-        Assert.False(session.InFlight);
         Assert.Equal(key, session.IdempotencyKey);
-        Assert.StartsWith("draft", RecordAt(id));
+        Assert.Null(RecordAt(id));
     }
 
     // ---- review finding 2: the endpoint is frozen when the send starts ----
@@ -248,6 +257,69 @@ public sealed class SendExecutorTests : IDisposable
         var third = await exec.RunAsync(session, session.Build("5552345678", null, false, false));
         Assert.Equal(SendAttemptStatus.Accepted, third.Status);
         Assert.Equal("tok-new", api.Endpoints[^1].Token);
+    }
+
+    // ---- the server pin survives a restart ----
+
+    [Fact]
+    public async Task A_resumed_send_is_not_sent_to_a_server_other_than_the_recorded_one()
+    {
+        var (id, pdf) = Spooled();
+        var cfg = new ClientConfig { Server = "127.0.0.1", Port = 8081, Token = "tok-a" };
+        var first = new FakeApi(() => throw new FaxApiException(0, "timeout"));
+        var s1 = new SendSession(id, pdf);
+        Assert.Equal(AttemptOutcome.Uncertain,
+            (await new SendExecutor(first, cfg, new JobTracker(_dir)).RunAsync(s1, s1.Build("5552345678", null, false, false))).Outcome);
+
+        // Restart with Settings now pointing at another fax server.
+        var req = Assert.Single(new JobTracker(_dir).Scan());
+        Assert.Equal(SendKind.Resume, req.Kind);
+        Assert.Equal("127.0.0.1:8081", req.Server);
+        var s2 = SendSession.For(req);
+        var moved = new ClientConfig { Server = "10.9.9.9", Port = 8081, Token = "tok-a" };
+        var api = new FakeApi(() => J("lf9"));
+        var exec = new SendExecutor(api, moved, new JobTracker(_dir));
+        var r = await exec.RunAsync(s2, s2.Build("", null, false, false));
+        Assert.Equal(SendAttemptStatus.NotSent, r.Status);
+        Assert.Contains("127.0.0.1:8081", r.Message);
+        Assert.Contains("10.9.9.9:8081", r.Message);
+        Assert.Empty(api.Calls);
+        Assert.StartsWith("uncertain", RecordAt(id));
+
+        moved.Server = "127.0.0.1"; // back on the recorded server it goes out, same key
+        Assert.Equal(SendAttemptStatus.Accepted, (await exec.RunAsync(s2, s2.Build("", null, false, false))).Status);
+        Assert.Equal($"post 15552345678  {req.LockedPlan!.IdempotencyKey}", Assert.Single(api.Calls));
+    }
+
+    [Fact]
+    public async Task A_record_from_an_older_version_without_a_server_resumes_unpinned()
+    {
+        var (id, pdf) = Spooled();
+        File.WriteAllText(Path.Combine(Jobs, id + ".json"),
+            $$"""{"spoolId":"{{id}}","serverId":null,"number":"15552345678","subject":null,"keepLocalCopies":false,"state":"uncertain","idempotencyKey":"old-key-0123456789"}""");
+        var req = Assert.Single(new JobTracker(_dir).Scan());
+        Assert.Null(req.Server);
+        var s = SendSession.For(req);
+        Assert.Null(s.LockedServer);
+        Assert.True(s.ServerNotRecorded);
+        var api = new FakeApi();
+        var r = await new SendExecutor(api, new ClientConfig { Server = "10.9.9.9", Port = 8081, Token = "t" }, new JobTracker(_dir))
+            .RunAsync(s, s.Build("", null, false, false));
+        Assert.Equal(SendAttemptStatus.Accepted, r.Status);
+        Assert.Equal("post 15552345678  old-key-0123456789", Assert.Single(api.Calls));
+    }
+
+    [Fact]
+    public async Task The_sending_record_names_the_server_it_goes_to()
+    {
+        var (id, pdf) = Spooled();
+        var api = new FakeApi();
+        string? server = null;
+        api.OnCall = () => server = JsonDocument.Parse(File.ReadAllText(Path.Combine(Jobs, id + ".json"))).RootElement
+            .GetProperty("server").GetString();
+        var session = new SendSession(id, pdf);
+        await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, false, false));
+        Assert.Equal("127.0.0.1:8080", server);
     }
 
     [Fact]

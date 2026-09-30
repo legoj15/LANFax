@@ -11,9 +11,19 @@ public class SpoolWatcherTests : IDisposable
 
     public void Dispose() { try { Directory.Delete(_dir, true); } catch { } }
 
+    /// <summary>
+    /// Production timings scaled down about five times (1 s age, 500 ms recheck, 250 ms retry, 2 s poll): the same
+    /// sequence of checks without the real sleeps.
+    /// </summary>
     private SpoolWatcher Make()
     {
-        var w = new SpoolWatcher(_dir);
+        var w = new SpoolWatcher(_dir)
+        {
+            MinAge = TimeSpan.FromMilliseconds(200),
+            SizeRecheck = TimeSpan.FromMilliseconds(100),
+            RetryEvery = TimeSpan.FromMilliseconds(50),
+            PollEvery = TimeSpan.FromMilliseconds(400),
+        };
         w.NewPrintJob += (id, p) => { lock (_events) _events.Add((id, p, DateTime.UtcNow)); };
         w.Error += (r, e) => { lock (_errors) _errors.Add((r, e)); };
         return w;
@@ -53,7 +63,7 @@ public class SpoolWatcherTests : IDisposable
         Assert.Equal(Path.Combine(_dir, "jobs", id.ToString() + ".pdf"), path);
         Assert.Equal(pdf, File.ReadAllBytes(path));
         Assert.False(File.Exists(src));
-        await Task.Delay(3000);
+        await Task.Delay(1000); // two more polls: nothing new
         Assert.Equal(1, Count);
         Assert.Equal(0, ErrorCount);
     }
@@ -72,16 +82,16 @@ public class SpoolWatcherTests : IDisposable
             {
                 fs.Write(new byte[1000]);
                 fs.Flush();
-                await Task.Delay(500);
+                await Task.Delay(150);
             }
             fs.Write(Encoding.ASCII.GetBytes("%%EOF\n"));
-            Assert.Equal(0, Count); // still locked after 3 s
+            Assert.Equal(0, Count); // still locked after several age waits and rechecks
             release = DateTime.UtcNow;
         }
         await WaitFor(() => Count == 1);
         Assert.True(_events[0].at >= release, "raised before the writer released the file");
         Assert.Equal(6011, new FileInfo(_events[0].path).Length);
-        await Task.Delay(2500);
+        await Task.Delay(1000);
         Assert.Equal(1, Count);
     }
 
@@ -107,9 +117,9 @@ public class SpoolWatcherTests : IDisposable
         w.Start();
         var src = Path.Combine(_dir, "print.pdf");
         File.WriteAllBytes(src, Pdf());
-        await Task.Delay(300);
+        await Task.Delay(50); // inside the 200 ms age wait
         File.Delete(src);
-        await Task.Delay(2500);
+        await Task.Delay(1000);
         Assert.Equal(0, Count);
         File.WriteAllBytes(src, Pdf(20));
         await WaitFor(() => Count == 1);
@@ -154,7 +164,7 @@ public class SpoolWatcherTests : IDisposable
         File.WriteAllText(w.JobsDir, "a file where the jobs dir should be");
         File.WriteAllBytes(w.PrintPath, Pdf());
         await WaitFor(() => ErrorCount >= 1);
-        await Task.Delay(6000); // several more failed attempts: still one Error (rate-limited per reason)
+        await Task.Delay(1500); // the fast retries and several polls: still one Error (rate-limited per reason)
         Assert.Equal(1, ErrorCount);
         Assert.Equal(0, Count);
         Assert.True(File.Exists(w.PrintPath)); // the job is not lost
@@ -171,11 +181,12 @@ public class SpoolWatcherTests : IDisposable
     public async Task StopWhileAJobIsBeingProcessedLeavesItAlone()
     {
         var w = Make();
+        w.MinAge = TimeSpan.FromSeconds(1); // a wide window to stop inside
         w.Start();
         File.WriteAllBytes(w.PrintPath, Pdf());
-        await Task.Delay(700); // inside the 1 s age wait / size recheck
+        await Task.Delay(300); // inside the age wait
         w.Stop();
-        await Task.Delay(2500);
+        await Task.Delay(1500);
         Assert.Equal(0, Count);
         Assert.Equal(0, ErrorCount);
         Assert.True(File.Exists(w.PrintPath));
@@ -213,11 +224,11 @@ public class SpoolWatcherTests : IDisposable
     public async Task FileWithoutEofWaitsThenIsTreatedAsNotAPdf()
     {
         using var w = Make();
-        w.EofWait = TimeSpan.FromSeconds(2);
+        w.EofWait = TimeSpan.FromMilliseconds(800);
         w.Start();
         var truncated = Encoding.ASCII.GetBytes("%PDF-1.7\n1 0 obj << /Type /Catalog >> endobj\n");
         File.WriteAllBytes(w.PrintPath, truncated);
-        await Task.Delay(2500); // stable and unlocked, but not complete yet: still waiting
+        await Task.Delay(600); // stable and unlocked, but not complete yet: still waiting
         Assert.True(File.Exists(w.PrintPath));
         Assert.Equal(0, ErrorCount);
         await WaitFor(() => ErrorCount >= 1);
@@ -234,7 +245,7 @@ public class SpoolWatcherTests : IDisposable
         w.EofWait = TimeSpan.FromSeconds(10);
         w.Start();
         File.WriteAllBytes(w.PrintPath, Encoding.ASCII.GetBytes("%PDF-1.7\npartial"));
-        await Task.Delay(2500);
+        await Task.Delay(700); // past the age wait and recheck: waiting for %%EOF
         Assert.Equal(0, Count);
         File.AppendAllText(w.PrintPath, "\n%%EOF\n");
         await WaitFor(() => Count == 1);

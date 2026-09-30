@@ -85,9 +85,21 @@ public sealed class PrinterSetup(IPrinterKeyReader reader, Func<ProcessStartInfo
     /// <summary>The script the csproj copies to install\ beside the exe (and the installer lays down there too).</summary>
     public static string ScriptPath => Path.Combine(AppContext.BaseDirectory, "install", "Install-LANFaxPrinter.ps1");
 
-    /// <summary>A trailing backslash would escape the closing quote (<c>"C:\dir\"</c>), so it is trimmed.</summary>
+    /// <summary>
+    /// One command-line string for the elevated powershell.exe. A quote inside a value would end its argument early,
+    /// so it is refused (<see cref="ArgumentException"/>; <c>ClientConfig.Validate</c> refuses it too). A trailing
+    /// backslash would escape the closing quote (<c>"C:\dir\"</c>): the spool dir's is trimmed, and any that remain
+    /// (a root such as <c>D:\</c>) are doubled, which argv parsing turns back into one.
+    /// </summary>
     public static string BuildArguments(string script, string spoolDir, string printerName) =>
-        $"-NoProfile -ExecutionPolicy Bypass -File \"{script}\" -SpoolDir \"{TrimSlashes(spoolDir)}\" -PrinterName \"{printerName}\"";
+        $"-NoProfile -ExecutionPolicy Bypass -File {Quote(script)} -SpoolDir {Quote(TrimSlashes(spoolDir))} -PrinterName {Quote(printerName)}";
+
+    private static string Quote(string value)
+    {
+        if (value.Contains('"')) throw new ArgumentException($"\"{value}\" contains a quote (\"), which cannot be passed to the install script.");
+        int trailing = value.Length - value.TrimEnd('\\').Length;
+        return "\"" + value + new string('\\', trailing) + "\"";
+    }
 
     private static string TrimSlashes(string p)
     {
@@ -103,9 +115,12 @@ public sealed class PrinterSetup(IPrinterKeyReader reader, Func<ProcessStartInfo
     {
         script ??= ScriptPath;
         if (!File.Exists(script)) return "Install script not found: " + script;
+        string args;
+        try { args = BuildArguments(script, spoolDir, printerName); }
+        catch (ArgumentException e) { return "Cannot install the printer: " + e.Message; }
         try
         {
-            await _run(new ProcessStartInfo("powershell.exe", BuildArguments(script, spoolDir, printerName))
+            await _run(new ProcessStartInfo("powershell.exe", args)
             {
                 UseShellExecute = true,
                 Verb = "runas",

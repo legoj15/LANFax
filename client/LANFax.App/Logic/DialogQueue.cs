@@ -60,8 +60,10 @@ public enum SendKind
 }
 
 /// <summary>What a send dialog is opened for: a spooled PDF or, with no PDF, a test page.</summary>
+/// <param name="Server">For <see cref="SendKind.Resume"/>: the authority (host:port) the stored key went to, null when
+/// the record predates it.</param>
 public sealed record SendRequest(Guid SpoolId, string? PdfPath, string? Number = null, string? Subject = null,
-    SendKind Kind = SendKind.New, SendPlan? LockedPlan = null)
+    SendKind Kind = SendKind.New, SendPlan? LockedPlan = null, string? Server = null)
 {
     public bool NeedsConfirmation => Kind == SendKind.Suspect;
 }

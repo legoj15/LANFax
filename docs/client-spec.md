@@ -42,10 +42,11 @@ client/
     Program.cs                      machine-wide single-instance mutex (Global\LANFax.Tray, see "One active session"); tray icon; no console
     TrayContext.cs                  NotifyIcon + menu: Open, Send a test..., Receive a test (arm 20 min), Settings, Install printer, Exit
     SendDialog.cs                   non-modal; number, subject, page count, Send / Cancel; "Send test page instead" checkbox
-    Logic/                          testable plain classes: SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer, InstanceGuard, ...
+    Logic/                          testable plain classes: SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer + InboundCatchUp, InstanceGuard, PrintedBy, ...
     MainForm.cs                     (phase 3, NOT YET WRITTEN) status header, arm card with countdown, jobs grid, inbox grid, open PDF
     SettingsDialog.cs               server host/ip, port, token, "Clear token", "Test connection"
-  LANFax.Tests/                     xunit: Core only (no UI)
+  LANFax.Tests/                     xunit: Core (config, FaxApi, EventStream, SpoolWatcher, numbers) + install/Inno script checks
+  LANFax.App.Tests/                 xunit: App Logic classes (no UI; the WinForms files are not tested)
   install/
     Install-LANFaxPrinter.ps1       elevated: Add-PrinterPort -Name <spool path>; Add-Printer -Name "LAN Fax" -DriverName "Microsoft Print To PDF" -PortName <spool path>, or Set-Printer -PortName <spool path> when the printer exists on another port; idempotent
     Uninstall-LANFaxPrinter.ps1     removes printer and port; leaves %ProgramData%\LANFax
@@ -88,6 +89,9 @@ client/
   if they differ the file is checked again from the start. Otherwise move it
   to `spool\jobs\<guid>.pdf` immediately (frees the port path for the next
   job) and raise `NewPrintJob(guid, path)`.
+- The timings (`MinAge` 1 s, `SizeRecheck` 500 ms, `RetryEvery` 250 ms,
+  `PollEvery` 2 s, `EofWait` 10 s) are instance properties so the tests run the
+  same checks about five times faster.
 - A failed move (e.g. `jobs\` unwritable) raises `Error(reason, exception)`
   at most once per distinct reason per 60 s; the file stays at `print.pdf`.
   After 5 consecutive failures the watcher retries only on the 2 s poll.
@@ -116,6 +120,9 @@ client/
    line shows "N page(s), X KB" (`PdfInfo`: largest `/Count` inside an object
    with `/Type /Pages`, so outline counts are ignored, else the number of
    `/Type /Page` objects), computed on the thread pool after the dialog opens.
+   Shared PC: when the spooled file's NTFS owner is another Windows user (not
+   this user, a group this user is in, or SYSTEM/LOCAL/NETWORK SERVICE) the
+   line ends ". Printed by <DOMAIN\user>" (`PrintedBy`).
 3. Subject optional. "Send test page instead of this document" checkbox
    turns the request into `POST /test/send` and discards the PDF.
 4. `POST /jobs` with `Content-Type: application/pdf`, `X-Fax-To` (the
@@ -135,14 +142,22 @@ client/
    included, goes to the snapshot, so Settings saved mid-retry cannot replay
    the key to another server; Settings also refuse Save while a send is in
    flight ("Wait for the current fax to finish"). A session locked by an
-   uncertain attempt pins that server (`LockedServer`): a later Send while
-   Settings point elsewhere is "not sent" with a message naming both (a new
-   token for the same server is fine). A failure before `Started` is "not
-   sent" and changes nothing; a `FaxApiConfigException` (the URI could not be
-   built) is "not sent" even after `Started`; anything thrown after it is
-   classified by the pure `SendOutcome.Classify` (4xx = rejected, everything
-   else including 3xx, 5xx, status 0, an unreadable 2xx and non-API
-   exceptions = uncertain):
+   uncertain attempt pins that server (`LockedServer`), and the record keeps
+   it (`server`, the host:port authority, written by `BeginSend` and by
+   `RecordFailure`), so the pin survives a restart: `SendSession.Resume`
+   restores it and a later Send while Settings point elsewhere is "not sent"
+   with a message naming both servers, and no request (a new token for the
+   same server is fine). A record from an older version has no `server`: it
+   resumes unpinned and the dialog adds "(It was sent from an earlier version;
+   server not recorded.)". The snapshot also refuses a token that is not a
+   valid HTTP Bearer parameter (`ClientConfig.TokenError`: visible ASCII, no
+   space, quote or backslash) with `FaxApiConfigException`. A failure before
+   `Started` is "not sent" and changes nothing; a `FaxApiConfigException` is
+   "not sent" even after `Started` (defensive: the snapshot throws it first);
+   anything thrown after it is classified by the pure `SendOutcome.Classify`
+   (4xx except 409 = rejected; everything else including 409, 3xx, 5xx,
+   status 0, an unreadable 2xx and non-API exceptions = uncertain; faxd sends
+   409 when the key already holds a job for another number, so a job exists):
    - uncertain: the plan is frozen and the number, subject and test-page box
      become read-only with "The server may already have this job; fields are
      locked. Send will not create a duplicate. Cancel keeps the document (see
@@ -151,7 +166,7 @@ client/
      rejection.
    - rejected (a 4xx): fields stay (or become) editable and the key rotates.
      faxd checks the Idempotency-Key before it validates or reads the body,
-     so any 4xx except 401 proves no job exists under the key: a LOCKED
+     so any 4xx except 401 (and 409, which is uncertain) proves no job exists under the key: a LOCKED
      session (in this run or resumed from disk) unlocks, rotates the key and
      the record becomes `draft`. A 401 fails before the key lookup, so a
      locked session stays locked with the same key.
@@ -162,14 +177,17 @@ client/
    throws `InvalidOperationException`.
 6. Every spooled document's state is persisted by `JobTracker` in
    `spool\jobs\<guid>.json` beside the PDF (spool id, server job id,
-   Idempotency-Key, number, subject, test-page flag, keepLocalCopies, state),
+   Idempotency-Key, number, subject, test-page flag, keepLocalCopies, state,
+   server authority),
    written to a temp file, `Flush(true)`, then renamed over the record:
    - `sending`: written before the first byte of every attempt, with the key
      and full plan. If it cannot be written, nothing is sent.
    - `uncertain`: after an uncertain failure (same key, same plan).
    - `draft`: after a definite rejection (plan editable, no key), including
      one that unlocks a locked session.
-   - `accepted`: the server took it; `serverId` set. The PDF stays until a
+   - `accepted`: the server took it; `serverId` set. Only these are polled
+     (`TrackedJob.IsPollable` is `State == accepted` with a server id; an older
+     record's `queued`/`dialing` with a server id loads as `accepted`). The PDF stays until a
      terminal state arrives by `JobChanged` or by the fallback poll
      (`GET /jobs/<id>` at startup, on every stream (re)connect and every
      60 s): `sent`/`cancelled` delete it (or move it to `spool\sent\` with
@@ -178,7 +196,9 @@ client/
      prefilled).
    - `unknown`: the poll got 404 for a tracked job (server database reset).
      Polling stops and the PDF is offered with the "may already have been
-     sent" warning.
+     sent" warning. Saving Settings with another server has the same effect
+     for every accepted document still pending: the new server answers 404,
+     so each is re-offered with that warning.
    On accept the balloon says "Fax to <number> queued" using the server's
    `to_number`, or "Server queued this fax to X (you entered Y)". The tray's
    own test page has no PDF and is not persisted; a print job sent as a test
@@ -201,13 +221,16 @@ client/
    - `draft`: opens unlocked with number and subject prefilled.
    - `failed`: opens as a retry, prefilled, fresh key.
    - `unknown`, a corrupt json (renamed to `<guid>.json.bad`), a `sending`
-     record without a key, or an accepted record without `serverId`: opens
+     record without a key, an accepted record without `serverId`, or any
+     state this version does not know: opens
      with the "This document may already have been sent" warning; Send stays
      disabled until the user ticks "Send it anyway", then uses a fresh key.
-   - a guid-named PDF with no json: offered as unsent, as before.
+   - a guid-named PDF with no json: offered as unsent, as before. So is one
+     whose json was listed but is gone when read (FileNotFound after the
+     enumeration: a Discard or finished job raced the scan).
    `accepted` records are polled again; terminal leftovers are finished; a
    record whose PDF is gone is removed. A json that cannot be opened (held by
-   antivirus or backup) is read again 3 times 200 ms apart; if it stays
+   antivirus or backup) is read again 3 times `ReadRetryDelay` (200 ms) apart; if it stays
    unavailable it is skipped for this scan (logged, not renamed, its PDF not
    offered) and handled at the next start. Only content that is not a record
    becomes `.bad`. A `<guid>.json.tmp` with no `<guid>.json` (crash between the
@@ -233,6 +256,16 @@ client/
    `FaxApi`, `EventStream` and `SpoolWatcher` `Log` go to the app log.
 11. The dialog queue opens the next dialog even if one fails to open (that
    document goes to "Unsent documents (N)...") or its close handler throws.
+## State vocabularies (where each transition is decided)
+
+| Vocabulary | Values | Decided in |
+|---|---|---|
+| `SendState` (record `state`, `JobTracker.cs`) | `sending`, `uncertain`, `draft`, `accepted`, `unknown`, plus the server's terminal `sent`/`failed`/`cancelled` | `BeginSend` (sending), `RecordFailure` (uncertain if the session is locked, else draft), `Track` (accepted), `MarkUnknown` (404), `OnJobUpdate` (terminal) |
+| `SendKind` (why a dialog opens, `DialogQueue.cs`) | `New`, `Retry`, `Draft`, `Resume`, `Suspect` | `JobTracker.Scan` at startup (by record state), `RequestFor` (failed -> Retry, unknown -> Suspect), a fresh print job (New) |
+| `AttemptOutcome` (`SendSession.cs`) | `NotSent`, `Rejected`, `Uncertain` | `SendOutcome.Classify` via `SendSession.Failed`: NotSent before `Started` or on `FaxApiConfigException`; 4xx except 409 = Rejected; the rest Uncertain. A locked session unlocks only on Rejected with a status other than 401 |
+| `DialogOutcome` (`SendDialog.cs`) | `Accepted`, `Cancelled`, `Kept`, `Abandoned` | `SendDialog.OnClosing`: user close keeps the document (Kept) when `SendSession.CancelKeepsDocumentFor` says so (locked or Suspect), else Cancelled; app exit/shutdown = Abandoned. `TrayContext.OnSendDialogClosed` acts on it |
+| `OfferCategory` (tray items, `DialogQueue.cs`) | `Unsent`, `Retry` | `TrayContext`: Kept dialogs and dialogs that failed to open -> Unsent; `OnJobChanged` failed -> Retry |
+
 ## Inbound catch-up (phase 2, tray)
 
 - `InboundAnnouncer` decides which received faxes get "Fax received from X":
@@ -244,8 +277,18 @@ client/
   `resync`, the tray calls `GET /jobs?direction=in&state=received&limit=100
   &updated_since=<resync since, else newest seen>` and announces the ids not
   announced yet, oldest first (more than 3 give one summary balloon, "N faxes
-  were received while LANFax was not connected"). With no state at all (first
-  run) the list is taken as a silent baseline.
+  were received while LANFax was not connected"). The first completed
+  catch-up is a silent baseline: `announced.json` keeps an explicit
+  `baselineTaken` flag and `baselineAt` (this machine's UTC time), so an empty
+  inbox on the first run still ends it; an older file with ids or a time
+  counts as taken. `InboundCatchUp` reads "baseline or not" BEFORE the request
+  goes out, so a live `received` event during the first request cannot turn
+  the whole inbox into a summary balloon. faxd lists newest first with no
+  cursor, so a full page (100) is asked again with `limit=1000` (faxd's cap)
+  rather than paged; beyond 1000 only the newest are checked and the skip is
+  logged. A catch-up requested while one runs queues exactly one more run
+  (with the earliest requested `since`), never dropped. Failures, a
+  `FaxApiConfigException` included, are logged; the baseline stays pending.
 
 ## One active session
 
@@ -254,7 +297,10 @@ client/
   in the same session asks the running tray for its "already running"
   balloon (`Local\LANFax.Tray.ShowRunning`); a start in another Windows
   session (fast user switching, RDP) shows "LANFax is already running in
-  another session" and exits. Print jobs from the other session still land in
+  another session" and exits. `InstanceGuard.Acquire` creates the show event
+  the moment it owns the mutex (before the tray is built), and a second start
+  retries the signal for up to 2 s before concluding "another session", so a
+  second launch during startup is not misreported. Print jobs from the other session still land in
   the spool and are offered on the active instance's desktop: on a shared PC
   only one user at a time should be signed in with LANFax.
 
@@ -304,14 +350,24 @@ shared PC cannot read another user's token (the shared directory grants
 Users Modify). Clearing the token deletes the file. Migration: a `token`
 still in the shared file (machine-scope, written by older versions) is
 decrypted, re-protected into the user's `token.bin` and removed from the
-shared file on first load; once a user has `token.bin`, a shared token is
-removed and ignored. Each other user enters the token once. The Settings
-dialog is unchanged.
+shared file on first load; a `token.bin` that does not decrypt for this user
+falls back to that migration. The shared token is removed only once a token
+decrypted here AND is in this user's `token.bin` (never because the file
+merely exists). Each other user enters the token once. The token is trimmed
+on load, on save and in Settings; one that is not a valid Bearer parameter
+("Token must be plain ASCII without spaces") is refused by Settings, dropped
+on load with `LoadError`, and refused by the send snapshot. `config.json` and
+`token.bin` are written to a temp file, flushed to disk, then renamed.
 Default server is the IP, not the hostname, so VPN name resolution never
 matters. Settings dialog has "Test connection" (`GET /status`).
-`ClientConfig.Validate()` checks port 1..65535 and that the server is a bare
-host name or IP (no port, scheme or path) that forms a URI; Settings refuse
-to save (or test) anything it rejects.
+`ClientConfig.Validate()` checks port 1..65535, that the server is a bare
+host name or IP (no port, scheme or path) that forms a URI
+(`EndpointError()`, which the send snapshot uses), and that the printer name
+and spool dir contain no `"` (they are quoted into the elevated install
+command line; `Load` falls back to the default with `LoadError`, and
+`PrinterSetup.BuildArguments` and both scripts' relaunch refuse a quote and
+double trailing backslashes). Settings refuse to save (or test) anything it
+rejects.
 `ClientConfig.Load(path, tokenPath)` never throws: a blank, corrupt or
 unreadable file gives defaults; an unusable port or server falls back to the
 default for that value; a token that is not decryptable for this user is

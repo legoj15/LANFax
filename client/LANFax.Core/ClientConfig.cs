@@ -56,12 +56,34 @@ public sealed class ClientConfig
     /// </summary>
     public string? LoadError { get; private set; }
 
+    /// <summary>What <see cref="TokenError"/> says about a token that cannot be sent (never the token itself).</summary>
+    public const string TokenRule = "Token must be plain ASCII without spaces";
+
+    /// <summary>
+    /// Why <see cref="Server"/>/<see cref="Port"/> cannot form a request URI, or why <see cref="PrinterName"/> or
+    /// <see cref="SpoolDir"/> cannot go into the elevated install command line; null when all can. Never throws.
+    /// </summary>
+    public string? Validate() =>
+        EndpointError() ?? QuoteError("printer name", PrinterName) ?? QuoteError("spool folder", SpoolDir);
+
     /// <summary>Why <see cref="Server"/>/<see cref="Port"/> cannot form a request URI, or null when they can. Never throws.</summary>
-    public string? Validate()
+    public string? EndpointError()
     {
         if (Port is < 1 or > 65535) return $"port {Port} is not between 1 and 65535";
         return ServerError(Server);
     }
+
+    /// <summary>
+    /// Null when <paramref name="token"/> can be sent as an HTTP <c>Bearer</c> parameter (visible ASCII, no quote or
+    /// backslash) or is empty (no token); else <see cref="TokenRule"/>. A token that fails here would make the request
+    /// throw only once it is on its way, so it is refused before anything is sent.
+    /// </summary>
+    public static string? TokenError(string? token) =>
+        string.IsNullOrEmpty(token) || token.All(c => c is > ' ' and <= '~' and not '"' and not '\\') ? null : TokenRule;
+
+    /// <summary>The printer name and spool folder are quoted into one elevated command line: a quote would end the argument.</summary>
+    private static string? QuoteError(string what, string? value) =>
+        value != null && value.Contains('"') ? $"the {what} \"{value}\" contains a quote (\")" : null;
 
     private static string? ServerError(string? server)
     {
@@ -112,14 +134,27 @@ public sealed class ClientConfig
                 else errors.Add($"port {p} is not between 1 and 65535; using {c.Port}");
             }
             if (m.KeepLocalCopies is bool k) c.KeepLocalCopies = k;
-            if (!string.IsNullOrWhiteSpace(m.PrinterName)) c.PrinterName = m.PrinterName;
-            if (!string.IsNullOrWhiteSpace(m.SpoolDir)) c.SpoolDir = m.SpoolDir;
+            if (!string.IsNullOrWhiteSpace(m.PrinterName))
+            {
+                if (QuoteError("printer name", m.PrinterName) is { } err) errors.Add($"{err}; using \"{c.PrinterName}\"");
+                else c.PrinterName = m.PrinterName;
+            }
+            if (!string.IsNullOrWhiteSpace(m.SpoolDir))
+            {
+                if (QuoteError("spool folder", m.SpoolDir) is { } err) errors.Add($"{err}; using {c.SpoolDir}");
+                else c.SpoolDir = m.SpoolDir;
+            }
         }
         c.LoadToken(path, m, tokenPath, errors);
         c.LoadError = errors.Count == 0 ? null : string.Join("; ", errors);
         return c;
     }
 
+    /// <summary>
+    /// The user's own <c>token.bin</c> first; when it is missing or does not decrypt for this user, a machine-scope
+    /// token still in the shared file (older versions) is migrated into it. The shared token is removed only once a
+    /// token decrypted here AND sits in this user's file: an undecryptable user file never costs the only copy.
+    /// </summary>
     private void LoadToken(string path, FileModel? m, string tokenPath, List<string> errors)
     {
         byte[]? userBlob = null;
@@ -128,29 +163,39 @@ public sealed class ClientConfig
         {
             errors.Add($"the saved token could not be read ({e.GetType().Name}); enter it again in Settings");
         }
-        bool userFile = userBlob != null;
+        string? token = null;
+        bool inUserFile = false;
+        string? userError = null;
         if (userBlob != null)
         {
-            try { Token = Encoding.UTF8.GetString(Dpapi.Unprotect(userBlob)); }
+            try { token = Encoding.UTF8.GetString(Dpapi.Unprotect(userBlob)); inUserFile = true; }
             catch (CryptographicException)
             {
-                errors.Add("the saved token could not be decrypted for this Windows user; enter it again in Settings");
+                userError = "the saved token could not be decrypted for this Windows user; enter it again in Settings";
             }
         }
-        else if (!string.IsNullOrEmpty(m?.Token))
+        if (token == null && !string.IsNullOrEmpty(m?.Token))
         {
             // Migration: an older version kept a machine-scope token in the shared file.
-            try { Token = Encoding.UTF8.GetString(Dpapi.Unprotect(Convert.FromBase64String(m.Token))); }
+            try { token = Encoding.UTF8.GetString(Dpapi.Unprotect(Convert.FromBase64String(m.Token))); }
             catch (Exception e) when (e is CryptographicException or FormatException or ArgumentException)
             {
-                errors.Add("the saved token could not be decrypted on this machine; enter it again in Settings");
+                errors.Add(userError ?? "the saved token could not be decrypted on this machine; enter it again in Settings");
                 return; // leave the shared file alone: nothing was moved
             }
-            try { WriteToken(tokenPath, Token); userFile = true; }
+            userError = null;
+            try { WriteToken(tokenPath, token.Trim()); inUserFile = true; }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException or CryptographicException) { /* kept in memory; retried next start */ }
         }
-        // Once this user has their own copy, the shared file must not keep a token any local user could decrypt.
-        if (userFile && m is { Token.Length: > 0 })
+        if (userError != null) errors.Add(userError);
+        if (token != null)
+        {
+            token = token.Trim();
+            if (TokenError(token) is { } bad) errors.Add($"the saved token cannot be used ({bad}); enter it again in Settings");
+            else Token = token.Length == 0 ? null : token;
+        }
+        // Once this user's own file holds a working token, the shared file must not keep one any local user could decrypt.
+        if (token != null && inUserFile && m is { Token.Length: > 0 })
         {
             m.Token = null;
             try { WriteShared(path, m); }
@@ -162,9 +207,11 @@ public sealed class ClientConfig
     /// Writes the shared settings (never the token) to <paramref name="path"/> and the token, protected for the
     /// current Windows user, to <paramref name="tokenPath"/> (deleted when there is none).
     /// </summary>
+    /// <remarks>The token is trimmed first (a pasted token often carries a newline or space).</remarks>
     public void Save(string path, string tokenPath)
     {
-        if (!string.IsNullOrEmpty(Token)) WriteToken(tokenPath, Token);
+        Token = string.IsNullOrWhiteSpace(Token) ? null : Token.Trim();
+        if (Token != null) WriteToken(tokenPath, Token);
         else if (File.Exists(tokenPath)) File.Delete(tokenPath);
         WriteShared(path, new FileModel
         {
@@ -185,7 +232,12 @@ public sealed class ClientConfig
         var tmp = path + ".tmp";
         try
         {
-            File.WriteAllBytes(tmp, bytes);
+            // Flushed to disk before the rename: a power cut after the rename must not leave an empty file.
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                fs.Write(bytes);
+                fs.Flush(flushToDisk: true);
+            }
             File.Move(tmp, path, overwrite: true);
         }
         finally { try { File.Delete(tmp); } catch { } }

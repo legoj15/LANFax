@@ -149,6 +149,123 @@ public class ConfigHardeningTests : IDisposable
         Assert.Contains("token", c.LoadError, StringComparison.OrdinalIgnoreCase);
     }
 
+    // ---- token hygiene: the token must be usable as an HTTP Bearer parameter ----
+
+    [Theory]
+    [InlineData("0123456789abcdef0123456789abcdef", true)]
+    [InlineData("A-b_c.d~e+f/g=", true)]
+    [InlineData("tok en", false)]
+    [InlineData("tok\ten", false)]
+    [InlineData("t\u00f6ken", false)]
+    [InlineData("tok\"en", false)]
+    [InlineData(@"tok\en", false)]
+    [InlineData("", true)] // no token: not this error (requests then go without one)
+    public void Token_rule(string token, bool ok)
+    {
+        Assert.Equal(ok, ClientConfig.TokenError(token) == null);
+        if (!ok) Assert.Equal(ClientConfig.TokenRule, ClientConfig.TokenError(token));
+    }
+
+    [Fact]
+    public void An_unusable_token_is_a_config_error_from_the_endpoint_snapshot()
+    {
+        var e = Assert.Throws<FaxApiConfigException>(() => SendEndpoint.From(new ClientConfig { Server = "h", Token = "a b" }));
+        Assert.Contains(ClientConfig.TokenRule, e.Message);
+        Assert.DoesNotContain("a b", e.Message); // never the token itself
+        Assert.Null(SendEndpoint.From(new ClientConfig { Server = "h", Token = null }).Token); // no token is not a config error
+    }
+
+    [Fact]
+    public void Save_and_load_trim_the_token()
+    {
+        new ClientConfig { Server = "h", Token = "  padded-token \r\n" }.Save(Cfg, Tok);
+        Assert.Equal("padded-token", Encoding.UTF8.GetString(Dpapi.Unprotect(File.ReadAllBytes(Tok))));
+
+        Directory.CreateDirectory(Path.GetDirectoryName(Tok)!);
+        File.WriteAllBytes(Tok, Dpapi.Protect(Encoding.UTF8.GetBytes(" pasted-with-space\n"), DpapiScope.CurrentUser));
+        Assert.Equal("pasted-with-space", ClientConfig.Load(Cfg, Tok).Token);
+    }
+
+    [Fact]
+    public void A_stored_token_that_is_not_usable_is_dropped_with_a_load_error()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(Tok)!);
+        File.WriteAllBytes(Tok, Dpapi.Protect(Encoding.UTF8.GetBytes("two words"), DpapiScope.CurrentUser));
+        var c = ClientConfig.Load(Cfg, Tok);
+        Assert.Null(c.Token);
+        Assert.Contains(ClientConfig.TokenRule, c.LoadError);
+        Assert.DoesNotContain("two words", c.LoadError);
+    }
+
+    // ---- migration is gated on a token that actually decrypted ----
+
+    [Fact]
+    public void A_shared_token_is_kept_when_no_token_could_be_decrypted()
+    {
+        // The user file exists but is not this user's (or is damaged), and the shared token is unreadable too:
+        // removing the shared one would lose the only copy.
+        Directory.CreateDirectory(Path.GetDirectoryName(Tok)!);
+        File.WriteAllBytes(Tok, [1, 2, 3, 4]);
+        Write("{\"server\":\"h\",\"token\":\"AAAAAAAA\"}");
+        var c = ClientConfig.Load(Cfg, Tok);
+        Assert.Null(c.Token);
+        Assert.Contains("AAAAAAAA", File.ReadAllText(Cfg));
+    }
+
+    [Fact]
+    public void An_undecryptable_user_file_falls_back_to_migrating_the_shared_token()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(Tok)!);
+        File.WriteAllBytes(Tok, [1, 2, 3, 4]);
+        var blob = Convert.ToBase64String(Dpapi.Protect(Encoding.UTF8.GetBytes("machine-token"), DpapiScope.LocalMachine));
+        Write($"{{\"server\":\"h\",\"token\":\"{blob}\"}}");
+        var c = ClientConfig.Load(Cfg, Tok);
+        Assert.Equal("machine-token", c.Token);
+        Assert.DoesNotContain(blob, File.ReadAllText(Cfg));
+        Assert.Equal("machine-token", ClientConfig.Load(Cfg, Tok).Token); // now from the rewritten user file
+    }
+
+    [Fact]
+    public void A_shared_token_is_kept_when_the_user_copy_cannot_be_written()
+    {
+        // tokenPath's directory is a file, so the user copy cannot be written: the token is only in memory.
+        var blocked = Path.Combine(_dir, "blocked");
+        File.WriteAllText(blocked, "not a directory");
+        var tok = Path.Combine(blocked, "token.bin");
+        var blob = Convert.ToBase64String(Dpapi.Protect(Encoding.UTF8.GetBytes("machine-token"), DpapiScope.LocalMachine));
+        Write($"{{\"server\":\"h\",\"token\":\"{blob}\"}}");
+        Assert.Equal("machine-token", ClientConfig.Load(Cfg, tok).Token);
+        Assert.Contains(blob, File.ReadAllText(Cfg));
+    }
+
+    [Fact]
+    public void Writes_leave_no_temp_files()
+    {
+        new ClientConfig { Server = "h", Token = "t" }.Save(Cfg, Tok);
+        Assert.Empty(Directory.GetFiles(Path.GetDirectoryName(Cfg)!, "*.tmp"));
+        Assert.Empty(Directory.GetFiles(Path.GetDirectoryName(Tok)!, "*.tmp"));
+    }
+
+    // ---- printer name and spool dir go into an elevated command line ----
+
+    [Theory]
+    [InlineData("LAN \"Fax", null)]
+    [InlineData(null, @"C:\sp""ool")]
+    public void A_quote_in_the_printer_name_or_spool_dir_is_a_config_error(string? printer, string? spool)
+    {
+        var c = new ClientConfig { Server = "h" };
+        if (printer != null) c.PrinterName = printer;
+        if (spool != null) c.SpoolDir = spool;
+        Assert.Contains("quote", c.Validate());
+
+        var json = JsonSerializer.Serialize(new { server = "h", printerName = printer, spoolDir = spool });
+        var loaded = ClientConfig.Load(Write(json), Tok);
+        Assert.Equal("LAN Fax", loaded.PrinterName);
+        Assert.DoesNotContain("\"", loaded.SpoolDir);
+        Assert.Contains("quote", loaded.LoadError);
+        Assert.Null(loaded.Validate());
+    }
+
     [Fact]
     public void User_scope_round_trips_through_dpapi()
     {

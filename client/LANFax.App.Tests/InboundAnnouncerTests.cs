@@ -16,21 +16,29 @@ public sealed class InboundAnnouncerTests : IDisposable
     static Job In(string id, int minute, string state = "received", string direction = "in") =>
         new(id, direction, state, null, null, "15551230000", null, "inbound", 1, null, T0.AddMinutes(minute), T0.AddMinutes(minute), T0.AddMinutes(minute));
 
+    /// <summary>An announcer whose baseline is already taken (an empty inbox), as after the first run.</summary>
+    InboundAnnouncer Established()
+    {
+        var a = new InboundAnnouncer(State);
+        Assert.Empty(a.Absorb([], asBaseline: true));
+        return a;
+    }
+
     [Fact]
     public void A_live_fax_is_announced_once()
     {
-        var a = new InboundAnnouncer(State);
+        var a = Established();
         Assert.True(a.TryAnnounce(In("in1", 1)));
         Assert.False(a.TryAnnounce(In("in1", 1)));
-        Assert.Empty(a.Absorb([In("in1", 1)]));
+        Assert.Empty(a.Absorb([In("in1", 1)], asBaseline: false));
     }
 
     [Fact]
     public void Catch_up_announces_only_the_missed_ones_oldest_first()
     {
-        var a = new InboundAnnouncer(State);
+        var a = Established();
         a.TryAnnounce(In("in1", 1));
-        var news = a.Absorb([In("in4", 4), In("in1", 1), In("in3", 3)]);
+        var news = a.Absorb([In("in4", 4), In("in1", 1), In("in3", 3)], asBaseline: false);
         Assert.Equal(new[] { "in3", "in4" }, news.Select(j => j.Id));
         Assert.Equal(T0.AddMinutes(4), a.LastSeen);
     }
@@ -38,24 +46,25 @@ public sealed class InboundAnnouncerTests : IDisposable
     [Fact]
     public void Only_received_inbound_faxes_count()
     {
-        var a = new InboundAnnouncer(State);
+        var a = Established();
         a.TryAnnounce(In("in1", 1));
         Assert.False(a.TryAnnounce(In("lf1", 2, "sent", "out")));
         Assert.False(a.TryAnnounce(In("in2", 2, "failed")));
-        Assert.Empty(a.Absorb([In("lf2", 3, "queued", "out"), In("in3", 3, "failed")]));
+        Assert.Empty(a.Absorb([In("lf2", 3, "queued", "out"), In("in3", 3, "failed")], asBaseline: false));
     }
 
     [Fact]
     public void A_restart_does_not_announce_again()
     {
-        var a = new InboundAnnouncer(State);
+        var a = Established();
         a.TryAnnounce(In("in1", 1));
-        a.Absorb([In("in2", 2)]);
+        a.Absorb([In("in2", 2)], asBaseline: false);
 
         var b = new InboundAnnouncer(State);
         Assert.Equal(T0.AddMinutes(2), b.LastSeen);
-        Assert.Empty(b.Absorb([In("in1", 1), In("in2", 2)]));
-        Assert.Equal(new[] { "in9" }, b.Absorb([In("in2", 2), In("in9", 9)]).Select(j => j.Id));
+        Assert.False(b.NeedsBaseline);
+        Assert.Empty(b.Absorb([In("in1", 1), In("in2", 2)], asBaseline: false));
+        Assert.Equal(new[] { "in9" }, b.Absorb([In("in2", 2), In("in9", 9)], asBaseline: false).Select(j => j.Id));
     }
 
     [Fact]
@@ -63,8 +72,43 @@ public sealed class InboundAnnouncerTests : IDisposable
     {
         var a = new InboundAnnouncer(State);
         Assert.Null(a.LastSeen);
-        Assert.Empty(a.Absorb([In("old1", 1), In("old2", 2)]));
-        Assert.Equal(new[] { "new3" }, a.Absorb([In("old2", 2), In("new3", 3)]).Select(j => j.Id));
+        Assert.True(a.NeedsBaseline);
+        Assert.Empty(a.Absorb([In("old1", 1), In("old2", 2)], asBaseline: true));
+        Assert.False(a.NeedsBaseline);
+        Assert.Equal(new[] { "new3" }, a.Absorb([In("old2", 2), In("new3", 3)], asBaseline: false).Select(j => j.Id));
+    }
+
+    [Fact]
+    public void An_empty_inbox_on_the_first_run_still_ends_the_baseline_and_survives_a_restart()
+    {
+        var clock = T0.AddHours(1);
+        var a = new InboundAnnouncer(State, now: () => clock);
+        Assert.Empty(a.Absorb([], asBaseline: true));
+        Assert.False(a.NeedsBaseline);
+        Assert.Equal(clock, a.BaselineAt);
+
+        var b = new InboundAnnouncer(State);
+        Assert.False(b.NeedsBaseline);
+        Assert.Equal(clock, b.BaselineAt);
+        Assert.Equal(new[] { "in1" }, b.Absorb([In("in1", 70)], asBaseline: false).Select(j => j.Id));
+    }
+
+    [Fact]
+    public void A_live_fax_before_the_first_catch_up_does_not_end_the_baseline()
+    {
+        var a = new InboundAnnouncer(State);
+        Assert.True(a.TryAnnounce(In("live", 5)));
+        Assert.True(a.NeedsBaseline);
+    }
+
+    [Fact]
+    public void A_state_file_from_an_older_version_counts_as_a_taken_baseline()
+    {
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(State, """{"ids":["in1"],"lastSeen":"2026-09-29T12:01:00+00:00"}""");
+        var a = new InboundAnnouncer(State);
+        Assert.False(a.NeedsBaseline);
+        Assert.Equal(new[] { "in2" }, a.Absorb([In("in1", 1), In("in2", 2)], asBaseline: false).Select(j => j.Id));
     }
 
     [Fact]
@@ -98,8 +142,116 @@ public sealed class InboundAnnouncerTests : IDisposable
         var logs = new List<string>();
         var a = new InboundAnnouncer(State, logs.Add);
         Assert.Equal(0, a.Count);
+        Assert.True(a.NeedsBaseline);
         Assert.Single(logs);
         Assert.True(a.TryAnnounce(In("in1", 1)));
+    }
+
+    // ---- the catch-up run: baseline decided up front, widened when a page is full, coalesced ----
+
+    /// <summary>A faxd stand-in: <c>GET /jobs</c> returns the newest <c>limit</c> of the inbox, newest first.</summary>
+    sealed class FakeInbox
+    {
+        public readonly List<Job> Jobs = new();
+        public readonly List<(DateTimeOffset? Since, int Limit)> Calls = new();
+        public Func<Task>? Gate;
+        public Action? DuringFetch;
+
+        public async Task<IReadOnlyList<Job>> Fetch(DateTimeOffset? since, int limit)
+        {
+            Calls.Add((since, limit));
+            DuringFetch?.Invoke();
+            if (Gate != null) await Gate();
+            return Jobs.Where(j => since == null || j.UpdatedAt >= since)
+                .OrderByDescending(j => j.UpdatedAt).Take(limit).ToList();
+        }
+    }
+
+    [Fact]
+    public async Task A_live_fax_during_the_first_request_does_not_turn_the_inbox_into_news()
+    {
+        var inbox = new FakeInbox();
+        for (int i = 0; i < 10; i++) inbox.Jobs.Add(In("old" + i, i));
+        var a = new InboundAnnouncer(State);
+        inbox.DuringFetch = () => { inbox.Jobs.Add(In("live", 50)); Assert.True(a.TryAnnounce(In("live", 50))); };
+        var news = new List<Job>();
+        await new InboundCatchUp(a, inbox.Fetch, news.AddRange).RunAsync(null);
+        Assert.Empty(news);
+        Assert.False(a.NeedsBaseline);
+    }
+
+    [Fact]
+    public async Task A_full_page_is_fetched_again_with_the_larger_limit()
+    {
+        var inbox = new FakeInbox();
+        var a = Established();
+        for (int i = 0; i < 250; i++) inbox.Jobs.Add(In("in" + i, i));
+        var news = new List<Job>();
+        await new InboundCatchUp(a, inbox.Fetch, news.AddRange).RunAsync(null);
+        Assert.Equal(new[] { InboundCatchUp.PageSize, InboundCatchUp.MaxJobs }, inbox.Calls.Select(c => c.Limit));
+        Assert.Equal(250, news.Count);
+        Assert.Equal("in0", news[0].Id); // oldest first
+    }
+
+    [Fact]
+    public async Task The_catch_up_is_capped()
+    {
+        var inbox = new FakeInbox();
+        var a = Established();
+        for (int i = 0; i < 1500; i++) inbox.Jobs.Add(In("in" + i, i));
+        var news = new List<Job>();
+        var logs = new List<string>();
+        await new InboundCatchUp(a, inbox.Fetch, news.AddRange, log: logs.Add).RunAsync(null);
+        Assert.Equal(2, inbox.Calls.Count);
+        Assert.Equal(InboundCatchUp.MaxJobs, news.Count);
+        Assert.Equal("in1499", news[^1].Id); // the newest are kept
+        Assert.Contains(logs, l => l.Contains("1000"));
+    }
+
+    [Fact]
+    public async Task A_short_page_needs_one_request()
+    {
+        var inbox = new FakeInbox();
+        var a = Established();
+        inbox.Jobs.Add(In("in1", 1));
+        await new InboundCatchUp(a, inbox.Fetch, _ => { }).RunAsync(null);
+        Assert.Single(inbox.Calls);
+    }
+
+    [Fact]
+    public async Task A_catch_up_requested_while_one_runs_queues_exactly_one_more()
+    {
+        var inbox = new FakeInbox();
+        var a = Established();
+        var release = new TaskCompletionSource();
+        inbox.Gate = () => release.Task;
+        var news = new List<Job>();
+        var c = new InboundCatchUp(a, inbox.Fetch, news.AddRange);
+        var first = c.RunAsync(null);
+        Assert.True(c.Running);
+        inbox.Jobs.Add(In("in7", 7)); // arrives while the first request is out
+        var second = c.RunAsync(T0);
+        var third = c.RunAsync(null);
+        Assert.True(second.IsCompleted && third.IsCompleted); // merged into the running one, not dropped
+        inbox.Gate = null;
+        release.SetResult();
+        await first;
+        Assert.Equal(2, inbox.Calls.Count);
+        Assert.Equal(T0, inbox.Calls[1].Since); // the explicit resync time wins
+        Assert.Equal(new[] { "in7" }, news.Select(j => j.Id));
+        Assert.False(c.Running);
+    }
+
+    [Fact]
+    public async Task A_failed_catch_up_is_reported_and_leaves_the_baseline_pending()
+    {
+        var a = new InboundAnnouncer(State);
+        var errors = new List<Exception>();
+        var c = new InboundCatchUp(a, (_, _) => throw new FaxApiConfigException("bad token"), _ => { }, errors.Add);
+        await c.RunAsync(null);
+        Assert.IsType<FaxApiConfigException>(Assert.Single(errors));
+        Assert.True(a.NeedsBaseline);
+        Assert.False(c.Running);
     }
 
     [Theory]
@@ -115,9 +267,6 @@ public sealed class InboundAnnouncerTests : IDisposable
 
 public class InstanceGuardTests
 {
-    [Fact]
-    public void The_guard_is_machine_wide() => Assert.StartsWith(@"Global\", InstanceGuard.MutexName);
-
     [Theory]
     [InlineData(true, false, InstanceRole.Run)]
     [InlineData(false, true, InstanceRole.ShowRunningHere)]
@@ -125,7 +274,52 @@ public class InstanceGuardTests
     public void Decides_what_a_starting_instance_does(bool ownsMutex, bool signalledLocal, InstanceRole expected) =>
         Assert.Equal(expected, InstanceGuard.Decide(ownsMutex, signalledLocal));
 
+    static (string Mutex, string Event) Names()
+    {
+        var id = Guid.NewGuid().ToString("N");
+        return (@"Local\LANFax.Test.M." + id, @"Local\LANFax.Test.E." + id);
+    }
+
     [Fact]
-    public void Other_session_text() =>
-        Assert.Equal("LANFax is already running in another session", InstanceGuard.OtherSessionText);
+    public void The_owner_has_its_show_signal_as_soon_as_it_owns_the_mutex()
+    {
+        var (m, e) = Names();
+        using var owner = InstanceGuard.Acquire(m, e, TimeSpan.Zero);
+        Assert.Equal(InstanceRole.Run, owner.Role);
+        Assert.NotNull(owner.ShowSignal);
+        using var second = InstanceGuard.Acquire(m, e, TimeSpan.Zero);
+        Assert.Equal(InstanceRole.ShowRunningHere, second.Role);
+        Assert.Null(second.ShowSignal);
+        Assert.True(owner.ShowSignal!.WaitOne(0)); // the running tray was asked to show itself
+    }
+
+    [Fact]
+    public void A_second_start_during_the_owners_startup_is_not_reported_as_another_session()
+    {
+        // The owner holds the mutex but its signal does not exist yet; the second start waits for it (within its
+        // patience) rather than concluding that another Windows session runs LANFax.
+        var (_, e) = Names();
+        EventWaitHandle? late = null;
+        int tries = 0;
+        var role = InstanceGuard.Resolve(ownsMutex: false, trySignal: () =>
+        {
+            if (++tries == 3) late = new EventWaitHandle(false, EventResetMode.AutoReset, e);
+            return InstanceGuard.TrySignal(e);
+        }, patience: TimeSpan.FromSeconds(5), sleep: _ => { });
+        using (late)
+        {
+            Assert.Equal(InstanceRole.ShowRunningHere, role);
+            Assert.Equal(3, tries);
+        }
+    }
+
+    [Fact]
+    public void Without_a_signal_in_this_session_the_owner_is_in_another_session()
+    {
+        var (_, e) = Names();
+        int tries = 0;
+        var role = InstanceGuard.Resolve(false, () => { tries++; return InstanceGuard.TrySignal(e); }, TimeSpan.FromSeconds(1), _ => { });
+        Assert.Equal(InstanceRole.RunningInAnotherSession, role);
+        Assert.True(tries > 1);
+    }
 }

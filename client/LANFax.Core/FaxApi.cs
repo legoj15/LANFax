@@ -18,8 +18,9 @@ public class FaxApiException(int statusCode, string message, Exception? inner = 
 public sealed class FaxApiUnauthorizedException() : FaxApiException(401, "unauthorized (check the token in Settings)");
 
 /// <summary>
-/// The settings cannot form a request URI (a server with a port or path in it, a port outside 1..65535). Thrown
-/// before any request is built, so it proves nothing was sent; never retried. StatusCode is 0.
+/// The settings cannot form a request (a server with a port or path in it, a port outside 1..65535, a token that is not
+/// a valid Bearer parameter). Thrown before any request is built, so it proves nothing was sent; never retried.
+/// StatusCode is 0.
 /// </summary>
 public sealed class FaxApiConfigException(string message) : FaxApiException(0, message);
 
@@ -30,10 +31,14 @@ public sealed class FaxApiConfigException(string message) : FaxApiException(0, m
 /// </summary>
 public sealed record SendEndpoint(Uri BaseUri, string? Token)
 {
-    /// <exception cref="FaxApiConfigException">the server or port cannot form a URI (<see cref="ClientConfig.Validate"/>)</exception>
+    /// <exception cref="FaxApiConfigException">
+    /// the server or port cannot form a URI (<see cref="ClientConfig.EndpointError"/>), or the token cannot be sent as a
+    /// Bearer parameter (<see cref="ClientConfig.TokenError"/>): refused here, before anything is sent
+    /// </exception>
     public static SendEndpoint From(ClientConfig cfg)
     {
-        if (cfg.Validate() is { } err) throw new FaxApiConfigException(err);
+        if (cfg.EndpointError() is { } err) throw new FaxApiConfigException(err);
+        if (ClientConfig.TokenError(cfg.Token) is { } bad) throw new FaxApiConfigException(bad);
         try { return new SendEndpoint(cfg.BaseUri, cfg.Token); }
         catch (Exception e) when (e is UriFormatException or InvalidOperationException or ArgumentException)
         {

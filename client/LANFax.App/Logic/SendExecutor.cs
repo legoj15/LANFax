@@ -55,7 +55,8 @@ public sealed class SendExecutor(ISendApi api, ClientConfig cfg, JobTracker? jou
         {
             return NotSent(session, $"Nothing was sent: the server address in Settings cannot be used ({e.Message}).");
         }
-        if (session.LockedServer is { } pinned && pinned != endpoint.BaseUri)
+        if (session.LockedServer is { } pinned &&
+            !string.Equals(pinned.Authority, endpoint.BaseUri.Authority, StringComparison.OrdinalIgnoreCase))
         {
             // The key may be queued on the first server; another faxd would treat it as new and dial again.
             return NotSent(session, $"Nothing was sent: this fax may already be queued on {pinned.Authority}, but Settings now " +
@@ -64,7 +65,7 @@ public sealed class SendExecutor(ISendApi api, ClientConfig cfg, JobTracker? jou
 
         if (journal != null)
         {
-            try { journal.BeginSend(plan); }
+            try { journal.BeginSend(plan, endpoint.BaseUri); }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
                 log?.Invoke($"recording the send of spool {session.SpoolId} failed", e);
