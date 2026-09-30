@@ -333,7 +333,17 @@ public class InstallerScriptTests
     public void Shared_data_dir_is_users_modify()
     {
         var dirs = Section("Dirs");
-        Assert.Contains(@"Name: ""{commonappdata}\LANFax""; Permissions: users-modify", dirs);
+        Assert.Contains(@"Name: ""{commonappdata}\LANFax""; Permissions: users-modify; Flags: uninsneveruninstall", dirs);
+    }
+
+    [Fact]
+    public void Uninstall_keeps_the_data_dirs()
+    {
+        // config.json, unsent documents (spool\jobs) and kept copies must survive an uninstall.
+        var dirs = Section("Dirs");
+        Assert.Equal(3, dirs.Count);
+        Assert.All(dirs, d => Assert.EndsWith("; Flags: uninsneveruninstall", d));
+        Assert.Contains(dirs, d => d.Contains(@"{commonappdata}\LANFax\spool\jobs"""));
     }
 
     [Fact]

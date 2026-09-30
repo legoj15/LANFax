@@ -114,6 +114,40 @@ public class EventStreamTests : IDisposable
     }
 
     [Fact]
+    public async Task RestartingTheSameInstanceKeepsLastEventIdAndReadsTheConfigAgain()
+    {
+        // The tray keeps one EventStream for the app's lifetime: saving Settings cancels the run and starts it again.
+        _srv.Handler = async (ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, "id: 5\nevent: arm\ndata: {\"armed\":false,\"remaining_min\":0,\"ext\":\"300\"}\n\n");
+            await Task.Delay(Timeout.Infinite, _cts.Token);
+        };
+        var cfg = new ClientConfig { Server = "127.0.0.1", Port = _srv.Port, Token = "tok1" };
+        var es = new EventStream(cfg, _http) { Delay = (_, _) => Task.Delay(5) };
+        int arms = 0;
+        es.ArmChanged += _ => Interlocked.Increment(ref arms);
+        using (var first = new CancellationTokenSource())
+        {
+            var run1 = es.StartAsync(first.Token);
+            await WaitFor(() => Volatile.Read(ref arms) >= 1);
+            first.Cancel();
+            await run1;
+        }
+        cfg.Token = "tok2"; // settings saved
+        using var second = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var run2 = es.StartAsync(second.Token);
+        await WaitFor(() => _srv.Requests.Length >= 2);
+        second.Cancel();
+        await run2;
+        var reqs = _srv.Requests;
+        Assert.Contains("token=tok1", reqs[0].PathAndQuery);
+        Assert.Null(reqs[0].Headers["Last-Event-ID"]);
+        Assert.Contains("token=tok2", reqs[1].PathAndQuery);
+        Assert.Equal("5", reqs[1].Headers["Last-Event-ID"]);
+    }
+
+    [Fact]
     public async Task ReconnectsWithLastEventIdAndBackoffResetsOnSuccess()
     {
         int n = 0;

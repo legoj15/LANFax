@@ -32,9 +32,9 @@ client/
   LANFax.Core/                      net10.0 class library: no UI
     ClientConfig.cs                 %ProgramData%\LANFax\config.json (server, port, DPAPI token, printer name, spool dir); Load never throws, sets LoadError
     Dpapi.cs                        machine-scope DPAPI via crypt32 P/Invoke (no NuGet package)
-    FaxApi.cs                       HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download
+    FaxApi.cs                       ISendApi (post job, test send) + HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download
     EventStream.cs                  SSE client: GET /events?token=, Last-Event-ID, stall detection, reconnect with backoff, raises typed events
-    SpoolWatcher.cs                 watches the port path; stability wait; %PDF check; moves to jobs/<guid>.pdf; raises NewPrintJob / Error
+    SpoolWatcher.cs                 watches the port path; stability wait; %PDF and %%EOF checks; moves to jobs/<guid>.pdf (or rejected/<guid>.pdf); raises NewPrintJob / Error
     Numbers.cs                      normalize_number / check_number mirror (shared vectors: LANFax.Tests/numbers-vectors.json)
     Models.cs                       Job, ArmState, ServerStatus records mirroring faxd JSON
   (PrinterSetup, which detects the printer and launches the elevated install/uninstall script, lives in LANFax.App)
@@ -42,13 +42,14 @@ client/
     Program.cs                      single-instance mutex; tray icon; no console
     TrayContext.cs                  NotifyIcon + menu: Open, Send a test..., Receive a test (arm 20 min), Settings, Install printer, Exit
     SendDialog.cs                   non-modal; number, subject, page count, Send / Cancel; "Send test page instead" checkbox
-    Logic/                          testable plain classes: SendSession, JobTracker, DialogQueue, PdfInfo, PrinterSetup, ...
+    Logic/                          testable plain classes: SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, ...
     MainForm.cs                     (phase 3) status header, arm card with countdown, jobs grid, inbox grid, open PDF
     SettingsDialog.cs               server host/ip, port, token, "Clear token", "Test connection"
   LANFax.Tests/                     xunit: Core only (no UI)
   install/
     Install-LANFaxPrinter.ps1       elevated: Add-PrinterPort -Name <spool path>; Add-Printer -Name "LAN Fax" -DriverName "Microsoft Print To PDF" -PortName <spool path>; idempotent
-    Uninstall-LANFaxPrinter.ps1
+    Uninstall-LANFaxPrinter.ps1     removes printer and port; leaves %ProgramData%\LANFax
+    (both scripts self-elevate by relaunching with ONE -ArgumentList command-line string, never a pre-quoted array)
     LANFax.iss                      Inno Setup: installs app to Program Files, runs Install-LANFaxPrinter.ps1 from [Code] (non-zero exit = non-fatal message), adds Run key for tray autostart; uninstall taskkills LANFax.exe in CurUninstallStepChanged(usUninstall) (after the user confirms), then removes the printer; /DAppSource=<dir> overrides the published app folder (the test suite compiles against a stub)
   build.ps1                         dotnet test, dotnet publish, iscc -> dist/LANFax-Setup.exe
 ```
@@ -60,14 +61,26 @@ client/
   (not only `spool\`): any logged-in user's print job can write the spool (the
   spooler writes as the user for Local Ports) and any Windows user can save
   `config.json`. The Inno Setup `[Dirs]` entry for `{commonappdata}\LANFax`
-  must grant `users-modify` too.
+  must grant `users-modify` too. All three `[Dirs]` entries carry
+  `Flags: uninsneveruninstall`: uninstalling keeps `config.json`, unsent
+  documents (`spool\jobs`), kept copies (`spool\sent`) and rejected print
+  files; a reinstall picks them up.
 - Watcher: `FileSystemWatcher` on the spool dir (Created/Changed) plus a 2 s
   polling fallback. A job is complete when the file has existed for at least
   1 s, its size is unchanged across two checks, and it can be opened with
   `FileShare.None`. A complete file that is 0 bytes or does not start with
-  `%PDF` is deleted and reported via `Error("... not a PDF ...")`. Otherwise
-  move it to `spool\jobs\<guid>.pdf` immediately (frees the port path for the
-  next job) and raise `NewPrintJob(guid, path)`.
+  `%PDF` is deleted and reported via `Error("... not a PDF ...")`. The
+  `%%EOF` markers in the whole file are counted: 0 means not finished yet, so
+  the watcher keeps checking while the size is unchanged for up to `EofWait`
+  (10 s), then deletes it as not a PDF (a truncated document is never
+  faxed); 2 or more means two jobs landed in one file, so it is moved to
+  `spool\rejected\<guid>.pdf`, never sent, and reported via `Error("print.pdf
+  contained N documents; the LAN Fax printer received two jobs at once. Print
+  them one at a time.")`. Right before the move the size and first 1024 bytes
+  are compared with what was checked (in-place truncation or rewrite guard);
+  if they differ the file is checked again from the start. Otherwise move it
+  to `spool\jobs\<guid>.pdf` immediately (frees the port path for the next
+  job) and raise `NewPrintJob(guid, path)`.
 - A failed move (e.g. `jobs\` unwritable) raises `Error(reason, exception)`
   at most once per distinct reason per 60 s; the file stays at `print.pdf`.
   After 5 consecutive failures the watcher retries only on the 2 s poll.
@@ -77,7 +90,13 @@ client/
   appends, or fails while the first is still present. If it fails, the app
   must move the file within ~1 s (it does) and the second job will retry via
   the spooler's own retry; if it appends, the app must detect `%%EOF` count
-  and split, or reject and notify.
+  and split, or reject and notify. **Result still pending** (needs the
+  elevated disposable printer). Until it is recorded the app defends
+  anyway: a file with two or more `%%EOF` markers is rejected (moved to
+  `spool\rejected\`, error balloon, never sent), and a file without one is not
+  sent. Caveat: a PDF with incremental updates or linearization also has
+  several `%%EOF`; Microsoft Print To PDF writes neither, so this is safe for
+  the LAN Fax printer's own output.
 
 ## Send flow (phase 2)
 
@@ -109,10 +128,19 @@ client/
    exceptions = uncertain):
    - uncertain: the plan is frozen and the number, subject and test-page box
      become read-only with "The server may already have this job; fields are
-     locked. Cancel stops retrying; the server may still send it." Only Send
-     (same key, same request) or Cancel remain. Once locked, the dialog stays
-     locked.
-   - rejected: fields stay editable and the key rotates.
+     locked. Send will not create a duplicate. Cancel keeps the document (see
+     "Unsent documents" in the LANFax menu)." Only Send (same key, same
+     request) or Cancel remain. The dialog stays locked until a definite
+     rejection.
+   - rejected (a 4xx): fields stay (or become) editable and the key rotates.
+     faxd checks the Idempotency-Key before it validates or reads the body,
+     so any 4xx except 401 proves no job exists under the key: a LOCKED
+     session (in this run or resumed from disk) unlocks, rotates the key and
+     the record becomes `draft`. A 401 fails before the key lookup, so a
+     locked session stays locked with the same key.
+   `SendExecutor` runs one attempt (read PDF, write `sending`, `Started`,
+   request through `ISendApi`, classify, record the failure); the dialog only
+   validates and shows the result.
    `Failed(rejected|uncertain)` or `Succeeded` without a `Started` attempt
    throws `InvalidOperationException`.
 6. Every spooled document's state is persisted by `JobTracker` in
@@ -122,7 +150,8 @@ client/
    - `sending`: written before the first byte of every attempt, with the key
      and full plan. If it cannot be written, nothing is sent.
    - `uncertain`: after an uncertain failure (same key, same plan).
-   - `draft`: after a definite rejection (plan editable, no key).
+   - `draft`: after a definite rejection (plan editable, no key), including
+     one that unlocks a locked session.
    - `accepted`: the server took it; `serverId` set. The PDF stays until a
      terminal state arrives by `JobChanged` or by the fallback poll
      (`GET /jobs/<id>` at startup, on every stream (re)connect and every
@@ -137,10 +166,14 @@ client/
    `to_number`, or "Server queued this fax to X (you entered Y)". The tray's
    own test page has no PDF and is not persisted; a print job sent as a test
    page is persisted until accepted, then its PDF is deleted.
-7. Cancel (button or close box): delete the PDF and its json, except in a
-   resumed (locked-from-disk) dialog, where Cancel keeps both and the
-   document is listed under "Unsent documents (N)..." in the tray menu. App
-   exit or shutdown with a dialog open keeps the PDF.
+7. Cancel (button or close box): delete the PDF and its json, except while
+   the dialog is locked (resumed from disk, or after an uncertain failure in
+   this run), where Cancel keeps both and the document is listed under
+   "Unsent documents (N)..." in the tray menu (the record says `uncertain`,
+   so the next start reopens it locked). A locked dialog that a definite 4xx
+   unlocked is a draft again: Cancel deletes. The tray's test page has no
+   document, so its Cancel keeps nothing. App exit or shutdown with a dialog
+   open keeps the PDF.
 8. Startup, before the watcher starts, `JobTracker.Scan` returns a
    `SendRequest` per document that needs the user, and each opens straight
    into the dialog queue (no balloon to miss):
@@ -155,7 +188,13 @@ client/
      disabled until the user ticks "Send it anyway", then uses a fresh key.
    - a guid-named PDF with no json: offered as unsent, as before.
    `accepted` records are polled again; terminal leftovers are finished; a
-   record whose PDF is gone is removed.
+   record whose PDF is gone is removed. A json that cannot be opened (held by
+   antivirus or backup) is read again 3 times 200 ms apart; if it stays
+   unavailable it is skipped for this scan (logged, not renamed, its PDF not
+   offered) and handled at the next start. Only content that is not a record
+   becomes `.bad`. A `<guid>.json.tmp` with no `<guid>.json` (crash between the
+   flushed temp write and the rename) is adopted when it parses as a record;
+   a torn temp file, or one beside an existing json, is ignored.
 9. Exit: if a send is on the wire, the tray asks "A fax is being sent. Wait
    for it?". Yes waits up to 30 s for the result (an accepted job is still
    recorded), No exits at once; the `sending` record already prevents a
@@ -165,7 +204,9 @@ client/
 10. Balloons all go through `NotificationQueue`: one at a time, each ends on
    click, close or an 8 s timer (stale timers and the Closed event of the
    balloon being replaced are ignored), so a later balloon never takes over a
-   pending click action. Startup balloons: settings problem
+   pending click action. A click stops the timer before its action runs (the
+   action may open a modal dialog that pumps messages), timeouts and closes
+   are ignored while it runs, and the next balloon shows once it returns. Startup balloons: settings problem
    (`ClientConfig.LoadError`, click opens Settings), printer missing, token
    missing. A 401 on the event stream shows "The server rejected the LANFax
    token" once per app run (again after Settings are saved); the click opens
@@ -180,6 +221,10 @@ client/
   window, Disarm), jobs grid (time, to, state badge, pages, error), inbox
   grid (time, from, pages), double-click opens the PDF (download to
   `%LocalAppData%\LANFax\cache\<id>.pdf`, then `ShellExecute`).
+- One `EventStream` for the app's lifetime (it reads the config at each
+  connect). Saving Settings cancels the run, waits for it to end and calls
+  `StartAsync` again with a new token, so `LastEventId` survives; events a
+  cancelled run raises are dropped.
 - Live updates from `EventStream`; on reconnect reload both grids
   (`GET /jobs?updated_since=`, formatted culture-invariant as
   `yyyy-MM-ddTHH:mm:ssZ` in UTC). If no line (event or the 15 s keepalive)

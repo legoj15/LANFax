@@ -1,6 +1,8 @@
 <#
 .SYNOPSIS
-  Removes the "LAN Fax" printer and its file port. Self-elevates (UAC prompt). Idempotent. Leaves the spool folder.
+  Removes the "LAN Fax" printer and its file port. Self-elevates (UAC prompt). Idempotent.
+  Leaves %ProgramData%\LANFax alone (config.json, unsent documents in spool\jobs, kept copies in spool\sent,
+  rejected print files); the uninstaller keeps that folder too.
 #>
 [CmdletBinding()]
 param(
@@ -14,9 +16,9 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isAdmin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     $exe = (Get-Process -Id $PID).Path
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath),
-                 '-SpoolDir', ('"{0}"' -f $SpoolDir), '-PrinterName', ('"{0}"' -f $PrinterName))
-    $p = Start-Process -FilePath $exe -ArgumentList $argList -Verb RunAs -Wait -PassThru
+    # One command-line string: Windows PowerShell 5.1 re-quotes array entries that contain spaces and splits them.
+    $argLine = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -SpoolDir `"$SpoolDir`" -PrinterName `"$PrinterName`""
+    $p = Start-Process -FilePath $exe -ArgumentList $argLine -Verb RunAs -Wait -PassThru
     exit $p.ExitCode
 }
 

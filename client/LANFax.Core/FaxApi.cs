@@ -17,8 +17,15 @@ public class FaxApiException(int statusCode, string message, Exception? inner = 
 
 public sealed class FaxApiUnauthorizedException() : FaxApiException(401, "unauthorized (check the token in Settings)");
 
+/// <summary>The two requests that submit a fax; the send dialog's <c>SendExecutor</c> depends on this, not on HTTP.</summary>
+public interface ISendApi
+{
+    Task<Job> PostJobAsync(Stream pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default);
+    Task<Job> SendTestPageAsync(string to, string? note, string idempotencyKey, CancellationToken ct = default);
+}
+
 /// <summary>HttpClient wrapper for the faxd API. The token is sent as a Bearer header and never logged.</summary>
-public sealed class FaxApi(ClientConfig cfg, HttpClient http)
+public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi
 {
     public const int MaxAttempts = 3;
 

@@ -10,7 +10,7 @@ internal enum DialogOutcome
     Accepted,
     /// <summary>The user pressed Cancel or closed the window: discard the PDF.</summary>
     Cancelled,
-    /// <summary>The user cancelled a resumed (possibly already sent) job: keep the PDF and its record.</summary>
+    /// <summary>The user cancelled a locked (possibly already sent) job: keep the PDF and its record.</summary>
     Kept,
     /// <summary>Closed by app exit or Windows shutdown: keep the PDF (offered again at next start).</summary>
     Abandoned,
@@ -18,16 +18,15 @@ internal enum DialogOutcome
 
 /// <summary>
 /// Non-modal send dialog. With a spooled PDF it is the print-to-fax dialog; with no PDF it is the tray's
-/// "Send a test page" prompt (test-page mode forced, no checkbox). Order of one attempt: validate the number, read
-/// the document, persist <c>sending</c> through the journal, then <see cref="SendSession.Started"/> and the request;
-/// whatever is thrown after Started is classified by <see cref="SendOutcome"/>. The dialog never deletes the PDF:
+/// "Send a test page" prompt (test-page mode forced, no checkbox). One attempt: validate the number, then
+/// <see cref="SendExecutor"/> reads the document, persists <c>sending</c>, calls <see cref="SendSession.Started"/> and
+/// sends; the dialog shows the result and locks or unlocks its fields. The dialog never deletes the PDF:
 /// <see cref="TrayContext"/> tracks, discards or keeps it from <see cref="Outcome"/>.
 /// </summary>
 internal sealed class SendDialog : Form
 {
     private readonly ClientConfig _cfg;
-    private readonly FaxApi _api;
-    private readonly JobTracker? _journal;
+    private readonly SendExecutor _executor;
     private readonly Action _openSettings;
     private readonly Icon _icon = IconFactory.Create(true);
 
@@ -61,10 +60,11 @@ internal sealed class SendDialog : Form
     public Task Idle => _idle.Task;
 
     /// <param name="journal">Persists the send state of a spooled PDF; null for the tray's test page (nothing on disk).</param>
-    public SendDialog(ClientConfig cfg, FaxApi api, SendRequest request, JobTracker? journal, Action openSettings)
+    public SendDialog(ClientConfig cfg, ISendApi api, SendRequest request, JobTracker? journal, Action openSettings)
     {
-        _cfg = cfg; _api = api; _openSettings = openSettings;
-        _journal = request.PdfPath != null ? journal : null;
+        _cfg = cfg; _openSettings = openSettings;
+        _executor = new SendExecutor(api, request.PdfPath != null ? journal : null,
+            (m, e) => { if (e == null) FileLog.Info(m); else FileLog.Error(m, e); });
         Request = request;
         Session = request.LockedPlan is { } locked ? SendSession.Resume(locked) : new SendSession(request.SpoolId, request.PdfPath);
         var pdfPath = request.PdfPath;
@@ -176,6 +176,15 @@ internal sealed class SendDialog : Form
         _confirm.Visible = false;
     }
 
+    /// <summary>A definite rejection proved the server has nothing under the old key: the fields are editable again.</summary>
+    private void ReleaseLock()
+    {
+        _number.Input.ReadOnly = false;
+        _subject.ReadOnly = false;
+        _testPage.Enabled = true;
+        _lockNote.Visible = false;
+    }
+
     private void SetBusy(bool busy)
     {
         _busy = busy;
@@ -200,65 +209,19 @@ internal sealed class SendDialog : Form
 
         SetBusy(true);
         _serverError.Text = "";
-        byte[]? bytes = null;
-        if (plan.Route == SendRoute.Document)
+        var r = await _executor.RunAsync(Session, plan);
+        if (r.Status == SendAttemptStatus.Accepted)
         {
-            try { bytes = await File.ReadAllBytesAsync(plan.PdfPath); }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            {
-                NotSent("Cannot read the document: " + e.Message);
-                return;
-            }
-        }
-        // 2. Persist "sending" with the key and plan before the first byte goes out.
-        if (_journal != null)
-        {
-            try { _journal.BeginSend(plan); }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-            {
-                FileLog.Error($"recording the send of spool {Session.SpoolId} failed", e);
-                NotSent("Nothing was sent: the send could not be recorded on disk (" + e.Message + ").");
-                return;
-            }
-        }
-
-        // 3. Send. From here on a failure may mean the server has the job.
-        Session.Started(plan);
-        Exception failure;
-        try
-        {
-            Job job;
-            if (plan.Route == SendRoute.TestPage)
-                job = await _api.SendTestPageAsync(plan.Number, plan.Subject, plan.IdempotencyKey);
-            else
-            {
-                using var ms = new MemoryStream(bytes!, writable: false);
-                job = await _api.PostJobAsync(ms, plan.Number, plan.Subject, plan.IdempotencyKey);
-            }
-            Session.Succeeded(job);
             Outcome = DialogOutcome.Accepted;
             SetBusy(false);
             Close();
             return;
         }
-        catch (Exception e) { failure = e; }
-
-        var outcome = Session.Failed(SendOutcome.Classify(failure));
-        if (outcome == AttemptOutcome.Uncertain && failure is not FaxApiException) FileLog.Error("send failed unexpectedly", failure);
-        FileLog.Info($"send attempt {Session.Attempts} for spool {Session.SpoolId}: {outcome} " +
-                     $"(status {(failure as FaxApiException)?.StatusCode.ToString() ?? failure.GetType().Name})");
-        _journal?.RecordFailure(Session, plan);
         if (Session.FieldsLocked) ApplyLock();
-        _serverError.Text = SendOutcome.Describe(failure);
+        else if (_number.Input.ReadOnly) ReleaseLock();
+        _serverError.Text = r.Message ?? "";
         SetBusy(false);
-        if (failure is FaxApiUnauthorizedException) _openSettings();
-    }
-
-    private void NotSent(string message)
-    {
-        Session.Failed(AttemptOutcome.NotSent);
-        _serverError.Text = message;
-        SetBusy(false);
+        if (r.Failure is FaxApiUnauthorizedException) _openSettings();
     }
 
     private void OnClosing(object? sender, FormClosingEventArgs e)
@@ -276,9 +239,9 @@ internal sealed class SendDialog : Form
         }
         if (Outcome == DialogOutcome.Accepted) return;
         // Only an explicit user close discards the document; app exit or shutdown keeps it for next start.
-        // A resumed send may already be at the server: Cancel keeps it rather than lose track of it.
+        // While locked (resumed, or uncertain in this run) the server may have the job: Cancel keeps it.
         Outcome = e.CloseReason != CloseReason.UserClosing ? DialogOutcome.Abandoned
-            : Session.Resumed ? DialogOutcome.Kept : DialogOutcome.Cancelled;
+            : Session.CancelKeepsDocument ? DialogOutcome.Kept : DialogOutcome.Cancelled;
     }
 
     protected override void Dispose(bool disposing)

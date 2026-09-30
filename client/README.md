@@ -13,3 +13,6 @@ warns on first run.
 
 The printer is installed and removed by `install/Install-LANFaxPrinter.ps1` and
 `install/Uninstall-LANFaxPrinter.ps1` (each asks for administrator approval).
+
+Uninstalling LANFax keeps its data folder (`%ProgramData%\LANFax`: settings, unsent documents, kept copies).
+Delete that folder by hand to remove everything.

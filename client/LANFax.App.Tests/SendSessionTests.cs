@@ -19,8 +19,8 @@ public class SendSessionTests
     }
 
     /// <summary>
-    /// One char per step. R = attempt rejected (4xx), U = attempt uncertain (status 0), N = nothing sent (no attempt),
-    /// 3 = attempt answered 302, 2 = attempt answered an unreadable 200, S = attempt accepted.
+    /// One char per step. R = attempt rejected (413), A = attempt answered 401, U = attempt uncertain (status 0),
+    /// N = nothing sent (no attempt), 3 = attempt answered 302, 2 = attempt answered an unreadable 200, S = attempt accepted.
     /// </summary>
     static void Run(SendSession s, string steps, List<SendPlan> attempts)
     {
@@ -32,10 +32,11 @@ public class SendSessionTests
             s.Started(p);
             switch (c)
             {
-                case 'R': s.Failed(SendOutcome.Classify(new FaxApiException(413, "too big"))); break;
-                case 'U': s.Failed(SendOutcome.Classify(new FaxApiException(0, "cannot reach faxd"))); break;
-                case '3': s.Failed(SendOutcome.Classify(new FaxApiException(302, "Found"))); break;
-                case '2': s.Failed(SendOutcome.Classify(new FaxApiException(200, "faxd returned a job without id or state"))); break;
+                case 'R': s.Failed(new FaxApiException(413, "too big")); break;
+                case 'A': s.Failed(new FaxApiUnauthorizedException()); break;
+                case 'U': s.Failed(new FaxApiException(0, "cannot reach faxd")); break;
+                case '3': s.Failed(new FaxApiException(302, "Found")); break;
+                case '2': s.Failed(new FaxApiException(200, "faxd returned a job without id or state")); break;
                 case 'S': s.Succeeded(J("15552345678")); break;
                 default: throw new ArgumentException(c.ToString());
             }
@@ -51,7 +52,11 @@ public class SendSessionTests
     [InlineData("2", true, 1)]    // unreadable 200 -> Locked
     [InlineData("3", true, 1)]    // 3xx -> Uncertain -> Locked
     [InlineData("N", false, 1)]   // nothing sent: nothing changes
-    [InlineData("UR", true, 1)]   // once locked, a later 4xx does not unlock or rotate
+    [InlineData("UR", false, 2)]  // Locked+4xx: the server checks the key before the body, so no job exists: unlock, rotate
+    [InlineData("URU", true, 2)]  // ...and a later uncertain failure locks again under the new key
+    [InlineData("UA", true, 1)]   // Locked+401: auth fails before the key lookup, so the job may exist: stay locked
+    [InlineData("A", false, 2)]   // Fresh+401: nothing was ever uncertain: rotate as any rejection
+    [InlineData("UAR", false, 2)] // a 401 then a real 4xx under the same key: unlock
     [InlineData("US", true, 1)]   // Locked+Success
     public void Transition_table(string steps, bool locked, int key)
     {
@@ -126,8 +131,54 @@ public class SendSessionTests
         Assert.Equal("stored-key", s.IdempotencyKey);
         Assert.Same(stored, s.Build("", null, true, false));
         s.Started(stored);
-        Assert.Equal(AttemptOutcome.Rejected, s.Failed(AttemptOutcome.Rejected));
+        Assert.Equal(AttemptOutcome.Rejected, s.Failed(new FaxApiUnauthorizedException()));
         Assert.Equal("stored-key", s.IdempotencyKey);
+        Assert.True(s.FieldsLocked);
+    }
+
+    [Fact]
+    public void Resumed_session_unlocks_and_rotates_after_a_definite_rejection()
+    {
+        var stored = SendPlan.Create(Spool, @"C:\spool\jobs\x.pdf", "5552345678", "subj", false, true, "stored-key");
+        var s = SendSession.Resume(stored, () => Guid.Parse("00000000-0000-0000-0000-000000000009"));
+        s.Started(stored);
+        Assert.Equal(AttemptOutcome.Rejected, s.Failed(new FaxApiException(422, "bad number")));
+        Assert.False(s.FieldsLocked);
+        Assert.Null(s.LockedPlan);
+        Assert.Equal(K(9), s.IdempotencyKey);
+        var next = s.Build("555 999 0000", null, false, false); // fields are editable again
+        Assert.Equal("15559990000", next.Number);
+        Assert.Equal(K(9), next.IdempotencyKey);
+    }
+
+    [Fact]
+    public void A_rejection_without_a_status_never_unlocks()
+    {
+        // Failed(outcome) without the status cannot tell a 401 from another 4xx: stay on the safe side.
+        var s = New();
+        var p = s.Build("5552345678", null, false, false);
+        s.Started(p); s.Failed(AttemptOutcome.Uncertain);
+        s.Started(p); s.Failed(AttemptOutcome.Rejected);
+        Assert.True(s.FieldsLocked);
+        Assert.Equal(K(1), s.IdempotencyKey);
+    }
+
+    [Theory]
+    [InlineData(false, "", true, false)]    // fresh dialog: Cancel discards
+    [InlineData(false, "R", true, false)]   // after a rejection: nothing at the server, Cancel discards
+    [InlineData(false, "U", true, true)]    // after an uncertain failure in this run: Cancel keeps it, like a resumed dialog
+    [InlineData(false, "UR", true, false)]  // ...unless a later 4xx proved the server has nothing
+    [InlineData(true, "", true, true)]      // resumed locked: Cancel keeps it
+    [InlineData(true, "R", true, false)]    // resumed, then a definite 4xx: unlocked, Cancel discards
+    [InlineData(false, "U", false, false)]  // the tray's test page has no document to keep
+    public void Cancel_keeps_the_document_while_the_server_may_have_it(bool resumed, string steps, bool hasPdf, bool keeps)
+    {
+        var pdf = hasPdf ? @"C:\spool\jobs\x.pdf" : null;
+        var s = resumed
+            ? SendSession.Resume(SendPlan.Create(Spool, pdf!, "5552345678", null, false, false, "stored-key"), () => Guid.NewGuid())
+            : New(pdf);
+        Run(s, steps, new List<SendPlan>());
+        Assert.Equal(keeps, s.CancelKeepsDocument);
     }
 
     [Fact]
@@ -140,8 +191,8 @@ public class SendSessionTests
     [Fact]
     public void Note_texts()
     {
-        Assert.Equal("The server may already have this job; fields are locked. Cancel stops retrying; the server may still send it.",
-            SendSession.LockNote);
+        Assert.Equal("The server may already have this job; fields are locked. Send will not create a duplicate. " +
+            "Cancel keeps the document (see \"Unsent documents\" in the LANFax menu).", SendSession.LockNote);
         Assert.Equal("This document may already have been sent; Send will not create a duplicate. Cancel keeps the document.",
             SendSession.ResumeNote);
         Assert.Equal("This document may already have been sent. Sending it again may fax it a second time.",
@@ -304,6 +355,35 @@ public class NotificationQueueTests
         q.OnTimeout(q.Current.Id);
         Assert.Equal("c", q.Current!.Text);
         Assert.Equal(TimeSpan.FromSeconds(8), NotificationQueue.Duration);
+    }
+
+    [Fact]
+    public void Click_stops_the_timer_before_the_action_and_advances_once_after_it_returns()
+    {
+        // The click action may open a modal dialog (Settings) that pumps messages: the 8 s timer or the balloon's
+        // Closed must not advance the queue underneath it, and the next notice shows only after the action returns.
+        var clock = new Clock();
+        var shown = new List<string>();
+        bool timerRunning = false;
+        NotificationQueue q = null!;
+        var log = new List<string>();
+        q = new NotificationQueue(n => { shown.Add(n.Text); timerRunning = true; }, () => clock.Now,
+            stopTimer: () => timerRunning = false);
+        q.Enqueue("Open settings?", () =>
+        {
+            log.Add($"action, timer running={timerRunning}");
+            clock.Now += TimeSpan.FromSeconds(20); // the user takes a while in the dialog
+            q.OnTimeout(q.Current!.Id);            // a tick that was already queued
+            q.OnClosed();                          // the balloon closing itself
+            log.Add($"current during action={q.Current?.Text}");
+        });
+        q.Enqueue("b");
+        q.Enqueue("c");
+        q.OnClicked();
+        Assert.Equal(new[] { "action, timer running=False", "current during action=Open settings?" }, log);
+        Assert.Equal(new[] { "Open settings?", "b" }, shown);
+        Assert.Equal("b", q.Current!.Text);
+        Assert.Equal(1, q.Waiting);
     }
 
     [Fact]

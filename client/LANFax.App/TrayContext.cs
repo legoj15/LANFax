@@ -35,6 +35,10 @@ internal sealed class TrayContext : ApplicationContext
     private readonly ToolStripMenuItem _retryItem;
     private readonly RegisteredWaitHandle? _showWait;
     private readonly EventWaitHandle _showEvent;
+    /// <summary>One stream for the app's lifetime (it reads the config at each connect), so LastEventId survives a restart.</summary>
+    private readonly EventStream _events;
+    private readonly object _sseGate = new();
+    private CancellationToken _sseLive; // the token of the run currently allowed to raise events (guarded by _sseGate)
     private CancellationTokenSource? _sseCts;
     private Task? _sseTask;
     private SendDialog? _openDialog;
@@ -56,7 +60,7 @@ internal sealed class TrayContext : ApplicationContext
         FileLog.Info($"config: {_loc.ReadPath} (save to {_loc.Path}, fallback={_loc.IsFallback}), server {_cfg.Server}:{_cfg.Port}, token set={!string.IsNullOrEmpty(_cfg.Token)}");
         if (_cfg.LoadError != null) FileLog.Error("config: " + _cfg.LoadError);
 
-        _notices = new NotificationQueue(ShowBalloon);
+        _notices = new NotificationQueue(ShowBalloon, stopTimer: () => _noticeTimer.Stop());
         _noticeTimer.Tick += (_, _) => { _noticeTimer.Stop(); _notices.OnTimeout(_noticeId); };
 
         var menu = new ContextMenuStrip();
@@ -110,6 +114,7 @@ internal sealed class TrayContext : ApplicationContext
         try { _spool.Start(); }
         catch (Exception e) { FileLog.Error("spool watcher failed to start", e); Balloon("Cannot watch " + _cfg.SpoolDir + ": " + e.Message); }
 
+        _events = CreateEventStream();
         StartEventStream();
         _poll.Tick += async (_, _) => await PollTrackedAsync();
         _poll.Start();
@@ -174,51 +179,75 @@ internal sealed class TrayContext : ApplicationContext
 
     // ---- event stream and job tracking ----
 
+    private CancellationToken LiveStreamToken { get { lock (_sseGate) return _sseLive; } }
+
+    /// <summary>
+    /// Handlers capture the live run's token when the event is raised (on the stream's thread), so anything a cancelled
+    /// run raises is dropped even if it reaches the UI thread after the next run started.
+    /// </summary>
+    private EventStream CreateEventStream()
+    {
+        var es = new EventStream(_cfg, _sseHttp) { Log = m => FileLog.Info(m) };
+        es.Connected += () =>
+        {
+            var ct = LiveStreamToken;
+            OnUi(() =>
+            {
+                if (ct.IsCancellationRequested) return;
+                _everConnected = true;
+                UpdateConnectionState(true);
+                _ = PollTrackedAsync(); // catch up on anything that finished while disconnected
+            });
+        };
+        es.Disconnected += e =>
+        {
+            var ct = LiveStreamToken;
+            OnUi(() =>
+            {
+                if (ct.IsCancellationRequested) return;
+                UpdateConnectionState(false);
+                if (_unauthorized.ShouldShow(e))
+                {
+                    FileLog.Error("event stream: unauthorized");
+                    Balloon(NotificationText.Unauthorized, OpenSettings);
+                }
+            });
+        };
+        es.Resync += since =>
+        {
+            var ct = LiveStreamToken;
+            OnUi(() =>
+            {
+                if (ct.IsCancellationRequested) return;
+                FileLog.Info($"event stream: resync requested (since {since?.ToString("o") ?? "unknown"}); polling tracked jobs");
+                _ = PollTrackedAsync();
+            });
+        };
+        es.JobChanged += j => OnUi(() => OnJobChanged(j));
+        es.Received += j => OnUi(() => Balloon(NotificationText.ForReceived(j)));
+        return es;
+    }
+
+    /// <summary>
+    /// (Re)starts the one <see cref="EventStream"/>: cancels the current run, waits for it to end (one run at a time,
+    /// so LastEventId has a single writer), then runs again with a new token if a token is configured.
+    /// </summary>
     private void StartEventStream()
     {
-        // Cancel the old stream; dispose its CTS only once its loop has observed the cancellation.
         var oldCts = _sseCts;
         var oldTask = _sseTask;
         oldCts?.Cancel();
-        if (oldCts != null)
-        {
-            if (oldTask == null) oldCts.Dispose();
-            else oldTask.ContinueWith(_ => oldCts.Dispose(), TaskScheduler.Default);
-        }
-        _sseCts = new CancellationTokenSource();
-        _sseTask = null;
-        var ct = _sseCts.Token;
-        var es = new EventStream(_cfg, _sseHttp) { Log = m => FileLog.Info(m) };
-        es.Connected += () => OnUi(() =>
-        {
-            if (ct.IsCancellationRequested) return;
-            _everConnected = true;
-            UpdateConnectionState(true);
-            _ = PollTrackedAsync(); // catch up on anything that finished while disconnected
-        });
-        es.Disconnected += e => OnUi(() =>
-        {
-            if (ct.IsCancellationRequested) return;
-            UpdateConnectionState(false);
-            if (_unauthorized.ShouldShow(e))
-            {
-                FileLog.Error("event stream: unauthorized");
-                Balloon(NotificationText.Unauthorized, OpenSettings);
-            }
-        });
-        es.Resync += since => OnUi(() =>
-        {
-            if (ct.IsCancellationRequested) return;
-            FileLog.Info($"event stream: resync requested (since {since?.ToString("o") ?? "unknown"}); polling tracked jobs");
-            _ = PollTrackedAsync();
-        });
-        es.JobChanged += j => OnUi(() => OnJobChanged(j));
-        es.Received += j => OnUi(() => Balloon(NotificationText.ForReceived(j)));
         UpdateConnectionState(false);
-        if (string.IsNullOrEmpty(_cfg.Token)) return; // nothing to authenticate with yet
+        bool run = !string.IsNullOrEmpty(_cfg.Token); // nothing to authenticate with yet
+        var cts = run ? new CancellationTokenSource() : null;
+        _sseCts = cts;
         _sseTask = Task.Run(async () =>
         {
-            try { await es.StartAsync(ct); }
+            if (oldTask != null) { try { await oldTask; } catch { /* logged by that run */ } }
+            oldCts?.Dispose(); // only once its run has observed the cancellation
+            if (cts == null || cts.IsCancellationRequested) return;
+            lock (_sseGate) _sseLive = cts.Token;
+            try { await _events.StartAsync(cts.Token); }
             catch (Exception e) { FileLog.Error("event stream ended", e); }
         });
     }

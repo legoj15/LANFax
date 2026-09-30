@@ -32,9 +32,10 @@ RestartApplications=no
 
 [Dirs]
 ; Deliberate shared-machine decision: any local user may edit config.json and every user's print job must write the spool.
-Name: "{commonappdata}\LANFax"; Permissions: users-modify
-Name: "{commonappdata}\LANFax\spool"; Permissions: users-modify
-Name: "{commonappdata}\LANFax\spool\jobs"; Permissions: users-modify
+; uninsneveruninstall: config.json, unsent documents and kept copies survive an uninstall (and a reinstall finds them).
+Name: "{commonappdata}\LANFax"; Permissions: users-modify; Flags: uninsneveruninstall
+Name: "{commonappdata}\LANFax\spool"; Permissions: users-modify; Flags: uninsneveruninstall
+Name: "{commonappdata}\LANFax\spool\jobs"; Permissions: users-modify; Flags: uninsneveruninstall
 
 [Files]
 Source: "{#AppSource}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

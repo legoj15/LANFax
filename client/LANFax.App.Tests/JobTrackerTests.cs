@@ -81,16 +81,33 @@ public sealed class JobTrackerTests : IDisposable
     }
 
     [Fact]
-    public void Locked_session_stays_uncertain_even_after_a_later_rejection()
+    public void Locked_session_stays_uncertain_after_a_401()
     {
         var t = new JobTracker(_dir);
         var (id, pdf) = Spooled();
         var s = new SendSession(id, pdf);
         var p = s.Build("5552345678", null, false, false);
         t.BeginSend(p); s.Started(p); s.Failed(AttemptOutcome.Uncertain); t.RecordFailure(s, p);
-        t.BeginSend(p); s.Started(p); s.Failed(AttemptOutcome.Rejected); t.RecordFailure(s, p);
+        t.BeginSend(p); s.Started(p); s.Failed(new FaxApiUnauthorizedException()); t.RecordFailure(s, p);
         Assert.Equal("uncertain", Record(id).GetProperty("state").GetString());
         Assert.Equal(p.IdempotencyKey, Record(id).GetProperty("idempotencyKey").GetString());
+    }
+
+    [Fact]
+    public void Locked_session_becomes_draft_after_a_definite_4xx()
+    {
+        // faxd looks the Idempotency-Key up before it validates or reads the body: a 4xx other than 401 means no job.
+        var t = new JobTracker(_dir);
+        var (id, pdf) = Spooled();
+        var s = new SendSession(id, pdf);
+        var p = s.Build("5552345678", null, false, false);
+        t.BeginSend(p); s.Started(p); s.Failed(AttemptOutcome.Uncertain); t.RecordFailure(s, p);
+        t.BeginSend(p); s.Started(p); s.Failed(new FaxApiException(413, "too big")); t.RecordFailure(s, p);
+        var r = Record(id);
+        Assert.Equal("draft", r.GetProperty("state").GetString());
+        Assert.Equal(JsonValueKind.Null, r.GetProperty("idempotencyKey").ValueKind);
+        Assert.NotEqual(p.IdempotencyKey, s.IdempotencyKey);
+        Assert.Equal(SendKind.Draft, Assert.Single(new JobTracker(_dir).Scan()).Kind);
     }
 
     [Theory]
@@ -177,6 +194,75 @@ public sealed class JobTrackerTests : IDisposable
         var t = new JobTracker(_dir);
         t.Discard(id);
         Assert.False(File.Exists(pdf) || File.Exists(JsonOf(id) + ".bad"));
+    }
+
+    [Fact]
+    public async Task Briefly_locked_json_is_read_after_a_retry_not_treated_as_corrupt()
+    {
+        var t0 = new JobTracker(_dir);
+        var (id, pdf) = Spooled();
+        t0.BeginSend(Plan(id, pdf, keep: false, key: "K1"));
+        var hold = new FileStream(JsonOf(id), FileMode.Open, FileAccess.Read, FileShare.None);
+        var release = Task.Run(async () => { await Task.Delay(300); hold.Dispose(); });
+        var req = Assert.Single(new JobTracker(_dir).Scan());
+        await release;
+        Assert.Equal(SendKind.Resume, req.Kind);
+        Assert.Equal("K1", req.LockedPlan!.IdempotencyKey);
+        Assert.False(File.Exists(JsonOf(id) + ".bad"));
+    }
+
+    [Fact]
+    public void Persistently_locked_json_is_skipped_this_scan_not_renamed_or_offered()
+    {
+        var logs = new List<string>();
+        var (id, pdf) = Spooled();
+        new JobTracker(_dir).BeginSend(Plan(id, pdf, keep: false, key: "K1"));
+        using (new FileStream(JsonOf(id), FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            Assert.Empty(new JobTracker(_dir, logs.Add).Scan());
+            Assert.True(File.Exists(JsonOf(id)));
+            Assert.False(File.Exists(JsonOf(id) + ".bad"));
+        }
+        Assert.Contains(logs, l => l.Contains(id.ToString()) && l.Contains("skipped"));
+        // released: the next scan resumes it normally
+        Assert.Equal(SendKind.Resume, Assert.Single(new JobTracker(_dir).Scan()).Kind);
+    }
+
+    [Fact]
+    public void Leftover_tmp_is_adopted_when_the_json_is_missing()
+    {
+        // A crash between the flushed temp write and the rename: the temp file holds the latest record.
+        var (id, pdf) = Spooled();
+        new JobTracker(_dir).BeginSend(Plan(id, pdf, keep: false, key: "K7"));
+        File.Move(JsonOf(id), JsonOf(id) + ".tmp");
+        var req = Assert.Single(new JobTracker(_dir).Scan());
+        Assert.Equal(SendKind.Resume, req.Kind);
+        Assert.Equal("K7", req.LockedPlan!.IdempotencyKey);
+        Assert.True(File.Exists(JsonOf(id)));
+        Assert.False(File.Exists(JsonOf(id) + ".tmp"));
+    }
+
+    [Fact]
+    public void Unreadable_leftover_tmp_is_not_adopted()
+    {
+        var (id, _) = Spooled();
+        File.WriteAllText(JsonOf(id) + ".tmp", "{\"spoolId\":"); // torn write
+        var req = Assert.Single(new JobTracker(_dir).Scan());
+        Assert.Equal(SendKind.New, req.Kind); // offered as an unsent PDF, as without any record
+        Assert.False(File.Exists(JsonOf(id)));
+    }
+
+    [Fact]
+    public void Leftover_tmp_beside_an_existing_json_is_ignored()
+    {
+        var (id, pdf) = Spooled();
+        var t = new JobTracker(_dir);
+        t.BeginSend(Plan(id, pdf, keep: false, key: "OLD"));
+        var old = File.ReadAllText(JsonOf(id));
+        t.BeginSend(Plan(id, pdf, keep: false, key: "NEW"));
+        File.WriteAllText(JsonOf(id) + ".tmp", old);
+        Assert.Equal("NEW", Assert.Single(new JobTracker(_dir).Scan()).LockedPlan!.IdempotencyKey);
+        Assert.Contains("\"NEW\"", File.ReadAllText(JsonOf(id)));
     }
 
     [Fact]

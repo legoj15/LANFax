@@ -22,12 +22,14 @@ public class SpoolWatcherTests : IDisposable
     private int Count { get { lock (_events) return _events.Count; } }
     private int ErrorCount { get { lock (_errors) return _errors.Count; } }
 
-    /// <summary>A minimal file that passes the %PDF header check, padded to <paramref name="len"/> bytes.</summary>
+    /// <summary>
+    /// A minimal complete file: the %PDF header, padding to <paramref name="len"/> bytes, then one <c>%%EOF</c>.
+    /// </summary>
     private static byte[] Pdf(int len = 16, byte fill = (byte)'x')
     {
         var b = Enumerable.Repeat(fill, Math.Max(len, 5)).ToArray();
         Encoding.ASCII.GetBytes("%PDF-").CopyTo(b, 0);
-        return b;
+        return [.. b, .. Encoding.ASCII.GetBytes("\n%%EOF\n")];
     }
 
     private static async Task WaitFor(Func<bool> cond, int ms = 15000)
@@ -72,12 +74,13 @@ public class SpoolWatcherTests : IDisposable
                 fs.Flush();
                 await Task.Delay(500);
             }
+            fs.Write(Encoding.ASCII.GetBytes("%%EOF\n"));
             Assert.Equal(0, Count); // still locked after 3 s
             release = DateTime.UtcNow;
         }
         await WaitFor(() => Count == 1);
         Assert.True(_events[0].at >= release, "raised before the writer released the file");
-        Assert.Equal(6005, new FileInfo(_events[0].path).Length);
+        Assert.Equal(6011, new FileInfo(_events[0].path).Length);
         await Task.Delay(2500);
         Assert.Equal(1, Count);
     }
@@ -177,5 +180,116 @@ public class SpoolWatcherTests : IDisposable
         Assert.Equal(0, ErrorCount);
         Assert.True(File.Exists(w.PrintPath));
         Assert.Empty(Directory.GetFiles(w.JobsDir));
+    }
+
+    // ---- concatenated or truncated print files (the spooler probe is still pending) ----
+
+    private string RejectedDir => Path.Combine(_dir, "rejected");
+
+    [Fact]
+    public async Task TwoDocumentsInOneFileAreRejectedNotSent()
+    {
+        using var w = Make();
+        w.Start();
+        byte[] two = [.. Pdf(30, (byte)'1'), .. Pdf(30, (byte)'2')];
+        File.WriteAllBytes(w.PrintPath, two);
+        await WaitFor(() => ErrorCount >= 1);
+        await WaitFor(() => !File.Exists(w.PrintPath), 3000);
+        Assert.Equal(0, Count);
+        Assert.Empty(Directory.GetFiles(w.JobsDir));
+        Assert.Equal("print.pdf contained 2 documents; the LAN Fax printer received two jobs at once. Print them one at a time.",
+            _errors[0].reason);
+        var kept = Assert.Single(Directory.GetFiles(RejectedDir));
+        Assert.True(Guid.TryParse(Path.GetFileNameWithoutExtension(kept), out _));
+        Assert.Equal(".pdf", Path.GetExtension(kept));
+        Assert.Equal(two, File.ReadAllBytes(kept));
+
+        // the next single document goes through normally
+        File.WriteAllBytes(w.PrintPath, Pdf(20));
+        await WaitFor(() => Count == 1);
+    }
+
+    [Fact]
+    public async Task FileWithoutEofWaitsThenIsTreatedAsNotAPdf()
+    {
+        using var w = Make();
+        w.EofWait = TimeSpan.FromSeconds(2);
+        w.Start();
+        var truncated = Encoding.ASCII.GetBytes("%PDF-1.7\n1 0 obj << /Type /Catalog >> endobj\n");
+        File.WriteAllBytes(w.PrintPath, truncated);
+        await Task.Delay(2500); // stable and unlocked, but not complete yet: still waiting
+        Assert.True(File.Exists(w.PrintPath));
+        Assert.Equal(0, ErrorCount);
+        await WaitFor(() => ErrorCount >= 1);
+        await WaitFor(() => !File.Exists(w.PrintPath), 3000);
+        Assert.Equal(0, Count);
+        Assert.Contains("not a PDF", _errors[0].reason);
+        Assert.Contains("%%EOF", _errors[0].reason);
+    }
+
+    [Fact]
+    public async Task EofArrivingWithinTheWaitIsSentNormally()
+    {
+        using var w = Make();
+        w.EofWait = TimeSpan.FromSeconds(10);
+        w.Start();
+        File.WriteAllBytes(w.PrintPath, Encoding.ASCII.GetBytes("%PDF-1.7\npartial"));
+        await Task.Delay(2500);
+        Assert.Equal(0, Count);
+        File.AppendAllText(w.PrintPath, "\n%%EOF\n");
+        await WaitFor(() => Count == 1);
+        Assert.Equal(0, ErrorCount);
+    }
+
+    [Fact]
+    public async Task FileChangedInPlaceJustBeforeTheMoveIsNotSent()
+    {
+        using var w = Make();
+        int hooked = 0;
+        w.BeforeMove = () =>
+        {
+            // truncated and rewritten in place after the checks: the header no longer matches
+            if (Interlocked.Increment(ref hooked) == 1) File.WriteAllBytes(w.PrintPath, Encoding.ASCII.GetBytes("%!PS-Adobe"));
+        };
+        w.Start();
+        File.WriteAllBytes(w.PrintPath, Pdf(40));
+        await WaitFor(() => ErrorCount >= 1);
+        await WaitFor(() => !File.Exists(w.PrintPath), 3000);
+        Assert.Equal(0, Count);
+        Assert.Empty(Directory.GetFiles(w.JobsDir));
+        Assert.Contains("not a PDF", _errors[0].reason);
+    }
+
+    [Fact]
+    public async Task SameSizeRewriteJustBeforeTheMoveIsNotSentAsTheOldDocument()
+    {
+        using var w = Make();
+        int hooked = 0;
+        var replacement = Pdf(40, (byte)'z');
+        w.BeforeMove = () => { if (Interlocked.Increment(ref hooked) == 1) File.WriteAllBytes(w.PrintPath, replacement); };
+        w.Start();
+        File.WriteAllBytes(w.PrintPath, Pdf(40, (byte)'y'));
+        await WaitFor(() => Count == 1);
+        Assert.True(Volatile.Read(ref hooked) >= 2, "the changed file was moved without being checked again");
+        Assert.Equal(replacement, File.ReadAllBytes(_events[0].path));
+    }
+
+    [Theory]
+    [InlineData("", 0)]
+    [InlineData("%PDF-1.7 %%EOF", 1)]
+    [InlineData("%%EOF%%EOF", 2)]
+    [InlineData("%%EO F %EOF %%eof", 0)]
+    public void CountsEofMarkers(string content, int expected) =>
+        Assert.Equal(expected, SpoolWatcher.CountEof(new MemoryStream(Encoding.ASCII.GetBytes(content))));
+
+    [Fact]
+    public void CountsEofMarkersAcrossBufferBoundaries()
+    {
+        foreach (var at in new[] { 65536 - 4, 65536 - 2, 65536, 65536 * 2 - 1 })
+        {
+            var b = Enumerable.Repeat((byte)'x', 65536 * 3).ToArray();
+            Encoding.ASCII.GetBytes("%%EOF").CopyTo(b, at);
+            Assert.Equal(1, SpoolWatcher.CountEof(new MemoryStream(b)));
+        }
     }
 }

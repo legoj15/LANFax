@@ -4,8 +4,12 @@ namespace LANFax.Core;
 /// Watches spoolDir\print.pdf (the file the printer port writes). A file is complete when it has existed
 /// for at least 1 s, its size is unchanged across two checks 500 ms apart, and it opens with FileShare.None.
 /// A complete file that does not start with <c>%PDF</c> (including 0 bytes) is deleted and reported through
-/// <see cref="Error"/>; a PDF is moved to spoolDir\jobs\&lt;guid&gt;.pdf (freeing the port path) and
-/// <see cref="NewPrintJob"/> fires. A FileSystemWatcher and a 2 s poll both just start the check loop if it is idle.
+/// <see cref="Error"/>. A PDF must also end its document: with no <c>%%EOF</c> it is waited on for
+/// <see cref="EofWait"/> and then treated as not a PDF; with two or more it is two jobs written into one file (the
+/// spooler's behaviour for back-to-back jobs is still unverified), so it is moved to spoolDir\rejected\&lt;guid&gt;.pdf
+/// and reported, never sent. Otherwise, if its size and first bytes are unchanged since the check, it is moved to
+/// spoolDir\jobs\&lt;guid&gt;.pdf (freeing the port path) and <see cref="NewPrintJob"/> fires. A FileSystemWatcher
+/// and a 2 s poll both just start the check loop if it is idle.
 /// </summary>
 public sealed class SpoolWatcher(string spoolDir) : IDisposable
 {
@@ -17,6 +21,9 @@ public sealed class SpoolWatcher(string spoolDir) : IDisposable
     public const int FastRetryLimit = 5;
     private static readonly TimeSpan RetryEvery = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan PollEvery = TimeSpan.FromSeconds(2);
+    /// <summary>Bytes compared again before the move, to catch a file rewritten or truncated in place after the check.</summary>
+    private const int HeaderBytes = 1024;
+    private static readonly byte[] EofMarker = "%%EOF"u8.ToArray();
 
     private readonly object _gate = new();
     private readonly Dictionary<string, DateTime> _reported = new();
@@ -37,8 +44,50 @@ public sealed class SpoolWatcher(string spoolDir) : IDisposable
     /// <summary>Optional diagnostics sink.</summary>
     public Action<string>? Log { get; set; }
 
+    /// <summary>
+    /// How long a stable, unlocked print file without <c>%%EOF</c> is given to finish before it is deleted as not a
+    /// PDF (a truncated document must not be faxed).
+    /// </summary>
+    public TimeSpan EofWait { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>Test hook: runs after the checks, right before the size and header are compared again and the file moves.</summary>
+    internal Action? BeforeMove { get; set; }
+
     public string PrintPath => Path.Combine(spoolDir, "print.pdf");
     public string JobsDir => Path.Combine(spoolDir, "jobs");
+    public string RejectedDir => Path.Combine(spoolDir, "rejected");
+
+    /// <summary>Number of <c>%%EOF</c> markers from the stream's current position to its end.</summary>
+    public static int CountEof(Stream s)
+    {
+        var buf = new byte[64 * 1024];
+        int carry = 0, count = 0, n;
+        while ((n = s.Read(buf, carry, buf.Length - carry)) > 0)
+        {
+            int len = carry + n;
+            var span = buf.AsSpan(0, len);
+            int i = 0, at;
+            while ((at = span[i..].IndexOf(EofMarker)) >= 0) { count++; i += at + EofMarker.Length; }
+            // Keep the tail that could begin a marker split across reads (never part of one already counted).
+            carry = Math.Min(EofMarker.Length - 1, len - i);
+            Buffer.BlockCopy(buf, len - carry, buf, 0, carry);
+        }
+        return count;
+    }
+
+    private static byte[] ReadHeader(FileStream fs)
+    {
+        var head = new byte[(int)Math.Min(HeaderBytes, fs.Length)];
+        fs.Position = 0;
+        return head[..fs.ReadAtLeast(head, head.Length, throwOnEndOfStream: false)];
+    }
+
+    /// <summary>The file at the port path still has the size and first bytes that were checked.</summary>
+    private bool SameAsChecked(byte[] head, long size)
+    {
+        using var fs = new FileStream(PrintPath, FileMode.Open, FileAccess.Read, FileShare.None);
+        return fs.Length == size && ReadHeader(fs).AsSpan().SequenceEqual(head);
+    }
 
     public void Start()
     {
@@ -100,6 +149,8 @@ public sealed class SpoolWatcher(string spoolDir) : IDisposable
     {
         DateTime? firstSeen = null;
         DateTime created = default;
+        DateTime? noEofSince = null;
+        long noEofSize = -1;
         while (!ct.IsCancellationRequested && File.Exists(PrintPath))
         {
             try
@@ -118,35 +169,55 @@ public sealed class SpoolWatcher(string spoolDir) : IDisposable
                 if (fi.Length != size1 || fi.CreationTimeUtc != created) { firstSeen = null; continue; }
 
                 bool isPdf;
+                byte[] head;
+                long checkedSize;
+                int eofs;
                 using (var fs = new FileStream(PrintPath, FileMode.Open, FileAccess.Read, FileShare.None))
                 {
-                    var head = new byte[4];
-                    isPdf = fs.ReadAtLeast(head, head.Length, throwOnEndOfStream: false) == head.Length &&
-                            head is [(byte)'%', (byte)'P', (byte)'D', (byte)'F'];
+                    checkedSize = fs.Length;
+                    head = ReadHeader(fs);
+                    isPdf = head is [(byte)'%', (byte)'P', (byte)'D', (byte)'F', ..];
+                    fs.Position = 0;
+                    eofs = isPdf ? CountEof(fs) : 0;
                 }
 
                 if (ct.IsCancellationRequested) return;
+                if (isPdf && eofs == 0)
+                {
+                    // Not finished yet (or truncated): keep checking while it stays the same size, up to EofWait.
+                    if (noEofSince == null || noEofSize != checkedSize) { noEofSince = DateTime.UtcNow; noEofSize = checkedSize; }
+                    if (DateTime.UtcNow - noEofSince < EofWait) { await Task.Delay(RetryEvery, ct); continue; }
+                }
                 firstSeen = null;
-                if (!isPdf)
+                noEofSince = null;
+                if (!isPdf || eofs == 0)
                 {
                     File.Delete(PrintPath);
-                    Report($"print.pdf was not a PDF ({size1} bytes); deleted it",
-                        new InvalidDataException("print.pdf does not start with %PDF"), rateLimited: false);
+                    Report(isPdf
+                            ? $"print.pdf was not a PDF ({size1} bytes, no %%EOF after {EofWait.TotalSeconds:0.#} s); deleted it"
+                            : $"print.pdf was not a PDF ({size1} bytes); deleted it",
+                        new InvalidDataException(isPdf ? "print.pdf has no %%EOF" : "print.pdf does not start with %PDF"),
+                        rateLimited: false);
                     continue;
                 }
 
+                // Two jobs written into one file must never go out as one fax: keep it aside and tell the user.
+                bool reject = eofs >= 2;
                 var id = Guid.NewGuid();
-                var dest = Path.Combine(JobsDir, id + ".pdf");
+                var destDir = reject ? RejectedDir : JobsDir;
+                var dest = Path.Combine(destDir, id + ".pdf");
+                try { BeforeMove?.Invoke(); } catch { /* test hook */ }
+                if (!SameAsChecked(head, checkedSize)) continue; // rewritten or truncated in place: check it again
                 try
                 {
-                    Directory.CreateDirectory(JobsDir);
+                    Directory.CreateDirectory(destDir);
                     File.Move(PrintPath, dest);
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                 {
                     if (!File.Exists(PrintPath)) continue; // it vanished: nothing to move
                     int n = ++_moveFailures;
-                    Report($"cannot move print.pdf into {JobsDir}: {e.Message}", e, rateLimited: true);
+                    Report($"cannot move print.pdf into {destDir}: {e.Message}", e, rateLimited: true);
                     if (n >= FastRetryLimit)
                     {
                         if (n == FastRetryLimit) Log?.Invoke($"spool: {n} move failures in a row; retrying on the 2 s poll only");
@@ -156,6 +227,13 @@ public sealed class SpoolWatcher(string spoolDir) : IDisposable
                     continue;
                 }
                 _moveFailures = 0;
+
+                if (reject)
+                {
+                    Report($"print.pdf contained {eofs} documents; the LAN Fax printer received two jobs at once. Print them one at a time.",
+                        new InvalidDataException($"print.pdf had {eofs} %%EOF markers; kept as {dest}"), rateLimited: false);
+                    continue;
+                }
 
                 if (ct.IsCancellationRequested)
                 {

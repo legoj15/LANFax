@@ -6,7 +6,11 @@ public enum AttemptOutcome
 {
     /// <summary>Nothing reached the server (bad number, unreadable file). Key and fields unchanged.</summary>
     NotSent,
-    /// <summary>A 4xx: the server refused the request and holds nothing under the key. Rotate the key.</summary>
+    /// <summary>
+    /// A 4xx: the server refused the request. faxd looks the Idempotency-Key up before it validates or reads the
+    /// body, so any 4xx but 401 proves it holds nothing under the key: rotate it (and unlock a locked session).
+    /// A 401 fails before the lookup, so it proves nothing about a job the key may already have.
+    /// </summary>
     Rejected,
     /// <summary>Timeout, connection error, 3xx, 5xx, an unreadable 2xx or anything unexpected: the server may have queued the job.</summary>
     Uncertain,
@@ -49,14 +53,16 @@ public static class SendGate
 /// <summary>
 /// State of one send dialog across attempts. Money rule: after an uncertain failure the next attempt must be
 /// byte-for-byte the same request under the same Idempotency-Key (the server may already be dialling it), so the
-/// plan is frozen and the dialog locks its fields. After a definite rejection the server holds nothing, so the
-/// fields stay editable and the key rotates (an edited number must never reuse a key the server may know).
+/// plan is frozen and the dialog locks its fields. After a definite rejection (a 4xx other than 401, see
+/// <see cref="AttemptOutcome.Rejected"/>) the server holds nothing, so the fields become or stay editable and the key
+/// rotates (an edited number must never reuse a key the server may know).
 /// Each <see cref="Started"/> is answered by exactly one <see cref="Succeeded"/> or <see cref="Failed"/>.
 /// </summary>
 public sealed class SendSession
 {
     public const string LockNote =
-        "The server may already have this job; fields are locked. Cancel stops retrying; the server may still send it.";
+        "The server may already have this job; fields are locked. Send will not create a duplicate. " +
+        "Cancel keeps the document (see \"Unsent documents\" in the LANFax menu).";
     public const string ResumeNote =
         "This document may already have been sent; Send will not create a duplicate. Cancel keeps the document.";
     public const string SuspectNote =
@@ -92,6 +98,11 @@ public sealed class SendSession
     public int Attempts { get; private set; }
     public SendPlan? LockedPlan { get; private set; }
     public bool FieldsLocked => LockedPlan != null;
+    /// <summary>
+    /// Cancel keeps the document (listed under "Unsent documents") instead of deleting it: the server may have the
+    /// job, so the document and its record must not be lost. The tray's test page has no document to keep.
+    /// </summary>
+    public bool CancelKeepsDocument => FieldsLocked && PdfPath != null;
     /// <summary>Locked from a record on disk (a previous run), not by a failure in this dialog.</summary>
     public bool Resumed { get; }
     public bool InFlight => _inFlight != null;
@@ -119,11 +130,15 @@ public sealed class SendSession
         AcceptedPlan = plan;
     }
 
+    /// <summary>Records what the attempt in flight threw: classified by <see cref="SendOutcome"/>, with its status.</summary>
+    public AttemptOutcome Failed(Exception e) => Failed(SendOutcome.Classify(e), (e as FaxApiException)?.StatusCode);
+
     /// <summary>
     /// Records a failed attempt. <see cref="AttemptOutcome.NotSent"/> is for validation failures before
-    /// <see cref="Started"/>; the other outcomes answer the attempt in flight and throw without one.
+    /// <see cref="Started"/>; the other outcomes answer the attempt in flight and throw without one. A locked session
+    /// unlocks only on a rejection whose <paramref name="status"/> is known and is not 401.
     /// </summary>
-    public AttemptOutcome Failed(AttemptOutcome o)
+    public AttemptOutcome Failed(AttemptOutcome o, int? status = null)
     {
         if (o == AttemptOutcome.NotSent)
         {
@@ -132,9 +147,17 @@ public sealed class SendSession
         }
         var plan = _inFlight ?? throw new InvalidOperationException($"{o} without Started");
         _inFlight = null;
-        if (LockedPlan != null) return o; // once uncertain, always the same request
-        if (o == AttemptOutcome.Uncertain) LockedPlan = plan;
-        else IdempotencyKey = _newKey().ToString();
+        if (o == AttemptOutcome.Uncertain)
+        {
+            LockedPlan ??= plan; // once uncertain, the same request until the server proves it has nothing
+            return o;
+        }
+        if (LockedPlan != null)
+        {
+            if (status is null or 401) return o; // no proof the server lacks the job: stay locked, same key
+            LockedPlan = null;
+        }
+        IdempotencyKey = _newKey().ToString();
         return o;
     }
 }

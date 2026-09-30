@@ -46,6 +46,11 @@ public sealed record TerminalResult(TrackedJob Tracked, TerminalOutcome Outcome)
 public sealed class JobTracker(string spoolDir, Action<string>? log = null)
 {
     private static readonly JsonSerializerOptions Opts = new(JsonSerializerDefaults.Web);
+    /// <summary>A record another process holds open (antivirus, backup) is read again this many times before giving up.</summary>
+    private const int ReadRetries = 3;
+    private static readonly TimeSpan ReadRetryDelay = TimeSpan.FromMilliseconds(200);
+
+    private enum LoadStatus { Ok, BadContent, Unavailable }
     private readonly Dictionary<string, TrackedJob> _byServerId = new(StringComparer.Ordinal);
 
     public string JobsDir => Path.Combine(spoolDir, "jobs");
@@ -132,11 +137,20 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
     {
         var offers = new List<SendRequest>();
         if (!Directory.Exists(JobsDir)) return offers;
+        AdoptLeftoverTemps();
+        var skipped = new HashSet<Guid>();
         foreach (var json in Directory.EnumerateFiles(JobsDir, "*.json"))
         {
             if (!Guid.TryParse(Path.GetFileNameWithoutExtension(json), out var id)) continue;
             var pdf = PdfPath(id);
-            var t = Load(json);
+            var (t, status) = Load(json);
+            if (status == LoadStatus.Unavailable)
+            {
+                // Held open by another process: not corrupt. Leave it for the next start rather than guess.
+                log?.Invoke($"record {id} could not be read (in use); skipped this scan");
+                skipped.Add(id);
+                continue;
+            }
             if (t == null)
             {
                 // Unreadable: keep it aside as evidence; its PDF is offered below with the warning.
@@ -180,10 +194,35 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
         foreach (var pdf in Directory.EnumerateFiles(JobsDir, "*.pdf"))
         {
             if (!Guid.TryParse(Path.GetFileNameWithoutExtension(pdf), out var id) || File.Exists(JsonPath(id))) continue;
+            if (skipped.Contains(id)) continue;
             if (offers.Any(o => o.SpoolId == id)) continue;
             offers.Add(new SendRequest(id, pdf, Kind: File.Exists(BadPath(id)) ? SendKind.Suspect : SendKind.New));
         }
         return offers;
+    }
+
+    /// <summary>
+    /// A crash between the flushed temp write and its rename leaves <c>&lt;guid&gt;.json.tmp</c> with the newest
+    /// record and no <c>&lt;guid&gt;.json</c>: rename it into place when it reads as a record. A temp file beside an
+    /// existing record, or one that does not parse (a torn write), is left alone; the next write replaces it.
+    /// </summary>
+    private void AdoptLeftoverTemps()
+    {
+        foreach (var tmp in Directory.EnumerateFiles(JobsDir, "*.json.tmp"))
+        {
+            var json = tmp[..^".tmp".Length];
+            if (!Guid.TryParse(Path.GetFileNameWithoutExtension(json), out _) || File.Exists(json)) continue;
+            if (Load(tmp).Status != LoadStatus.Ok) continue;
+            try
+            {
+                File.Move(tmp, json);
+                log?.Invoke($"adopted leftover {Path.GetFileName(tmp)} as the record");
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                log?.Invoke($"adopting {Path.GetFileName(tmp)} failed ({e.GetType().Name}: {e.Message})");
+            }
+        }
     }
 
     private static TrackedJob FromPlan(SendPlan p, string state, string? key) =>
@@ -253,17 +292,37 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
         File.Move(tmp, path, overwrite: true);
     }
 
-    private TrackedJob? Load(string path)
+    /// <summary>
+    /// Reads a record. A sharing violation or denied access is retried <see cref="ReadRetries"/> times
+    /// <see cref="ReadRetryDelay"/> apart and then reported as <see cref="LoadStatus.Unavailable"/>; only content
+    /// that is not a record is <see cref="LoadStatus.BadContent"/>.
+    /// </summary>
+    private (TrackedJob? Record, LoadStatus Status) Load(string path)
     {
+        string text;
+        for (int attempt = 0; ; attempt++)
+        {
+            try { text = File.ReadAllText(path); break; }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                if (e is FileNotFoundException or DirectoryNotFoundException) return (null, LoadStatus.Unavailable);
+                if (attempt >= ReadRetries)
+                {
+                    log?.Invoke($"tracker record {Path.GetFileName(path)} unreadable after {ReadRetries} retries ({e.GetType().Name}: {e.Message})");
+                    return (null, LoadStatus.Unavailable);
+                }
+                Thread.Sleep(ReadRetryDelay);
+            }
+        }
         try
         {
-            var t = JsonSerializer.Deserialize<TrackedJob>(File.ReadAllText(path), Opts);
-            return t is { Number: not null, State: not null } ? t : null;
+            var t = JsonSerializer.Deserialize<TrackedJob>(text, Opts);
+            return t is { Number: not null, State: not null } ? (t, LoadStatus.Ok) : (null, LoadStatus.BadContent);
         }
-        catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException or NotSupportedException)
+        catch (Exception e) when (e is JsonException or NotSupportedException)
         {
-            log?.Invoke($"tracker record {Path.GetFileName(path)} unreadable ({e.GetType().Name})");
-            return null;
+            log?.Invoke($"tracker record {Path.GetFileName(path)} is not a valid record ({e.GetType().Name})");
+            return (null, LoadStatus.BadContent);
         }
     }
 

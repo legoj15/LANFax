@@ -5,9 +5,12 @@ namespace LANFax.App.Logic;
 /// replaces one whose click action is still pending. A notice ends on click, on close, or after
 /// <see cref="Duration"/> (the caller runs a timer and reports <see cref="OnTimeout"/> with the notice id).
 /// Double-advance guards: a stale timer id is ignored, and a Closed that arrives within <see cref="CloseGrace"/>
-/// of showing a notice belongs to the balloon it replaced. UI thread only.
+/// of showing a notice belongs to the balloon it replaced. A click stops the timer (<c>stopTimer</c>) before its
+/// action runs, ignores timeouts and closes while the action runs (it may show a modal dialog that pumps messages),
+/// and shows the next notice once the action returns. UI thread only.
 /// </summary>
-public sealed class NotificationQueue(Action<NotificationQueue.Notice> show, Func<DateTime>? clock = null)
+public sealed class NotificationQueue(Action<NotificationQueue.Notice> show, Func<DateTime>? clock = null,
+    Action? stopTimer = null)
 {
     public sealed record Notice(long Id, string Text, Action? OnClick);
 
@@ -18,6 +21,7 @@ public sealed class NotificationQueue(Action<NotificationQueue.Notice> show, Fun
     private readonly Queue<Notice> _waiting = new();
     private long _nextId;
     private DateTime _shownAt;
+    private bool _clicking;
 
     public Notice? Current { get; private set; }
     public int Waiting => _waiting.Count;
@@ -32,20 +36,26 @@ public sealed class NotificationQueue(Action<NotificationQueue.Notice> show, Fun
     public void OnClicked()
     {
         var c = Current;
-        if (c == null) return;
+        if (c == null || _clicking) return;
+        stopTimer?.Invoke();
+        _clicking = true;
         try { c.OnClick?.Invoke(); }
-        finally { Advance(); }
+        finally
+        {
+            _clicking = false;
+            if (Current == c) Advance();
+        }
     }
 
     public void OnClosed()
     {
-        if (Current == null || _now() - _shownAt < CloseGrace) return;
+        if (Current == null || _clicking || _now() - _shownAt < CloseGrace) return;
         Advance();
     }
 
     public void OnTimeout(long id)
     {
-        if (Current?.Id != id) return;
+        if (Current?.Id != id || _clicking) return;
         Advance();
     }
 
