@@ -8,6 +8,7 @@ namespace LANFax.App;
 internal sealed class TrayContext : ApplicationContext
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan ExitWait = TimeSpan.FromSeconds(30);
 
     private readonly ConfigLocation _loc;
     private readonly ClientConfig _cfg;
@@ -17,6 +18,9 @@ internal sealed class TrayContext : ApplicationContext
     private readonly FaxApi _api;
     private readonly JobTracker _tracker;
     private readonly DialogQueue<SendRequest> _queue = new();
+    private readonly OfferBook _offers = new();
+    private readonly NotificationQueue _notices;
+    private readonly System.Windows.Forms.Timer _noticeTimer = new() { Interval = (int)NotificationQueue.Duration.TotalMilliseconds };
     private readonly UnauthorizedNotice _unauthorized = new();
     private readonly NotifyIcon _tray;
     private readonly Control _ui = new();
@@ -26,19 +30,21 @@ internal sealed class TrayContext : ApplicationContext
     private readonly System.Windows.Forms.Timer _poll = new() { Interval = (int)PollInterval.TotalMilliseconds };
     /// <summary>Test-page jobs (no local PDF, so not in the tracker) awaiting their terminal balloon.</summary>
     private readonly HashSet<string> _submitted = new();
-    private readonly Queue<(string Text, Action? OnClick)> _startupNotices = new();
     private readonly ToolStripMenuItem _installItem;
+    private readonly ToolStripMenuItem _unsentItem;
+    private readonly ToolStripMenuItem _retryItem;
     private readonly RegisteredWaitHandle? _showWait;
     private readonly EventWaitHandle _showEvent;
     private CancellationTokenSource? _sseCts;
     private Task? _sseTask;
     private SendDialog? _openDialog;
+    private long _noticeId;
     private bool _everConnected;
     private bool _polling;
     private bool _installing;
     private bool _settingsOpen;
-    private Action? _balloonClick;
     private bool _exiting;
+    private bool _exitPending;
 
     public TrayContext()
     {
@@ -50,8 +56,15 @@ internal sealed class TrayContext : ApplicationContext
         FileLog.Info($"config: {_loc.ReadPath} (save to {_loc.Path}, fallback={_loc.IsFallback}), server {_cfg.Server}:{_cfg.Port}, token set={!string.IsNullOrEmpty(_cfg.Token)}");
         if (_cfg.LoadError != null) FileLog.Error("config: " + _cfg.LoadError);
 
+        _notices = new NotificationQueue(ShowBalloon);
+        _noticeTimer.Tick += (_, _) => { _noticeTimer.Stop(); _notices.OnTimeout(_noticeId); };
+
         var menu = new ContextMenuStrip();
         menu.Items.Add("Open LANFax", null, (_, _) => OpenWeb());
+        _unsentItem = new ToolStripMenuItem("", null, (_, _) => OpenOffers(OfferCategory.Unsent)) { Visible = false };
+        _retryItem = new ToolStripMenuItem("", null, (_, _) => OpenOffers(OfferCategory.Retry)) { Visible = false };
+        menu.Items.Add(_unsentItem);
+        menu.Items.Add(_retryItem);
         menu.Items.Add("Send a test page...", null, (_, _) => EnqueueSend(new SendRequest(Guid.NewGuid(), null)));
         menu.Items.Add("Receive a test (arm 20 min)", null, async (_, _) => await ReceiveTestAsync());
         menu.Items.Add(new ToolStripSeparator());
@@ -59,29 +72,29 @@ internal sealed class TrayContext : ApplicationContext
         menu.Items.Add(_installItem);
         menu.Items.Add("Settings...", null, (_, _) => OpenSettings());
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Exit", null, (_, _) => ExitApp());
-        menu.Opening += (_, _) => _installItem.Visible = !_printer.IsInstalled(_cfg.PrinterName);
+        menu.Items.Add("Exit", null, async (_, _) => await ExitAppAsync());
+        menu.Opening += (_, _) =>
+        {
+            _installItem.Visible = !_printer.IsInstalled(_cfg.PrinterName);
+            UpdateOfferItem(_unsentItem, OfferCategory.Unsent);
+            UpdateOfferItem(_retryItem, OfferCategory.Retry);
+        };
 
         _tray = new NotifyIcon { Icon = _iconOff, ContextMenuStrip = menu, Visible = true };
         _tray.DoubleClick += (_, _) => OpenWeb();
-        _tray.BalloonTipClicked += (_, _) =>
-        {
-            var a = _balloonClick; _balloonClick = null;
-            a?.Invoke();
-            ShowNextStartupNotice();
-        };
-        _tray.BalloonTipClosed += (_, _) => ShowNextStartupNotice();
+        _tray.BalloonTipClicked += (_, _) => _notices.OnClicked();
+        _tray.BalloonTipClosed += (_, _) => _notices.OnClosed();
         UpdateConnectionState(false);
 
         _showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ShowEventName);
         _showWait = ThreadPool.RegisterWaitForSingleObject(_showEvent,
             (_, _) => OnUi(() => Balloon("LANFax is already running")), null, Timeout.Infinite, false);
 
-        // Before the watcher starts, so a fresh print job is never mistaken for an orphan.
-        IReadOnlyList<Orphan> orphans = [];
-        try { orphans = _tracker.Scan(); }
-        catch (Exception e) { FileLog.Error("scanning spool\\jobs failed", e); }
-        if (orphans.Count > 0) FileLog.Info($"{orphans.Count} unsent document(s) in spool\\jobs");
+        // Before the watcher starts, so a fresh print job is never mistaken for an unsent leftover.
+        IReadOnlyList<SendRequest> unsent = [];
+        try { unsent = _tracker.Scan(); }
+        catch (Exception e) { FileLog.Error(@"scanning spool\jobs failed", e); }
+        foreach (var u in unsent) FileLog.Info($"spool {u.SpoolId}: unsent document ({u.Kind})");
 
         _spool = new SpoolWatcher(_cfg.SpoolDir) { Log = m => FileLog.Info("spool: " + m) };
         _spool.NewPrintJob += (id, path) => OnUi(() =>
@@ -101,21 +114,14 @@ internal sealed class TrayContext : ApplicationContext
         _poll.Tick += async (_, _) => await PollTrackedAsync();
         _poll.Start();
 
-        // One balloon at a time: the rest follow when it closes or is clicked.
+        // Unsent documents open straight away, one dialog at a time, not behind a balloon that can be missed.
+        if (unsent.Count > 0) OnUi(() => { foreach (var u in unsent) EnqueueSend(u); });
         if (_cfg.LoadError != null)
-            _startupNotices.Enqueue((NotificationText.ConfigProblem(_cfg.LoadError), OpenSettings));
-        if (orphans.Count > 0)
-            _startupNotices.Enqueue((NotificationText.Orphans(orphans.Count), () =>
-            {
-                foreach (var o in orphans)
-                    if (File.Exists(o.PdfPath)) EnqueueSend(new SendRequest(o.SpoolId, o.PdfPath, o.Number, o.Subject));
-            }));
+            Balloon(NotificationText.ConfigProblem(_cfg.LoadError), OpenSettings);
         if (!_printer.IsInstalled(_cfg.PrinterName))
-            _startupNotices.Enqueue(($"The \"{_cfg.PrinterName}\" printer is not installed. Click here to install it.",
-                () => _ = InstallPrinterAsync()));
+            Balloon($"The \"{_cfg.PrinterName}\" printer is not installed. Click here to install it.", () => _ = InstallPrinterAsync());
         else if (string.IsNullOrEmpty(_cfg.Token) && _cfg.LoadError == null)
-            _startupNotices.Enqueue(("Set the server token in LANFax settings. Click here.", OpenSettings));
-        ShowNextStartupNotice();
+            Balloon("Set the server token in LANFax settings. Click here.", OpenSettings);
     }
 
     // ---- threading and notifications ----
@@ -127,20 +133,35 @@ internal sealed class TrayContext : ApplicationContext
         catch (Exception) { /* shutting down */ }
     }
 
+    /// <summary>Queues a balloon: it shows once the ones before it were clicked, closed or timed out.</summary>
     private void Balloon(string text, Action? onClick = null)
     {
-        _balloonClick = onClick;
-        _tray.BalloonTipTitle = "LANFax";
-        _tray.BalloonTipText = text;
-        _tray.BalloonTipIcon = ToolTipIcon.Info;
-        _tray.ShowBalloonTip(6000);
+        if (_exiting) return;
+        _notices.Enqueue(text, onClick);
     }
 
-    private void ShowNextStartupNotice()
+    private void ShowBalloon(NotificationQueue.Notice n)
     {
-        if (_startupNotices.Count == 0) return;
-        var (text, click) = _startupNotices.Dequeue();
-        Balloon(text, click);
+        _noticeTimer.Stop();
+        _noticeId = n.Id;
+        _tray.BalloonTipTitle = "LANFax";
+        _tray.BalloonTipText = n.Text;
+        _tray.BalloonTipIcon = ToolTipIcon.Info;
+        _tray.ShowBalloonTip((int)NotificationQueue.Duration.TotalMilliseconds);
+        _noticeTimer.Start();
+    }
+
+    private void UpdateOfferItem(ToolStripMenuItem item, OfferCategory category)
+    {
+        var n = _offers.Count(category);
+        item.Visible = n > 0;
+        item.Text = OfferBook.MenuText(category, n);
+    }
+
+    private void OpenOffers(OfferCategory category)
+    {
+        foreach (var r in _offers.TakeAll(category))
+            if (r.PdfPath == null || File.Exists(r.PdfPath)) EnqueueSend(r);
     }
 
     private void UpdateConnectionState(bool connected)
@@ -204,17 +225,20 @@ internal sealed class TrayContext : ApplicationContext
             FileLog.Info($"job {j.Id} {j.State}: local copy {r.Outcome}");
             if (r.Outcome == TerminalOutcome.KeptForRetry)
             {
-                var t = r.Tracked;
-                Balloon(NotificationText.ForFailedWithRetry(j), () =>
-                {
-                    var pdf = _tracker.PdfPath(t.SpoolId);
-                    if (File.Exists(pdf)) EnqueueSend(new SendRequest(t.SpoolId, pdf, t.Number, t.Subject));
-                });
+                var req = _tracker.RequestFor(r.Tracked);
+                _offers.Add(OfferCategory.Retry, req); // stays in the tray menu if the balloon is missed
+                Balloon(NotificationText.ForFailedWithRetry(j), () => OpenOffer(req));
             }
             else if (NotificationText.ForTerminalJob(j) is { } text) Balloon(text);
             return;
         }
         if (_submitted.Remove(j.Id) && NotificationText.ForTerminalJob(j) is { } msg) Balloon(msg);
+    }
+
+    /// <summary>A balloon's click: opens the offer unless it was already opened (e.g. from the tray menu).</summary>
+    private void OpenOffer(SendRequest req)
+    {
+        if (_offers.Take(req.SpoolId) && req.PdfPath != null && File.Exists(req.PdfPath)) EnqueueSend(req);
     }
 
     /// <summary>Fallback for missed events: asks the server about every job still waiting for a terminal state.</summary>
@@ -229,68 +253,112 @@ internal sealed class TrayContext : ApplicationContext
             foreach (var id in ids)
             {
                 try { OnJobChanged(await _api.GetJobAsync(id)); }
+                catch (FaxApiException e) when (e.StatusCode == 404)
+                {
+                    OnJobUnknown(id);
+                }
                 catch (FaxApiException e)
                 {
                     FileLog.Info($"poll job {id}: {e.StatusCode} {e.Message}");
                     if (e.StatusCode is 0 or 401) break; // server unreachable or token bad: try next tick
                 }
+                catch (JsonException e) { FileLog.Info($"poll job {id}: unreadable answer ({e.Message})"); }
             }
         }
         finally { _polling = false; }
+    }
+
+    /// <summary>The server has no such job (its database was reset): stop polling and give the document back to the user.</summary>
+    private void OnJobUnknown(string serverId)
+    {
+        _submitted.Remove(serverId);
+        if (_tracker.MarkUnknown(serverId) is not { } t) return;
+        FileLog.Error($"job {serverId} (spool {t.SpoolId}) is unknown to the server; offering the document again");
+        EnqueueSend(_tracker.RequestFor(t));
     }
 
     // ---- send dialogs (one at a time) ----
 
     private void EnqueueSend(SendRequest req)
     {
-        if (_exiting) return;
+        if (_exiting || _exitPending) return;
+        _offers.Remove(req.SpoolId);
+        if (req.PdfPath != null && _queue.Contains(q => q.SpoolId == req.SpoolId)) return; // already open or waiting
         var now = _queue.Enqueue(req);
-        if (now != null) OpenSendDialog(now);
+        if (now != null) ShowSendDialog(now);
         else if (_openDialog != null) _openDialog.Text = _queue.Title(_openDialog.BaseTitle);
     }
 
+    private void ShowSendDialog(SendRequest req) => _queue.Show(req, OpenSendDialog, (r, e) =>
+    {
+        FileLog.Error($"opening the send dialog for spool {r.SpoolId} failed", e);
+        if (r.PdfPath == null) return;
+        _offers.Add(OfferCategory.Unsent, r); // still reachable from the tray menu
+        Balloon("A document could not be opened for sending. Use \"Unsent documents\" in the LANFax menu to try again.");
+    });
+
     private void OpenSendDialog(SendRequest req)
     {
-        var dlg = new SendDialog(_cfg, _api, req, OpenSettings);
-        dlg.Text = _queue.Title(dlg.BaseTitle);
-        dlg.FormClosed += (_, _) => OnSendDialogClosed(dlg);
-        _openDialog = dlg;
-        dlg.Show();
+        var dlg = new SendDialog(_cfg, _api, req, _tracker, OpenSettings);
+        try
+        {
+            dlg.Text = _queue.Title(dlg.BaseTitle);
+            dlg.FormClosed += (_, _) => OnSendDialogClosed(dlg);
+            _openDialog = dlg;
+            dlg.Show();
+        }
+        catch
+        {
+            _openDialog = null;
+            dlg.Dispose();
+            throw;
+        }
     }
 
     private void OnSendDialogClosed(SendDialog dlg)
     {
-        if (_exiting) return; // app exit: leave every file where it is for the next start
-        var req = dlg.Request;
-        var s = dlg.Session;
-        switch (dlg.Outcome)
+        try
         {
-            case SendOutcome.Accepted when s.Accepted is { } job && s.AcceptedPlan is { } plan:
-                if (plan.Route == SendRoute.Document)
-                {
-                    _tracker.Track(plan, job);
-                    if (job.IsTerminal) OnJobChanged(job);
-                }
-                else
-                {
-                    if (req.PdfPath != null) _tracker.Discard(req.SpoolId); // test page instead: document not needed
-                    _submitted.Add(job.Id);
-                }
-                FileLog.Info($"job {job.Id} queued (spool {req.SpoolId}, attempts {s.Attempts})");
-                Balloon(NotificationText.Queued(job, plan.Number));
-                break;
-            case SendOutcome.Cancelled:
-                if (req.PdfPath != null) _tracker.Discard(req.SpoolId);
-                FileLog.Info($"send cancelled (spool {req.SpoolId}, attempts {s.Attempts})");
-                break;
-            default:
-                FileLog.Info($"send dialog abandoned (spool {req.SpoolId}); the document stays for the next start");
-                break;
+            var req = dlg.Request;
+            var s = dlg.Session;
+            switch (dlg.Outcome)
+            {
+                case DialogOutcome.Accepted when s.Accepted is { } job && s.AcceptedPlan is { } plan:
+                    // Tracked even while exiting: the record must say "accepted" before the app goes.
+                    if (plan.Route == SendRoute.Document)
+                    {
+                        _tracker.Track(plan, job);
+                        if (job.IsTerminal) OnJobChanged(job);
+                    }
+                    else
+                    {
+                        if (req.PdfPath != null) _tracker.Discard(req.SpoolId); // test page instead: document not needed
+                        _submitted.Add(job.Id);
+                    }
+                    FileLog.Info($"job {job.Id} queued (spool {req.SpoolId}, attempts {s.Attempts})");
+                    Balloon(NotificationText.Queued(job, plan.Number));
+                    break;
+                case DialogOutcome.Cancelled when !_exiting:
+                    if (req.PdfPath != null) _tracker.Discard(req.SpoolId);
+                    FileLog.Info($"send cancelled (spool {req.SpoolId}, attempts {s.Attempts})");
+                    break;
+                case DialogOutcome.Kept when !_exiting:
+                    _offers.Add(OfferCategory.Unsent, req);
+                    FileLog.Info($"resumed send postponed (spool {req.SpoolId}); kept for the next start");
+                    break;
+                default:
+                    FileLog.Info($"send dialog closed ({dlg.Outcome}, spool {req.SpoolId}); the document stays for the next start");
+                    break;
+            }
         }
-        _openDialog = null;
-        dlg.Dispose();
-        var next = _queue.Complete();
-        if (next != null && !_exiting) OnUi(() => OpenSendDialog(next));
+        catch (Exception e) { FileLog.Error("handling the closed send dialog failed", e); }
+        finally
+        {
+            if (_openDialog == dlg) _openDialog = null;
+            dlg.Dispose();
+            var next = _queue.Complete();
+            if (next != null && !_exiting && !_exitPending) OnUi(() => ShowSendDialog(next));
+        }
     }
 
     // ---- actions ----
@@ -357,10 +425,28 @@ internal sealed class TrayContext : ApplicationContext
         finally { _settingsOpen = false; }
     }
 
-    private void ExitApp()
+    /// <summary>
+    /// Tray Exit. A send on the wire is offered a wait (up to <see cref="ExitWait"/>) so its result is recorded;
+    /// exiting anyway is safe because the record already says "sending" with its key.
+    /// </summary>
+    private async Task ExitAppAsync()
     {
+        if (_exiting || _exitPending) return;
+        if (_openDialog is { Sending: true } dlg)
+        {
+            var r = MessageBox.Show("A fax is being sent. Wait for it?", "LANFax",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button1);
+            if (r == DialogResult.Yes)
+            {
+                _exitPending = true; // no new dialogs while waiting
+                FileLog.Info("exit: waiting for the send in flight");
+                var done = await Task.WhenAny(dlg.Idle, Task.Delay(ExitWait));
+                FileLog.Info(done == dlg.Idle ? "exit: send finished" : "exit: gave up waiting after 30 s");
+            }
+        }
         _exiting = true;
         _poll.Stop();
+        _noticeTimer.Stop();
         _sseCts?.Cancel();
         _spool.Stop();
         _tray.Visible = false;
@@ -373,6 +459,7 @@ internal sealed class TrayContext : ApplicationContext
         {
             _exiting = true;
             _poll.Dispose();
+            _noticeTimer.Dispose();
             _showWait?.Unregister(null);
             _showEvent.Dispose();
             _sseCts?.Cancel();

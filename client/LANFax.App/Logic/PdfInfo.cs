@@ -7,6 +7,13 @@ namespace LANFax.App.Logic;
 /// <summary>Cheap page count for the send dialog (no PDF library): a hint for the user, never used for billing.</summary>
 public static partial class PdfInfo
 {
+    // One indirect object's body: "12 0 obj ... endobj".
+    [GeneratedRegex(@"\d+\s+\d+\s+obj\b(.*?)\bendobj", RegexOptions.Singleline)]
+    private static partial Regex ObjRx();
+
+    [GeneratedRegex(@"/Type\s*/Pages(?![A-Za-z])")]
+    private static partial Regex PagesTypeRx();
+
     [GeneratedRegex(@"/Count\s+(\d{1,6})")]
     private static partial Regex CountRx();
 
@@ -15,15 +22,21 @@ public static partial class PdfInfo
     private static partial Regex PageRx();
 
     /// <summary>
-    /// The largest <c>/Count</c> (the root Pages node counts every page), else the number of Page objects,
-    /// else null. Page objects hidden in compressed object streams are only visible through /Count.
+    /// The largest <c>/Count</c> of a <c>/Type /Pages</c> object (the root counts every page; outlines also carry
+    /// <c>/Count</c> and are ignored), else the number of Page objects, else null. Page objects hidden in
+    /// compressed object streams are only visible through the Pages node.
     /// </summary>
     public static int? CountPages(byte[] pdf)
     {
         var text = Encoding.Latin1.GetString(pdf);
         int max = 0;
-        foreach (Match m in CountRx().Matches(text))
-            if (int.TryParse(m.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var n) && n > max) max = n;
+        foreach (Match obj in ObjRx().Matches(text))
+        {
+            var body = obj.Groups[1].Value;
+            if (!PagesTypeRx().IsMatch(body)) continue;
+            foreach (Match m in CountRx().Matches(body))
+                if (int.TryParse(m.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var n) && n > max) max = n;
+        }
         if (max > 0) return max;
         var pages = PageRx().Count(text);
         return pages > 0 ? pages : null;
@@ -34,6 +47,15 @@ public static partial class PdfInfo
         try { return CountPages(File.ReadAllBytes(path)); }
         catch (Exception) { return null; }
     }
+
+    /// <summary>"N pages, X KB" for a file, computed on the thread pool (large PDFs must not stall the dialog).</summary>
+    /// <param name="onWorker">Test hook, runs on the worker thread.</param>
+    public static Task<string> DescribeFileAsync(string path, Action? onWorker = null) => Task.Run(() =>
+    {
+        onWorker?.Invoke();
+        try { return Describe(CountPages(path), new FileInfo(path).Length); }
+        catch (Exception) { return "unknown size"; }
+    });
 
     public static string Describe(int? pages, long bytes)
     {

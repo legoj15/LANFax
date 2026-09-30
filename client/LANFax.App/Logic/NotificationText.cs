@@ -34,10 +34,6 @@ public static class NotificationText
     public static string ReceiveArmed(DateTimeOffset until) =>
         $"Fax line will answer until {until.ToLocalTime():t}";
 
-    public static string Orphans(int n) => n == 1
-        ? "1 unsent document found. Click here to send or discard it."
-        : $"{n} unsent documents found. Click here to send or discard them.";
-
     public const string Unauthorized = "The server rejected the LANFax token. Click here to open Settings.";
 
     public static string ConfigProblem(string loadError) =>

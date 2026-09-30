@@ -149,8 +149,6 @@ public class NotificationTextTests
     [Fact]
     public void Startup_notices()
     {
-        Assert.Equal("1 unsent document found. Click here to send or discard it.", NotificationText.Orphans(1));
-        Assert.Equal("3 unsent documents found. Click here to send or discard them.", NotificationText.Orphans(3));
         Assert.Equal("The server rejected the LANFax token. Click here to open Settings.", NotificationText.Unauthorized);
         Assert.Equal("LANFax settings could not be read (config.json is not valid JSON). Click here to open Settings.",
             NotificationText.ConfigProblem("config.json is not valid JSON"));
@@ -284,11 +282,27 @@ public class ConfigLocationTests
 
 public class InstallerScriptTests
 {
-    static string Iss()
+    static string IssPath()
     {
         var d = new DirectoryInfo(AppContext.BaseDirectory);
         while (d != null && !File.Exists(Path.Combine(d.FullName, "install", "LANFax.iss"))) d = d.Parent;
-        return File.ReadAllText(Path.Combine(d!.FullName, "install", "LANFax.iss"));
+        return Path.Combine(d!.FullName, "install", "LANFax.iss");
+    }
+
+    static string Iss() => File.ReadAllText(IssPath());
+
+    /// <summary>The non-comment lines of one [Section].</summary>
+    static List<string> Section(string name)
+    {
+        var lines = new List<string>();
+        bool inside = false;
+        foreach (var raw in File.ReadAllLines(IssPath()))
+        {
+            var l = raw.Trim();
+            if (l.StartsWith('[') && l.EndsWith(']')) { inside = l == "[" + name + "]"; continue; }
+            if (inside && l.Length > 0 && !l.StartsWith(';')) lines.Add(l);
+        }
+        return lines;
     }
 
     [Fact]
@@ -299,23 +313,57 @@ public class InstallerScriptTests
         Assert.Matches(@"Exec\(.*powershell\.exe", t);
         Assert.Contains("ResultCode", t);
         Assert.Contains("SuppressibleMsgBox", t);
-        // No longer a fire-and-forget [Run] entry whose exit code nobody reads.
         Assert.DoesNotMatch(@"(?m)^Filename:.*Install-LANFaxPrinter", t);
     }
 
     [Fact]
-    public void Uninstall_stops_the_running_app_first()
+    public void Uninstall_stops_the_running_app_in_the_uninstall_step_not_at_initialization()
     {
         var t = Iss();
-        Assert.Contains("InitializeUninstall", t);
-        Assert.Matches(@"taskkill.*LANFax\.exe|taskkill.*\{#AppExe\}", t);
+        // Killing in InitializeUninstall would stop the app even when the user then declines the uninstall.
+        Assert.DoesNotContain("InitializeUninstall", t);
+        var m = System.Text.RegularExpressions.Regex.Match(t,
+            @"procedure CurUninstallStepChanged\(CurUninstallStep: TUninstallStep\);(?<body>.*?)\r?\nend;",
+            System.Text.RegularExpressions.RegexOptions.Singleline);
+        Assert.True(m.Success, "CurUninstallStepChanged missing");
+        Assert.Matches(@"(?s)usUninstall.*taskkill.*\{#AppExe\}", m.Groups["body"].Value);
     }
 
     [Fact]
-    public void Shared_data_dir_is_users_modify_by_decision()
+    public void Shared_data_dir_is_users_modify()
     {
-        var t = Iss();
-        Assert.Contains(@"Name: ""{commonappdata}\LANFax""; Permissions: users-modify", t);
-        Assert.Matches(@"(?im)^;.*deliberate.*shared", t);
+        var dirs = Section("Dirs");
+        Assert.Contains(@"Name: ""{commonappdata}\LANFax""; Permissions: users-modify", dirs);
+    }
+
+    [Fact]
+    public async Task Script_compiles_with_inno_setup_when_installed()
+    {
+        const string iscc = @"E:\Program Files (x86)\Inno Setup 6\ISCC.exe";
+        if (!File.Exists(iscc)) return; // Inno Setup is not on this machine: the static checks above still run
+        var tmp = Path.Combine(Path.GetTempPath(), "lanfax-iscc-" + Guid.NewGuid().ToString("N"));
+        var stub = Path.Combine(tmp, "app");
+        var output = Path.Combine(tmp, "out");
+        Directory.CreateDirectory(stub);
+        try
+        {
+            File.WriteAllText(Path.Combine(stub, "LANFax.exe"), "stub"); // [Files] needs the published app; a stub is enough to compile
+            var psi = new ProcessStartInfo(iscc)
+            {
+                RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add("/Q");
+            psi.ArgumentList.Add("/O" + output);
+            psi.ArgumentList.Add("/DAppSource=" + stub);
+            psi.ArgumentList.Add(IssPath());
+            using var p = Process.Start(psi)!;
+            var stdout = p.StandardOutput.ReadToEndAsync();
+            var stderr = p.StandardError.ReadToEndAsync();
+            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+            await p.WaitForExitAsync(cts.Token);
+            Assert.True(p.ExitCode == 0, $"ISCC exit {p.ExitCode}: {await stderr} {await stdout}");
+            Assert.True(File.Exists(Path.Combine(output, "LANFax-Setup.exe")));
+        }
+        finally { try { Directory.Delete(tmp, true); } catch { } }
     }
 }

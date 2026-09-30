@@ -4,6 +4,10 @@
 #define AppName "LANFax"
 #define AppVersion "0.2.0"
 #define AppExe "LANFax.exe"
+; The published app folder. The test suite compiles this script with /DAppSource=<stub dir>, so no publish is needed there.
+#ifndef AppSource
+  #define AppSource "..\dist\app"
+#endif
 
 [Setup]
 AppId={{7D3B9C52-4E0A-4B8E-9F1D-2A6C5E8B4F13}
@@ -33,7 +37,7 @@ Name: "{commonappdata}\LANFax\spool"; Permissions: users-modify
 Name: "{commonappdata}\LANFax\spool\jobs"; Permissions: users-modify
 
 [Files]
-Source: "..\dist\app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#AppSource}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; The publish output already carries install\*.ps1; listed again so the installer never ships without them.
 Source: "*.ps1"; DestDir: "{app}\install"; Flags: ignoreversion
 
@@ -74,11 +78,12 @@ begin
     InstallPrinter;
 end;
 
-function InitializeUninstall(): Boolean;
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
 begin
-  // Stop every running tray instance (all sessions) so its files can be removed; failure (none running) is fine.
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Result := True;
+  // Only once the user has confirmed the uninstall: stop every running tray instance (all sessions) so its files
+  // can be removed. Failure (none running) is fine.
+  if CurUninstallStep = usUninstall then
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
