@@ -543,6 +543,182 @@ public class PrintPipeListenerTests : IDisposable
     }
 
     [Fact]
+    public async Task AJobWhoseRenameFailsIsCopiedIntoPlaceAndRaised()
+    {
+        // A scanner (or anything) holds the finished .part without FILE_SHARE_DELETE past the rename's retries: the
+        // complete job is copied to <id>.pdf and raised, never left under .part (which the tracker does not see).
+        var l = Make();
+        l.Start();
+        var pdf = Pdf(10_000);
+        var c = Connect();
+        c.Write(pdf[..3000]);
+        c.Flush();
+        await WaitFor(() => Directory.Exists(JobsDir) && Directory.GetFiles(JobsDir, "*.part").Length == 1);
+        var part = Directory.GetFiles(JobsDir, "*.part")[0];
+        using (var holder = new FileStream(part, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            c.Write(pdf[3000..]);
+            c.Flush();
+            c.Dispose();
+            await WaitFor(() => Count == 1);
+        }
+        Assert.Equal(pdf, File.ReadAllBytes(_events[0].path));
+        Assert.Equal(Path.Combine(JobsDir, _events[0].id + ".pdf"), _events[0].path);
+        Assert.Equal(0, ErrorCount);
+        // The .part could not be deleted while held: the next start sets it aside as a copy, not as a new job.
+        l.Stop();
+        var again = Make();
+        again.Start();
+        Assert.Single(Directory.GetFiles(JobsDir, "*.pdf"));
+        Assert.Empty(Directory.GetFiles(JobsDir, "*.part"));
+        Assert.Equal(0, ErrorCount);
+    }
+
+    [Fact]
+    public void ACompletePartWithoutItsPdfIsSetAsideAndReportedNeverOfferedAgain()
+    {
+        // A whole job left as <id>.pdf.part with no <id>.pdf beside it: either its copy was delivered and the .part
+        // could not be deleted (the user has since sent or cancelled it, so <id>.pdf is gone), or its rename and copy
+        // both failed. The two cannot be told apart, and re-offering a faxed document would fax it twice: it goes to
+        // rejected\ with one Error, never back into jobs\.
+        Directory.CreateDirectory(JobsDir);
+        var id = Guid.NewGuid();
+        var pdf = Pdf(50);
+        File.WriteAllBytes(Path.Combine(JobsDir, id + ".pdf.part"), pdf);
+        var l = Make();
+        l.Start();
+        Assert.False(File.Exists(Path.Combine(JobsDir, id + ".pdf")));
+        Assert.Empty(Directory.GetFiles(JobsDir));
+        Assert.Equal(pdf, File.ReadAllBytes(Assert.Single(Files(RejectedDir))));
+        lock (_errors) Assert.Contains("may already have been faxed", Assert.Single(_errors).reason);
+        Assert.Equal(0, Count);
+    }
+
+    [Fact]
+    public async Task AJobAlreadyDeliveredByCopyIsNotOfferedAgainOnceItsPdfIsGone()
+    {
+        // The rename fails, the copy is delivered and the held .part cannot be deleted; the user then sends the job
+        // (the tracker moves <id>.pdf away). A restart must not turn the leftover .part back into <id>.pdf.
+        var l = Make();
+        l.Start();
+        var pdf = Pdf(10_000);
+        var c = Connect();
+        c.Write(pdf[..3000]);
+        c.Flush();
+        await WaitFor(() => Directory.Exists(JobsDir) && Directory.GetFiles(JobsDir, "*.part").Length == 1);
+        var part = Directory.GetFiles(JobsDir, "*.part")[0];
+        using (var holder = new FileStream(part, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            c.Write(pdf[3000..]);
+            c.Flush();
+            c.Dispose();
+            await WaitFor(() => Count == 1);
+            l.Stop();
+        }
+        File.Delete(_events[0].path); // sent: the tracker moved it out of jobs\
+        var again = Make();
+        again.Start();
+        Assert.Empty(Directory.GetFiles(JobsDir, "*.pdf"));
+        Assert.Empty(Directory.GetFiles(JobsDir, "*.part"));
+        Assert.Equal(pdf, File.ReadAllBytes(Assert.Single(Files(RejectedDir))));
+        Assert.Equal(1, Count); // raised once, in the first session only
+        again.Stop();
+    }
+
+    [Fact]
+    public async Task AListenerThatStoppedByItselfIsNotRunningAndStartsAgain()
+    {
+        // Any unexpected fault ends the serve loop ("print pipe listener stopped"): IsRunning says so, so the tray can
+        // restart it, and Start serves the pipe again.
+        var l = Make();
+        bool thrown = false;
+        l.Log = m => { if (!thrown && m.Contains(" received,")) { thrown = true; throw new InvalidOperationException("boom"); } };
+        l.Start();
+        Assert.True(l.IsRunning);
+        Send(Pdf());
+        await WaitFor(() => !l.IsRunning);
+        Assert.False(l.IsListening);
+        Assert.Contains(_errors, e => e.reason.Contains("listener stopped"));
+        l.Start();
+        Assert.True(l.IsRunning && l.IsListening);
+        Send(Pdf(5, (byte)'z'));
+        await WaitFor(() => Count == 1);
+    }
+
+    [Fact]
+    public async Task IsRunningStaysTrueWhileTheNameIsTakenAndGoesFalseOnStop()
+    {
+        using var squatter = new NamedPipeServerStream(_pipe, PipeDirection.In, 4, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        var l = Make();
+        l.NameRetry = TimeSpan.FromMilliseconds(50);
+        l.Start();
+        await Task.Delay(200);
+        Assert.False(l.IsListening);
+        Assert.True(l.IsRunning); // still trying: not a dead listener
+        l.Stop();
+        Assert.False(l.IsRunning);
+    }
+
+    [Fact]
+    public async Task ASecondStopWaitsForTheJobTheFirstIsFinishing()
+    {
+        // The tray's Exit runs Stop off the UI thread; a WM_ENDSESSION meanwhile calls Stop again. That second call
+        // must wait for the job in flight too, or Windows ends the process mid-job.
+        var l = Make();
+        l.Start();
+        var pdf = Pdf(10_000);
+        var c = Connect();
+        c.Write(pdf[..3000]);
+        c.Flush();
+        await WaitFor(() => Directory.Exists(JobsDir) && Directory.GetFiles(JobsDir, "*.part").Length == 1);
+        var first = Task.Run(l.Stop);
+        await Task.Delay(200);
+        var second = Task.Run(l.Stop);
+        await Task.Delay(1000);
+        Assert.False(second.IsCompleted, "the second Stop returned while the job was still arriving");
+        c.Write(pdf[3000..]);
+        c.Flush();
+        c.Dispose();
+        await Task.WhenAll(first, second).WaitAsync(PrintPipeListener.StopWait + TimeSpan.FromSeconds(2));
+        Assert.False(l.IsReceiving);
+        Assert.Equal(pdf, File.ReadAllBytes(Assert.Single(Directory.GetFiles(JobsDir, "*.pdf"))));
+    }
+
+    [Fact]
+    public async Task StartAfterAStopThatGaveUpSaysThePreviousListenerIsStillFinishing()
+    {
+        // A Stop that gave up (the loop is still busy) leaves our own instances on the name: that is not a squatter.
+        using var gate = new ManualResetEventSlim();
+        var l = Make();
+        l.NameRetry = TimeSpan.FromMilliseconds(50);
+        l.Log = m => { if (m.Contains(" received,")) gate.Wait(TimeSpan.FromSeconds(60)); };
+        l.Start();
+        Send(Pdf());
+        await WaitFor(() => Directory.Exists(JobsDir) && Directory.GetFiles(JobsDir, "*.pdf").Length == 1);
+        l.Stop(); // gives up after StopWait: the loop is blocked in the log call
+        l.Start();
+        gate.Set();
+        lock (_errors)
+        {
+            var e = Assert.Single(_errors);
+            Assert.Contains("still finishing", e.reason);
+            Assert.DoesNotContain("another program", e.reason);
+        }
+        await WaitFor(() => l.IsListening, 10000); // takes the name once the old loop is gone
+    }
+
+    [Theory]
+    [MemberData(nameof(PdfAcceptanceVectors.Names), MemberType = typeof(PdfAcceptanceVectors))]
+    public void IsOneCompletePdfAppliesTheSharedAcceptanceRule(string name)
+    {
+        var (_, bytes, accepted) = PdfAcceptanceVectors.Get(name);
+        Directory.CreateDirectory(_dir);
+        var path = Path.Combine(_dir, name + ".pdf");
+        File.WriteAllBytes(path, bytes);
+        Assert.Equal(accepted, PrintPipeListener.IsOneCompletePdf(path, PdfAcceptanceVectors.MaxBytes));
+    }
+
+    [Fact]
     public void PipePathUsesTheName()
     {
         Assert.Equal(@"\\.\pipe\LANFax", PrintPipeListener.PortName(PrintPipeListener.DefaultPipeName));

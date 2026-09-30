@@ -34,6 +34,7 @@ client/
     FaxApi.cs                       ISendApi (post job, test send, both to a SendEndpoint snapshot, PDF as byte[]) + HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download; FaxApiConfigException
     EventStream.cs                  SSE client: GET /events?token=, Last-Event-ID, stall detection, reconnect with backoff, raises typed events
     PrintPipeListener.cs            serves the printer's pipe port \\.\pipe\LANFax (ACL: deny NETWORK, allow SYSTEM + current user, job-writing rights for Authenticated Users; first instance only, retried while taken; 2 instances); streams each connection to jobs/<guid>.pdf.part, flushes, renames to jobs/<guid>.pdf (or moves to rejected/); raises NewPrintJob / Error; EofCounter
+    OldPortLeftover.cs              sorts a document left in the old file port spool\print.pdf into jobs/ (one complete PDF) or rejected/; the tray runs it at start and after an install
     Numbers.cs                      normalize_number / check_number mirror (shared vectors: LANFax.Tests/numbers-vectors.json)
     Models.cs                       Job, ArmState, ServerStatus records mirroring faxd JSON
   (PrinterSetup, which detects the printer and launches the elevated install/uninstall script, lives in LANFax.App)
@@ -88,6 +89,30 @@ client/
   Missing or Misconfigured gets the same balloon as at start once per
   change, never on every tick; a change back to Installed is silent; the
   start-up status is the baseline; ticks are skipped while an install runs.
+  The same 30 s tick checks the listener (`PrintPipeListener.IsRunning`,
+  true while it serves or retries a taken name): one that ended on an
+  unexpected fault (reported once as "print pipe listener stopped: ...") is
+  started again, which also restarts the 10-minute stuck-job window (jobs
+  printed meanwhile wait in the queue). `ListenerWatch` (Logic,
+  unit-tested): the first restart of a session gets a balloon ("Receiving
+  from the "LAN Fax" printer had stopped; LANFax started it again ..."),
+  later ones are only logged. After a restart the tray offers any document
+  in `jobs\` not offered yet (a job the stopped loop saved but never
+  raised). A deliberate stop (WM_ENDSESSION, Exit) tells `ListenerWatch`
+  (`StoppedOnPurpose`), which then never restarts it: the session-end stop
+  does not end the tray, so without that the next tick started it again.
+- The tray runs the install script elevated (UAC, `runas`) through
+  `powershell -EncodedCommand`, a wrapper that appends every line the script
+  writes (all streams) to a temp file and adds "error: ..." with exit code 1
+  when it throws; it exits 0 otherwise, unless the script ended with its own
+  non-zero `exit N` (then N; `$?` tells that apart from a native command the
+  script ran and tolerated, which leaves `$LASTEXITCODE` non-zero); an elevated ShellExecute process cannot have its output
+  redirected. `PrinterSetup.InstallAsync` returns an `InstallResult`: a
+  non-zero exit code is a failure even when the port already reads right;
+  every line goes to the log (warning/error lines at error level), and the
+  success balloon names the first "warning:" line. After every install the
+  tray retries the leftover `print.pdf` (below) and offers any new document
+  in `jobs\` (`OfferRescuedDocuments`, `JobTracker.NewDocuments`).
 - Install script (idempotent, PowerShell 5.1): creates the pipe port if
   missing, adds the printer on it or moves an existing one onto it, removes
   the old file port `<spool dir>\print.pdf` when no printer uses it, lists
@@ -97,10 +122,17 @@ client/
   and document names in the script output; harmless unless someone
   restarts one, which would fax it again, so the user deletes them), moves a
   non-empty document left in the old `print.pdf` to `spool\jobs\<guid>.pdf`
-  (the tray offers it as unsent at its start) only when `Test-SinglePdf`
+  (the tray offers it as unsent at its start, and right after a printer
+  install from the tray) only when `Test-SinglePdf`
   accepts it by the listener's rule ("Print job acceptance" below); anything
   else (two jobs written over each other, a cut-off one) goes to
-  `spool\rejected\print-<guid>.pdf` and is never offered. It resumes a
+  `spool\rejected\print-<guid>.pdf` and is never offered. That step only
+  warns when it fails (the file locked by a viewer or a scanner), so the tray
+  does the same sorting itself (`OldPortLeftover`, Core, tested) at every
+  start before its unsent scan and after every install, whenever
+  `print.pdf` exists and the printer no longer prints to it; a file it
+  cannot move gets a balloon and is retried next time, one it rejects gets a
+  balloon naming where it went. It resumes a
   paused queue, and removes
   exactly one ACE if present: the
   BUILTIN\Users allow `0x0002000C` (manage printer) that the superseded
@@ -141,7 +173,12 @@ client/
   Jobs are handled one at a time in arrival order.
 - Per connection: stream to `jobs\<guid>.pdf.part` (64 KB buffer, never the
   whole job in memory), `Flush(true)`, rename to `jobs\<guid>.pdf`, raise
-  `NewPrintJob(guid, path)`. End of stream (the client closed) is the end of
+  `NewPrintJob(guid, path)`. A rename that still fails after its ~1 s of
+  retries (a scanner holding the file without FILE_SHARE_DELETE) falls back
+  to copying the job to `jobs\<guid>.pdf` (raised as usual; the `.part` is
+  deleted, or set aside at the next start when that fails too); if the copy
+  fails as well, the `.part` stays and is reported (moved to `rejected\` at
+  the next start: print it again). End of stream (the client closed) is the end of
   the job. Rejected, moved to `rejected\<guid>.pdf` and reported through
   `Error` (never deleted): a job that fails "Print job acceptance" below
   (over `MaxJobBytes`: the first 200 MB are kept, the rest is read and
@@ -156,9 +193,18 @@ client/
   the stall, it does not prevent a program that reconnects in a loop.
   A failure on our side while writing (disk full, `jobs\` not writable)
   drops the connection, moves the `.part` to `rejected\` and reports it.
-- Start moves stale `jobs\*.part` (a crash mid-job) to `rejected\` and logs
-  it, unless a loop an earlier `Stop` gave up on is still running (its
-  `.part` is not stale; the sweep waits for the next start). `*.pdf.part` never matches the tracker's `jobs\*.pdf` scan.
+- Start sweeps `jobs\*.part`, unless a loop an earlier `Stop` gave up on is
+  still running (its `.part` is not stale; the sweep waits for the next
+  start). Every `.part` goes to `rejected\`, never back into `jobs\`: one
+  beside its `<guid>.pdf` is the copy a failed rename left (logged); one that
+  passes "Print job acceptance" with no `<guid>.pdf` beside it is either
+  such a copy whose job was since sent or cancelled (the tracker moved the
+  `.pdf` away) or a job whose rename and copy both failed. The two cannot be
+  told apart and offering a sent job again would fax it twice, so it goes to
+  `rejected\<guid>.pdf` and is reported through `Error` ("... may already
+  have been faxed ... check before faxing it"); anything else (a crash
+  mid-job) is logged. `*.pdf.part` never matches the tracker's `jobs\*.pdf`
+  scan.
 - `Stop()`: no new connection, nothing raised any more (a job rejected or
   failing during the grace is only logged); a job in progress
   gets `StopGrace` (5 s) to finish and is then kept in `jobs\` (offered as
@@ -170,11 +216,20 @@ client/
   (only pausing the printer first would close that). `Stop` blocks at most
   `StopWait` (7 s); a loop still busy then (slow disk) is logged and finishes
   in the background, and the next `Start` waits for it before sweeping
-  `.part` files. Idle stop is immediate. Tray Exit runs `Stop` off the UI
-  thread and sets the tray tooltip while a document is still arriving.
+  `.part` files; while that loop still holds the name, `Start` reports "the
+  previous listener ... is still finishing a job" instead of the
+  "another program is already listening" squatter message. Idle stop is
+  immediate. A `Stop` called while another is in progress waits for the
+  same loop until the first one's `StopWait` runs out (the tray's Exit runs
+  `Stop` off the UI thread, and a WM_ENDSESSION meanwhile calls it again;
+  without that the second call returned at once and Windows could end the
+  process mid-job). Tray Exit sets the tray tooltip while a document is
+  still arriving.
 - Print job acceptance (one rule, applied by `PrintPipeListener` to every
-  job and by the install script's `Test-SinglePdf` to a document left in the
-  old `print.pdf`; `PdfAcceptanceVectors` in LANFax.Tests pins both): the
+  job, by `PrintPipeListener.IsOneCompletePdf` to a file (the start sweep and
+  the tray's leftover rescue) and by the install script's `Test-SinglePdf` to
+  a document left in the old `print.pdf`; `PdfAcceptanceVectors` in
+  LANFax.Tests pins all three): the
   bytes start with `%PDF`, hold exactly one `%%EOF`, have nothing but PDF
   whitespace (space, CR, LF, tab, FF, NUL) after it, and are at most 200 MB.
   Print To PDF writes exactly one `%%EOF` (every probe run), so this refuses
@@ -262,6 +317,8 @@ client/
     `/ModDate`, which have 1 s resolution). Suppressing a repeat hash would
     swallow an intentional reprint, so there is none; the stuck-jobs balloon
     says a restart can deliver a document twice and to send only one copy.
+    The `-Same` probe passes when every print arrived and the queue is empty,
+    and prints identical files as a NOTE, not a failure.
   - Listener stopped mid-job (40 pages, the spooler writes while the driver
     renders, so the job takes 15-20 s): the job goes to "Error, Printing" and
     is **not** retried by the spooler (30 s, 60 s and 10+ minutes seen) even

@@ -54,6 +54,8 @@ public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPi
     private CancellationTokenSource? _abort;  // cancelled StopGrace after Stop: a job still arriving is cut off
     private Task? _loop;
     private Task? _lingering; // a loop Stop gave up waiting for; the next Start waits for it before sweeping .part files
+    private Task? _stopping;  // the loop the last Stop waits for, and until when: a concurrent Stop waits for it too
+    private DateTime _stopDeadline;
     private volatile bool _serving;
     private volatile bool _receiving;
 
@@ -95,6 +97,14 @@ public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPi
 
     /// <summary>True while the pipe is served (false while another program holds the name).</summary>
     public bool IsListening { get { lock (_gate) return _serving && _loop is { IsCompleted: false }; } }
+
+    /// <summary>
+    /// True from <see cref="Start"/> until <see cref="Stop"/> or until the listener stopped by itself (an unexpected
+    /// fault, reported through <see cref="Error"/>). Unlike <see cref="IsListening"/> it stays true while another
+    /// program holds the name and the listener keeps retrying. False means nothing will serve the pipe until the next
+    /// <see cref="Start"/>.
+    /// </summary>
+    public bool IsRunning { get { lock (_gate) return _loop is { IsCompleted: false }; } }
 
     /// <summary>
     /// True while a print job is in flight: from the moment a client is connected until its file is saved (renamed
@@ -150,8 +160,38 @@ public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPi
         return counter.Count;
     }
 
-    /// <summary>Why the first instance could not be created: ERROR_ACCESS_DENIED from FILE_FLAG_FIRST_PIPE_INSTANCE means the name exists.</summary>
-    private string CannotTake(Exception e) => e is UnauthorizedAccessException ? NameTaken : $"cannot open {PipePath}: {e.Message}";
+    /// <summary>
+    /// The acceptance rule on a file (docs/client-spec.md "Print job acceptance"): starts with <c>%PDF</c>, exactly one
+    /// <c>%%EOF</c> with nothing but PDF whitespace after it, at most <paramref name="maxBytes"/>. Opened for reading
+    /// with FileShare.Read, so a file someone is still writing throws <see cref="IOException"/>.
+    /// </summary>
+    public static bool IsOneCompletePdf(string path, long maxBytes)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, BufferBytes);
+        if (fs.Length < 4 || fs.Length > maxBytes) return false;
+        var head = new byte[4];
+        fs.ReadExactly(head);
+        if (head is not [(byte)'%', (byte)'P', (byte)'D', (byte)'F']) return false;
+        var counter = new EofCounter();
+        counter.Feed(head);
+        var buf = new byte[BufferBytes];
+        int n;
+        while ((n = fs.Read(buf, 0, buf.Length)) > 0) counter.Feed(buf.AsSpan(0, n));
+        return counter.Count == 1 && counter.EndsWithEof;
+    }
+
+    /// <summary>
+    /// Why the first instance could not be created: ERROR_ACCESS_DENIED from FILE_FLAG_FIRST_PIPE_INSTANCE means the
+    /// name exists. While <paramref name="previous"/> (a loop the last Stop gave up on) still runs, the holder is
+    /// most likely that loop, not another program (with both its instances open the create fails as "all pipe
+    /// instances are busy" instead).
+    /// </summary>
+    private string CannotTake(Exception e, Task? previous) =>
+        previous is { IsCompleted: false } ? StillFinishing
+        : e is UnauthorizedAccessException ? NameTaken
+        : $"cannot open {PipePath}: {e.Message}";
+
+    private string StillFinishing => $"the previous listener on {PipePath} is still finishing a job; print jobs are taken again once it is done";
 
     private string NameTaken => $"another program is already listening on {PipePath} (a second LANFax, LANFax of another signed-in user, or a program posing as it); print jobs go there, not here";
 
@@ -166,7 +206,8 @@ public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPi
         {
             if (_loop is { IsCompleted: false }) return;
             try { _lingering?.Wait(StopWait); } catch (AggregateException) { }
-            bool stillWriting = _lingering is { IsCompleted: false };
+            var previous = _lingering is { IsCompleted: false } ? _lingering : null;
+            bool stillWriting = previous != null;
             _lingering = null;
             Directory.CreateDirectory(JobsDir);
             // A loop the last Stop gave up on may still be writing its .part: that one is not stale. Swept next start.
@@ -174,13 +215,13 @@ public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPi
             else MoveStaleParts();
             NamedPipeServerStream? first = null;
             try { first = CreateInstance(first: true); }
-            catch (Exception e) when (e is UnauthorizedAccessException or IOException) { Report(CannotTake(e), e, rateLimited: false); }
+            catch (Exception e) when (e is UnauthorizedAccessException or IOException) { Report(CannotTake(e, previous), e, rateLimited: false); }
             _accept = new CancellationTokenSource();
             _abort = new CancellationTokenSource();
             var accept = _accept.Token;
             var abort = _abort.Token;
             _serving = first != null;
-            _loop = Task.Run(() => RunAsync(first, accept, abort));
+            _loop = Task.Run(() => RunAsync(first, accept, abort, previous));
         }
     }
 
@@ -193,14 +234,28 @@ public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPi
     /// there). A connection that arrives in the instant between the last check and closing the pipe is dropped the
     /// same way; only pausing the printer first would close that. Blocks at most <see cref="StopWait"/>; if the loop
     /// is still busy then (a slow disk), it is logged, finishes in the background, and the next <see cref="Start"/>
-    /// waits for it.
+    /// waits for it. A Stop while another is in progress (the tray's Exit, then WM_ENDSESSION) waits for the same
+    /// loop, until the first one's <see cref="StopWait"/> runs out.
     /// </summary>
     public void Stop()
     {
         CancellationTokenSource? accept, abort;
-        Task? loop;
-        lock (_gate) { accept = _accept; abort = _abort; loop = _loop; _accept = null; _abort = null; _loop = null; }
-        if (accept == null || abort == null) return;
+        Task? loop, pending = null;
+        TimeSpan left = TimeSpan.Zero;
+        lock (_gate)
+        {
+            accept = _accept; abort = _abort; loop = _loop; _accept = null; _abort = null; _loop = null;
+            if (accept == null) { pending = _stopping; left = _stopDeadline - DateTime.UtcNow; }
+            else { _stopping = loop; _stopDeadline = DateTime.UtcNow + StopWait; }
+        }
+        if (accept == null || abort == null)
+        {
+            if (pending is { IsCompleted: false } && left > TimeSpan.Zero)
+            {
+                try { pending.Wait(left); } catch (AggregateException) { /* reported by the loop */ }
+            }
+            return;
+        }
         accept.Cancel();
         abort.CancelAfter(StopGrace);
         bool done = true;
@@ -220,12 +275,36 @@ public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPi
 
     public void Dispose() => Stop();
 
+    /// <summary>
+    /// A <c>.part</c> left in jobs\ at start goes to rejected\, never back into jobs\. Beside its saved
+    /// <c>&lt;guid&gt;.pdf</c> it is the copy a failed rename left behind (logged). One complete PDF without its
+    /// <c>.pdf</c> is either such a copy whose job was since sent or cancelled, or a job whose rename and copy both
+    /// failed; the two cannot be told apart and offering a faxed job again would fax it twice, so it is set aside and
+    /// reported through <see cref="Error"/>. Anything else is an interrupted job (logged).
+    /// </summary>
     private void MoveStaleParts()
     {
         foreach (var part in Directory.EnumerateFiles(JobsDir, "*.part").ToList())
         {
             try
             {
+                var done = part[..^".part".Length];
+                if (done.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (File.Exists(done))
+                    {
+                        Log?.Invoke($"pipe: {Path.GetFileName(part)} is a copy of the saved {Path.GetFileName(done)} (its rename had failed); moved to {MoveToRejected(part)}");
+                        continue;
+                    }
+                    if (IsOneCompletePdf(part, MaxJobBytes))
+                    {
+                        // Its copy may have been delivered and sent (or cancelled) since: never offered again.
+                        var aside = MoveToRejected(part, Path.GetFileName(done));
+                        Report($"a complete print job from an earlier session was set aside as {aside}; it may already have been faxed (its rename had failed), so check before faxing it",
+                            new IOException("complete .part without its .pdf: " + part), rateLimited: false);
+                        continue;
+                    }
+                }
                 var dest = MoveToRejected(part);
                 Log?.Invoke($"pipe: stale {Path.GetFileName(part)} from an interrupted job moved to {dest}");
             }
@@ -242,7 +321,7 @@ public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPi
     /// not be created) the name is free for a moment, so it is taken again the same way: a program that grabbed it in
     /// that moment is reported, never joined.
     /// </summary>
-    private async Task RunAsync(NamedPipeServerStream? first, CancellationToken accept, CancellationToken abort)
+    private async Task RunAsync(NamedPipeServerStream? first, CancellationToken accept, CancellationToken abort, Task? previous)
     {
         // Start reported a taken name already; a name lost later is reported at once.
         var reported = first == null ? DateTime.UtcNow : DateTime.MinValue;
@@ -261,7 +340,7 @@ public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPi
                         if (DateTime.UtcNow - reported >= NameTakenRepeat)
                         {
                             reported = DateTime.UtcNow;
-                            Report(CannotTake(e), e, rateLimited: false);
+                            Report(CannotTake(e, previous), e, rateLimited: false);
                         }
                         await Task.Delay(NameRetry, accept);
                     }
@@ -450,8 +529,18 @@ public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPi
         try { MoveFile(part, dest); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
-            Report($"a print job arrived but could not be renamed; it is kept as {part}: {e.Message}", e, rateLimited: false, stopping);
-            return;
+            // Something (a scanner) still holds the file without FILE_SHARE_DELETE: copy the whole job into place
+            // instead. The tracker only sees <id>.pdf, so a job left as .part would never be offered in this session.
+            try { File.Copy(part, dest); }
+            catch (Exception c) when (c is IOException or UnauthorizedAccessException)
+            {
+                try { File.Delete(dest); } catch (Exception d) when (d is IOException or UnauthorizedAccessException) { } // our own partial copy, if any
+                Report($"a print job arrived but could not be saved as {dest} ({c.Message}); it is kept as {part}, moved to {RejectedDir} at the next start of LANFax: print it again", c, rateLimited: false, stopping);
+                return;
+            }
+            Log?.Invoke($"pipe: renaming {Path.GetFileName(part)} failed ({e.Message}); copied to {dest}");
+            try { File.Delete(part); }
+            catch (Exception d) when (d is IOException or UnauthorizedAccessException) { Log?.Invoke($"pipe: cannot delete {part} (a copy of {dest}); set aside at the next start: {d.Message}"); }
         }
         Log?.Invoke($"pipe: job {id} received, {total} bytes");
         // Complete and on disk. Stopped meanwhile: it stays in jobs\, where the next start offers it as unsent.

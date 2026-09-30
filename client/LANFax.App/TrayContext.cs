@@ -37,6 +37,7 @@ internal sealed class TrayContext : ApplicationContext
     private readonly System.Windows.Forms.Timer _poll = new() { Interval = (int)PollInterval.TotalMilliseconds };
     private readonly System.Windows.Forms.Timer _printerCheck = new() { Interval = (int)PrinterCheckInterval.TotalMilliseconds };
     private readonly PrinterWatch _printerWatch;
+    private readonly ListenerWatch _listenerWatch = new();
     /// <summary>Asks Windows to wait for sign-out/shutdown while a print job is arriving through the pipe.</summary>
     private readonly ShutdownBlocker _shutdown;
     /// <summary>Test-page jobs (no local PDF, so not in the tracker) awaiting their terminal balloon.</summary>
@@ -136,6 +137,10 @@ internal sealed class TrayContext : ApplicationContext
         _showWait = ThreadPool.RegisterWaitForSingleObject(_showEvent,
             (_, _) => OnUi(() => Balloon("LANFax is already running")), null, Timeout.Infinite, false);
 
+        // A document left in the old file port by an install before 2026-09-30 goes to jobs\ (offered below) or
+        // rejected\. Retried at every start: the install script only warns when it cannot move it.
+        RescueOldPortLeftover();
+
         // Before the watcher starts, so a fresh print job is never mistaken for an unsent leftover.
         IReadOnlyList<SendRequest> unsent = [];
         try { unsent = _tracker.Scan(); }
@@ -144,7 +149,7 @@ internal sealed class TrayContext : ApplicationContext
 
         _spool = new PrintPipeListener(_cfg.SpoolDir) { Log = m => FileLog.Info(m) };
         // Stop runs on the UI thread inside WM_ENDSESSION: nothing it raises while stopping needs the UI thread.
-        _shutdown = new ShutdownBlocker(() => _spool.IsReceiving, _spool.Stop, m => FileLog.Info("shutdown: " + m));
+        _shutdown = new ShutdownBlocker(() => _spool.IsReceiving, StopListener, m => FileLog.Info("shutdown: " + m));
         // The listener raises true/false once per job, in order; BeginInvoke keeps that order on the UI thread.
         _spool.ReceivingChanged += on => OnUi(() => { if (on && _spool.IsReceiving) _shutdown.Block(ReceivingReason); else if (!on) _shutdown.Release(); });
         _spool.NewPrintJob += (id, path) => OnUi(() =>
@@ -195,13 +200,45 @@ internal sealed class TrayContext : ApplicationContext
         Balloon(NotificationText.PrinterMisconfigured(_cfg.PrinterName, s.ActualPort ?? ""), () => _ = InstallPrinterAsync());
     }
 
-    /// <summary>Periodic re-check: a printer removed or moved off the pipe after start is reported once per change.</summary>
+    /// <summary>
+    /// Periodic re-check: a print pipe listener that stopped by itself is started again, and a printer removed or
+    /// moved off the pipe after start is reported once per change.
+    /// </summary>
     private void CheckPrinter()
     {
-        if (_exiting || _installing) return; // the install reports its own result
+        if (_exiting) return;
+        CheckListener();
+        if (_installing) return; // the install reports its own result
         if (_printerWatch.Observe(PrinterStatusNow()) is { } changed) AnnouncePrinter(changed);
         var sinceStart = DateTime.UtcNow - _listenerStart;
         if (sinceStart >= StuckCheckDelay && sinceStart < StuckCheckWindow && !_stuckChecking) _ = AnnounceStuckPrintJobsAsync(_listenerStart);
+    }
+
+    /// <summary>
+    /// A listener that ended on an unexpected fault (it reported that once) is started again, and the stuck-job check
+    /// window restarts with it: jobs printed meanwhile wait in the queue and may need a restart there.
+    /// </summary>
+    private void CheckListener()
+    {
+        var action = _listenerWatch.Observe(_spool.IsRunning);
+        if (action == ListenerAction.None) return;
+        FileLog.Error("print pipe listener was not running; starting it again");
+        _listenerStart = DateTime.UtcNow;
+        try { _spool.Start(); }
+        catch (Exception e) { FileLog.Error("restarting the print pipe failed", e); }
+        OfferRescuedDocuments(); // a job the stopped loop saved in jobs\ but never raised
+        if (action == ListenerAction.RestartAndAnnounce) Balloon(NotificationText.ListenerRestarted(_cfg.PrinterName));
+    }
+
+    /// <summary>
+    /// The session-end stop (WM_ENDSESSION). It does not set <see cref="_exiting"/>, and the tray keeps running until
+    /// Windows ends it, so the periodic check is told the stop was deliberate and does not start the listener again.
+    /// Runs on the UI thread, like the check.
+    /// </summary>
+    private void StopListener()
+    {
+        _listenerWatch.StoppedOnPurpose();
+        _spool.Stop();
     }
 
     // ---- threading and notifications ----
@@ -559,13 +596,19 @@ internal sealed class TrayContext : ApplicationContext
         try
         {
             FileLog.Info("printer install requested");
-            var err = await _printer.InstallAsync(_cfg.SpoolDir, _cfg.PrinterName);
-            if (err == null)
+            var r = await _printer.InstallAsync(_cfg.SpoolDir, _cfg.PrinterName);
+            foreach (var line in r.Output)
             {
-                Balloon($"The \"{_cfg.PrinterName}\" printer is installed and prints to {PrinterSetup.ExpectedPort()}.");
-                OfferRescuedDocuments();
+                if (line.StartsWith("warning:", StringComparison.OrdinalIgnoreCase) || line.StartsWith("error:", StringComparison.OrdinalIgnoreCase))
+                    FileLog.Error("printer install: " + line);
+                else FileLog.Info("printer install: " + line);
             }
-            else { FileLog.Error("printer install: " + err); Balloon(err); }
+            if (r.Error == null) Balloon(NotificationText.PrinterInstalled(_cfg.PrinterName, r.Warnings));
+            else { FileLog.Error("printer install: " + r.Error); Balloon(r.Error); }
+            // The script may have moved the printer off the old file port and still failed to move its leftover
+            // (only a warning there): try again here, then offer whatever reached jobs\.
+            RescueOldPortLeftover();
+            OfferRescuedDocuments();
         }
         finally
         {
@@ -574,14 +617,56 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
-    /// <summary>The install's migration may move a leftover print.pdf into spool\jobs; offer it (and any other new document) now.</summary>
+    /// <summary>
+    /// A document left in the old file port <c>spool\print.pdf</c> (installs before 2026-09-30) is sorted into jobs\
+    /// or rejected\, as the install script does, once the printer no longer prints there. A file that cannot be moved
+    /// is announced and retried at the next start (and after the next install).
+    /// </summary>
+    private void RescueOldPortLeftover()
+    {
+        var path = OldPortLeftover.PathIn(_cfg.SpoolDir);
+        try
+        {
+            if (!File.Exists(path)) return;
+            if (SamePath(PrinterStatusNow().ActualPort, path))
+            {
+                FileLog.Info($"{path}: the printer still prints there; repairing the printer moves it");
+                return;
+            }
+            var r = OldPortLeftover.Rescue(_cfg.SpoolDir);
+            if (r.Outcome == LeftoverOutcome.Offered) FileLog.Info($"{path}: one complete PDF, moved to {r.MovedTo} (offered as unsent)");
+            else if (r.Outcome == LeftoverOutcome.Rejected)
+            {
+                FileLog.Error($"{path}: not one complete PDF, moved to {r.MovedTo}");
+                Balloon(NotificationText.LeftoverRejected(r.MovedTo!));
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            FileLog.Error($"{path}: moving the document left there failed", e);
+            Balloon(NotificationText.LeftoverStuck(path, e.Message));
+        }
+    }
+
+    /// <summary>Whether a printer port names this file (a port that is not a path, such as a pipe or PORTPROMPT:, does not).</summary>
+    private static bool SamePath(string? port, string path)
+    {
+        if (string.IsNullOrEmpty(port)) return false;
+        try { return string.Equals(Path.GetFullPath(port), Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase); }
+        catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException) { return false; }
+    }
+
+    /// <summary>
+    /// Offers every document in spool\jobs not offered yet: a leftover print.pdf an install moved there, or a job a
+    /// listener that stopped by itself saved without raising.
+    /// </summary>
     private void OfferRescuedDocuments()
     {
         try
         {
             foreach (var o in _tracker.NewDocuments(_offeredSpool))
             {
-                FileLog.Info($"spool {o.SpoolId}: document found in jobs after the printer install ({o.Kind})");
+                FileLog.Info($"spool {o.SpoolId}: document found in jobs ({o.Kind})");
                 EnqueueSend(o);
             }
         }
@@ -637,6 +722,7 @@ internal sealed class TrayContext : ApplicationContext
         _sseCts?.Cancel();
         // A document still arriving gets PrintPipeListener.StopGrace: say so, and keep the UI thread free meanwhile.
         if (_spool.IsReceiving) _tray.Text = "LANFax: finishing a document that is still printing...";
+        _listenerWatch.StoppedOnPurpose();
         await Task.Run(_spool.Stop);
         _tray.Visible = false;
         ExitThread();

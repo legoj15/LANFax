@@ -136,9 +136,12 @@ if (opt.Same)
     int distinct = hashes.Select(h => h.sha).Distinct().Count();
     var leftSame = Queue.Jobs(opt.Printer);
     Say($"same content printed {n} times: {hashes.Count} files, {distinct} distinct; left in queue: {leftSame.Count}");
-    bool differ = hashes.Count == n && distinct == n && leftSame.Count == 0;
-    Console.WriteLine(differ ? "RESULT: PASS (every reprint differs byte-wise)" : "RESULT: FAIL (identical reprints, or missing files)");
-    return differ ? 0 : 1;
+    // Identical reprints are expected (docs/client-spec.md: /CreationDate has 1 s resolution, so prints within the
+    // same second are byte-identical): a note, not a failure. A missing file or a job left in the queue is a loss.
+    if (distinct < hashes.Count) Say($"NOTE: {hashes.Count - distinct} of {hashes.Count} files repeat an earlier one byte for byte (expected for prints within the same second)");
+    bool whole = hashes.Count == n && leftSame.Count == 0;
+    Console.WriteLine(whole ? $"RESULT: PASS (all {n} prints arrived, {distinct} distinct)" : "RESULT: FAIL (missing files, or jobs left in the queue)");
+    return whole ? 0 : 1;
 }
 
 if (opt.NoListenerSeconds == null) listener.Start();

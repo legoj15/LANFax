@@ -11,7 +11,7 @@
   .\Probe-PipePrinter.ps1 -Count 10
   .\Probe-PipePrinter.ps1 -Count 3 -NoListenerSeconds 30   # print with nobody listening, wait, then listen: all must arrive
   .\Probe-PipePrinter.ps1 -StopMidJobSeconds 60              # listener stopped mid-job: does the spooler retry by itself?
-  .\Probe-PipePrinter.ps1 -Same -Count 2                   # same content printed twice: the PDFs must differ byte-wise
+  .\Probe-PipePrinter.ps1 -Same -Count 2                   # same content printed twice: all must arrive (identical bytes within one second are expected, noted)
   .\Probe-PipePrinter.ps1 -WhoIs                           # who the pipe client is (spooler identity, impersonation)
   .\Probe-PipePrinter.ps1 -WhoIs -OtherUser                # listener DACL minus this user's rule: does another user's job get through?
   .\Probe-PipePrinter.ps1 -Drain                           # take in leftovers of an aborted run until the queue is empty

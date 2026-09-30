@@ -87,8 +87,9 @@ public class InstallScriptTests
             var outFile = Path.Combine(tmp, "out.txt");
             var driver = Path.Combine(tmp, "driver script.ps1");
             File.WriteAllText(driver, string.Join("\r\n",
-                "param([string]$DataDir, [string]$SpoolDir, [string]$PrinterName)",
-                "if ($env:LANFAX_PROBE_CHILD) { Set-Content -LiteralPath $env:LANFAX_PROBE_OUT -Encoding UTF8 -Value @($DataDir, $SpoolDir, $PrinterName); exit 0 }",
+                // [CmdletBinding()] as in the real scripts: an argument the driver does not declare fails binding.
+                "[CmdletBinding()] param([string]$DataDir, [string]$SpoolDir, [string]$PrinterName, [string]$PipeName)",
+                "if ($env:LANFAX_PROBE_CHILD) { Set-Content -LiteralPath $env:LANFAX_PROBE_OUT -Encoding UTF8 -Value @($DataDir, $SpoolDir, $PrinterName, $PipeName); exit 0 }",
                 "$env:LANFAX_PROBE_CHILD = '1'",
                 quoter,
                 line,
@@ -101,7 +102,7 @@ public class InstallScriptTests
             {
                 UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
             };
-            foreach (var a in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", driver, "-SpoolDir", spoolDir, "-PrinterName", "LAN Fax" })
+            foreach (var a in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", driver, "-SpoolDir", spoolDir, "-PrinterName", "LAN Fax", "-PipeName", "LAN Fax Pipe" })
                 psi.ArgumentList.Add(a);
             if (hasDataDir) { psi.ArgumentList.Add("-DataDir"); psi.ArgumentList.Add(dataDir); }
             psi.Environment["LANFAX_PROBE_OUT"] = outFile;
@@ -113,7 +114,7 @@ public class InstallScriptTests
             await p.WaitForExitAsync(cts.Token);
             Assert.True(p.ExitCode == 0 && File.Exists(outFile), $"exit {p.ExitCode}: {await stderr} {await stdout}");
             var got = File.ReadAllLines(outFile);
-            Assert.Equal(new[] { hasDataDir ? dataDir : "", spoolDir, "LAN Fax" }, got);
+            Assert.Equal(new[] { hasDataDir ? dataDir : "", spoolDir, "LAN Fax", "LAN Fax Pipe" }, got);
         }
         finally { try { Directory.Delete(tmp, true); } catch { } }
     }

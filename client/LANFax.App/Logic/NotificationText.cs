@@ -68,9 +68,25 @@ public static class NotificationText
     /// The print pipe's <c>Error</c> (a rejected job, or the pipe held by another LANFax) as a balloon: the reason
     /// after the printer's name, cut to the balloon's 255 characters.
     /// </summary>
-    public static string PrintPipeProblem(string printerName, string reason)
-    {
-        var text = $"\"{printerName}\" printer: {reason}";
-        return text.Length <= 255 ? text : text[..252] + "...";
-    }
+    public static string PrintPipeProblem(string printerName, string reason) => Fit($"\"{printerName}\" printer: {reason}");
+
+    /// <summary>The periodic check found the print pipe listener stopped (an unexpected fault) and started it again.</summary>
+    public static string ListenerRestarted(string printerName) =>
+        $"Receiving from the \"{printerName}\" printer had stopped; LANFax started it again. If this repeats, restart LANFax.";
+
+    /// <summary>The tray's printer install succeeded; a migration step the script only warned about is named too.</summary>
+    public static string PrinterInstalled(string printerName, IReadOnlyList<string> warnings) => warnings.Count == 0
+        ? $"The \"{printerName}\" printer is installed and prints to {PrinterSetup.ExpectedPort()}."
+        : Fit($"The \"{printerName}\" printer is installed, with {(warnings.Count == 1 ? "a warning" : warnings.Count + " warnings")} (see the log): {warnings[0]}");
+
+    /// <summary>A document left in the old file port print.pdf could not be moved (it is retried at every start).</summary>
+    public static string LeftoverStuck(string path, string reason) =>
+        Fit($"A document printed before LANFax was updated is still in {path} and could not be moved ({reason}). Close any program that has it open; LANFax tries again at its next start.");
+
+    /// <summary>A document left in the old file port print.pdf was not one complete PDF.</summary>
+    public static string LeftoverRejected(string movedTo) =>
+        Fit($"A document printed before LANFax was updated was not one complete PDF and is not offered for sending; it was moved to {movedTo}.");
+
+    /// <summary>Cut to the balloon's 255 characters.</summary>
+    private static string Fit(string text) => text.Length <= 255 ? text : text[..252] + "...";
 }

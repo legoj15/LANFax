@@ -173,21 +173,27 @@ public class PrinterSetupTests
         Assert.False(new RegistryPrinterKeyReader().Exists(""));
     }
 
+    private const string Out = @"C:\Users\me\AppData\Local\Temp\lanfax-install.log";
+
     [Fact]
-    public void Install_command_line_quotes_paths()
+    public void Install_command_runs_the_script_with_quoted_values_and_captures_its_output()
     {
-        var a = PrinterSetup.BuildArguments(@"C:\Program Files\LANFax\install\Install-LANFaxPrinter.ps1", @"C:\ProgramData\LANFax\spool", "LAN Fax");
-        Assert.Contains("-File \"C:\\Program Files\\LANFax\\install\\Install-LANFaxPrinter.ps1\"", a);
-        Assert.Contains("-SpoolDir \"C:\\ProgramData\\LANFax\\spool\"", a);
-        Assert.Contains("-PrinterName \"LAN Fax\"", a);
-        Assert.Contains("-ExecutionPolicy Bypass", a);
+        var c = PrinterSetup.BuildCommand(@"C:\Program Files\LANFax\install\Install-LANFaxPrinter.ps1", @"C:\ProgramData\LANFax\spool", "LAN Fax", Out);
+        Assert.Contains(@"& 'C:\Program Files\LANFax\install\Install-LANFaxPrinter.ps1' -SpoolDir 'C:\ProgramData\LANFax\spool' -PrinterName 'LAN Fax' *>&1", c);
+        Assert.Contains($"$out = '{Out}'", c);
+        var a = PrinterSetup.BuildArguments(@"C:\s.ps1", @"C:\spool", "LAN Fax", Out);
+        Assert.StartsWith("-NoProfile -ExecutionPolicy Bypass -NonInteractive -EncodedCommand ", a);
+        var b64 = a[(a.LastIndexOf(' ') + 1)..];
+        Assert.Equal(PrinterSetup.BuildCommand(@"C:\s.ps1", @"C:\spool", "LAN Fax", Out), System.Text.Encoding.Unicode.GetString(Convert.FromBase64String(b64)));
     }
 
     [Fact]
-    public void Trailing_backslash_is_trimmed_so_it_cannot_escape_the_quote()
+    public void Trailing_backslash_is_trimmed_and_single_quotes_are_doubled()
     {
-        var a = PrinterSetup.BuildArguments(@"C:\s.ps1", @"C:\ProgramData\LANFax\spool\\", "LAN Fax");
-        Assert.Contains("-SpoolDir \"C:\\ProgramData\\LANFax\\spool\" ", a);
+        Assert.Contains(@"-SpoolDir 'C:\ProgramData\LANFax\spool' ", PrinterSetup.BuildCommand(@"C:\s.ps1", @"C:\ProgramData\LANFax\spool\\", "LAN Fax", Out));
+        Assert.Contains(@"-SpoolDir 'D:\' ", PrinterSetup.BuildCommand(@"C:\s.ps1", @"D:\", "LAN Fax", Out));
+        // PowerShell ends a single-quoted string at any of these quote characters; doubled, each is literal.
+        Assert.Contains("-PrinterName 'O''Brien \u2019\u2019s Fax'", PrinterSetup.BuildCommand(@"C:\s.ps1", @"C:\spool", "O'Brien \u2019s Fax", Out));
     }
 
     [Fact]
@@ -206,16 +212,19 @@ public class PrinterSetupTests
             bool installed = false;
             ProcessStartInfo? seen = null;
             var reader = new FuncReader(_ => installed);
-            var ps = new PrinterSetup(reader, async psi => { seen = psi; await Task.Yield(); installed = true; });
-            Assert.Null(await ps.InstallAsync(@"C:\spool", "LAN Fax", script));
-            Assert.Equal("runas", seen!.Verb);
+            var ps = new PrinterSetup(reader, async (psi, _) => { seen = psi; await Task.Yield(); installed = true; return 0; });
+            var ok = await ps.InstallAsync(@"C:\spool", "LAN Fax", script);
+            Assert.Null(ok.Error);
+            Assert.Empty(ok.Warnings);
+            Assert.Equal("runas", seen!.Verb); // still elevated through UAC
+            Assert.True(seen.UseShellExecute);
 
-            var cancelled = new PrinterSetup(reader, _ => throw new Win32Exception(1223));
-            Assert.Equal("Installation cancelled.", await cancelled.InstallAsync(@"C:\spool", "LAN Fax", script));
+            var cancelled = new PrinterSetup(reader, (_, _) => throw new Win32Exception(1223));
+            Assert.Equal("Installation cancelled.", (await cancelled.InstallAsync(@"C:\spool", "LAN Fax", script)).Error);
 
             installed = false;
-            var noop = new PrinterSetup(reader, _ => Task.CompletedTask);
-            Assert.StartsWith("The printer was not installed", await noop.InstallAsync(@"C:\spool", "LAN Fax", script));
+            var noop = new PrinterSetup(reader, (_, _) => Task.FromResult(0));
+            Assert.StartsWith("The printer was not installed", (await noop.InstallAsync(@"C:\spool", "LAN Fax", script)).Error);
         }
         finally { File.Delete(script); }
     }
@@ -223,8 +232,95 @@ public class PrinterSetupTests
     [Fact]
     public async Task Install_reports_missing_script()
     {
-        var ps = new PrinterSetup(new FakeReader(), _ => throw new InvalidOperationException("must not run"));
-        Assert.StartsWith("Install script not found", await ps.InstallAsync(@"C:\spool", "LAN Fax", @"C:\nope\x.ps1"));
+        var ps = new PrinterSetup(new FakeReader(), (_, _) => throw new InvalidOperationException("must not run"));
+        Assert.StartsWith("Install script not found", (await ps.InstallAsync(@"C:\spool", "LAN Fax", @"C:\nope\x.ps1")).Error);
+    }
+
+    [Fact]
+    public async Task Install_returns_the_script_output_and_its_warnings_and_removes_the_output_file()
+    {
+        // The rescue of a leftover print.pdf is a warning-only step: its warning must reach the tray, not vanish.
+        var script = Path.GetTempFileName();
+        string? outPath = null;
+        const string warning = @"warning: moving the document left in 'C:\spool\print.pdf' out of the way failed: locked";
+        try
+        {
+            var ps = new PrinterSetup(new FakeReader("LAN Fax"), (_, o) =>
+            {
+                outPath = o;
+                File.WriteAllLines(o, ["moving printer 'LAN Fax'", warning, @"LANFax printer 'LAN Fax' -> \\.\pipe\LANFax"]);
+                return Task.FromResult(0);
+            });
+            var r = await ps.InstallAsync(@"C:\spool", "LAN Fax", script);
+            Assert.Null(r.Error);
+            Assert.Equal(3, r.Output.Count);
+            Assert.Equal(warning, Assert.Single(r.Warnings));
+            Assert.False(File.Exists(outPath));
+        }
+        finally { File.Delete(script); }
+    }
+
+    [Fact]
+    public async Task Install_fails_on_a_nonzero_exit_even_when_the_port_reads_right()
+    {
+        var script = Path.GetTempFileName();
+        try
+        {
+            var ps = new PrinterSetup(new FakeReader("LAN Fax"), (_, o) =>
+            {
+                File.WriteAllLines(o, ["moving printer 'LAN Fax'", "error: Access is denied"]);
+                return Task.FromResult(1);
+            });
+            var r = await ps.InstallAsync(@"C:\spool", "LAN Fax", script);
+            Assert.Equal("The printer install script failed (exit code 1): error: Access is denied", r.Error);
+            var silent = new PrinterSetup(new FakeReader("LAN Fax"), (_, _) => Task.FromResult(3));
+            Assert.Equal("The printer install script failed (exit code 3).", (await silent.InstallAsync(@"C:\spool", "LAN Fax", script)).Error);
+        }
+        finally { File.Delete(script); }
+    }
+
+    [Fact]
+    public async Task Install_command_captures_warnings_errors_and_the_exit_code_on_windows_powershell()
+    {
+        // The real wrapper, minus elevation: the script's output lands in the file even when the script throws.
+        var ps51 = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
+        if (!File.Exists(ps51)) return;
+        var dir = Path.Combine(Path.GetTempPath(), "lanfax install cmd " + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var script = Path.Combine(dir, "fake 'install'.ps1");
+            File.WriteAllText(script, string.Join("\r\n",
+                "[CmdletBinding()] param([string]$SpoolDir, [string]$PrinterName)",
+                "$ErrorActionPreference = 'Stop'",
+                "\"spool=$SpoolDir printer=$PrinterName\"",
+                "\"warning: something failed\"",
+                "if ($PrinterName -eq 'Throw') { throw 'boom' }",
+                "if ($PrinterName -eq 'Native') { cmd /c exit 3 }", // a native command the script tolerates: not a failure
+                "if ($PrinterName -eq 'Exit') { exit 4 }",
+                ""));
+            async Task<(int code, string[] lines)> Run(string printer)
+            {
+                var o = Path.Combine(dir, Guid.NewGuid().ToString("N") + ".log");
+                var psi = new ProcessStartInfo(ps51, PrinterSetup.BuildArguments(script, @"C:\sp ool\", printer, o)) { UseShellExecute = false, CreateNoWindow = true };
+                using var p = Process.Start(psi)!;
+                using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(1));
+                await p.WaitForExitAsync(cts.Token);
+                return (p.ExitCode, File.Exists(o) ? File.ReadAllLines(o) : []);
+            }
+            var ok = await Run("LAN 'Fax'");
+            Assert.Equal(0, ok.code);
+            Assert.Equal([@"spool=C:\sp ool printer=LAN 'Fax'", "warning: something failed"], ok.lines);
+            var bad = await Run("Throw");
+            Assert.Equal(1, bad.code);
+            Assert.Equal("warning: something failed", bad.lines[1]);
+            Assert.Equal("error: boom", bad.lines[^1]);
+            Assert.Equal(0, (await Run("Native")).code);
+            var exit = await Run("Exit");
+            Assert.Equal(4, exit.code); // the script's own explicit exit code is kept
+            Assert.Equal("warning: something failed", exit.lines[^1]);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
     sealed class FuncReader(Func<string, bool> f) : IPrinterKeyReader
@@ -295,8 +391,8 @@ public class PrinterSetupTests
         var script = Path.GetTempFileName();
         try
         {
-            var ps = new PrinterSetup(new PortReader(@"C:\Old\print.pdf"), _ => Task.CompletedTask);
-            Assert.StartsWith(@"The printer still points at C:\Old\print.pdf", await ps.InstallAsync(@"C:\spool", "LAN Fax", script));
+            var ps = new PrinterSetup(new PortReader(@"C:\Old\print.pdf"), (_, _) => Task.FromResult(0));
+            Assert.StartsWith(@"The printer still points at C:\Old\print.pdf", (await ps.InstallAsync(@"C:\spool", "LAN Fax", script)).Error);
         }
         finally { File.Delete(script); }
     }
@@ -304,6 +400,56 @@ public class PrinterSetupTests
     [Fact]
     public void Missing_notice_names_the_printer() =>
         Assert.Equal(@"The ""LAN Fax"" printer is not installed. Click here to install it.", NotificationText.PrinterMissing("LAN Fax"));
+}
+
+public class ListenerWatchTests
+{
+    [Fact]
+    public void A_listener_that_is_not_running_is_restarted_and_the_first_restart_is_announced()
+    {
+        var w = new ListenerWatch();
+        Assert.Equal(ListenerAction.None, w.Observe(running: true));
+        Assert.Equal(ListenerAction.RestartAndAnnounce, w.Observe(running: false));
+        Assert.Equal(ListenerAction.None, w.Observe(running: true));
+        Assert.Equal(ListenerAction.Restart, w.Observe(running: false)); // one balloon per session; later ones only logged
+    }
+
+    [Fact]
+    public void A_listener_stopped_on_purpose_is_never_restarted()
+    {
+        // Session end (WM_ENDSESSION) and Exit stop the listener deliberately; a 30 s tick after that must not
+        // start it again (the session-end stop does not set the tray's _exiting).
+        var w = new ListenerWatch();
+        Assert.Equal(ListenerAction.None, w.Observe(running: true));
+        w.StoppedOnPurpose();
+        Assert.Equal(ListenerAction.None, w.Observe(running: false));
+        Assert.Equal(ListenerAction.None, w.Observe(running: false));
+    }
+
+    [Fact]
+    public void Install_notice_names_the_first_warning_and_fits_a_balloon()
+    {
+        Assert.Equal(@"The ""LAN Fax"" printer is installed and prints to \\.\pipe\LANFax.", NotificationText.PrinterInstalled("LAN Fax", []));
+        Assert.Equal(@"The ""LAN Fax"" printer is installed, with a warning (see the log): warning: x",
+            NotificationText.PrinterInstalled("LAN Fax", ["warning: x"]));
+        var two = NotificationText.PrinterInstalled("LAN Fax", ["warning: " + new string('y', 300), "warning: z"]);
+        Assert.StartsWith(@"The ""LAN Fax"" printer is installed, with 2 warnings (see the log): warning: yyy", two);
+        Assert.Equal(255, two.Length);
+    }
+
+    [Fact]
+    public void Leftover_notices_say_where_the_document_is()
+    {
+        Assert.Equal(@"A document printed before LANFax was updated is still in C:\s\print.pdf and could not be moved (locked). Close any program that has it open; LANFax tries again at its next start.",
+            NotificationText.LeftoverStuck(@"C:\s\print.pdf", "locked"));
+        Assert.Equal(@"A document printed before LANFax was updated was not one complete PDF and is not offered for sending; it was moved to C:\s\rejected\print-1.pdf.",
+            NotificationText.LeftoverRejected(@"C:\s\rejected\print-1.pdf"));
+    }
+
+    [Fact]
+    public void Listener_restart_notice_names_the_printer() =>
+        Assert.Equal(@"Receiving from the ""LAN Fax"" printer had stopped; LANFax started it again. If this repeats, restart LANFax.",
+            NotificationText.ListenerRestarted("LAN Fax"));
 }
 
 public class PrinterWatchTests
@@ -522,14 +668,7 @@ public class ElevatedArgumentTests
     [InlineData(@"C:\spool", "LAN \"Fax")]
     [InlineData(@"C:\sp""ool", "LAN Fax")]
     public void A_quote_in_the_printer_name_or_spool_dir_is_refused(string spool, string printer) =>
-        Assert.Throws<ArgumentException>(() => PrinterSetup.BuildArguments(@"C:\s.ps1", spool, printer));
-
-    [Fact]
-    public void A_root_spool_dir_keeps_its_backslash_without_escaping_the_quote()
-    {
-        var a = PrinterSetup.BuildArguments(@"C:\s.ps1", @"D:\", "LAN Fax");
-        Assert.Contains(@"-SpoolDir ""D:\\"" ", a); // argv parsing turns "D:\\" back into D:\
-    }
+        Assert.Throws<ArgumentException>(() => PrinterSetup.BuildArguments(@"C:\s.ps1", spool, printer, @"C:\out.log"));
 
     [Fact]
     public async Task Install_reports_a_refused_value_instead_of_running()
@@ -537,8 +676,8 @@ public class ElevatedArgumentTests
         var script = Path.GetTempFileName();
         try
         {
-            var ps = new PrinterSetup(new NoPrinter(), _ => throw new InvalidOperationException("must not run"));
-            Assert.Contains("\"", await ps.InstallAsync(@"C:\spool", "LAN \"Fax", script));
+            var ps = new PrinterSetup(new NoPrinter(), (_, _) => throw new InvalidOperationException("must not run"));
+            Assert.Contains("\"", (await ps.InstallAsync(@"C:\spool", "LAN \"Fax", script)).Error);
         }
         finally { File.Delete(script); }
     }
