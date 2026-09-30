@@ -18,6 +18,8 @@ public sealed class EventStream(ClientConfig cfg, HttpClient http)
     public event Action<ArmState>? ArmChanged;
     /// <summary>Full or partial status object; merge with <see cref="ServerStatus.Merge"/>. Element stays valid after the call.</summary>
     public event Action<JsonElement>? StatusChanged;
+    /// <summary>The server could not replay missed events; reload with <c>GET /jobs?updated_since=</c> (null: reload everything relevant).</summary>
+    public event Action<DateTimeOffset?>? Resync;
     public event Action? Connected;
     public event Action<Exception?>? Disconnected;
 
@@ -129,6 +131,14 @@ public sealed class EventStream(ClientConfig cfg, HttpClient http)
                     break;
                 case "arm":
                     if (el.Deserialize<ArmState>(Json.Options) is { } a) Raise(() => ArmChanged?.Invoke(a));
+                    break;
+                case "resync":
+                    DateTimeOffset? since = null;
+                    if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("since", out var sp)
+                        && sp.ValueKind == JsonValueKind.String
+                        && DateTimeOffset.TryParse(sp.GetString(), System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.None, out var sv)) since = sv;
+                    Raise(() => Resync?.Invoke(since));
                     break;
                 case "status":
                     var clone = el.Clone();

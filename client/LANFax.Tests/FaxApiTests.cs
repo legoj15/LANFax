@@ -31,7 +31,7 @@ public class FaxApiTests : IDisposable
     {
         _srv.Handler = (ctx, _) => FakeServer.Json(ctx, """
             {"daemon":{"version":"0.1.1","started_at":"x","ami_connected":true},
-             "queue":{"queued":1,"converting":0,"dialing":2,"sending":0},
+             "queue":{"queued":1,"dialing":2,"sending":0},
              "registrations":[{"name":"reg-in","status":"Registered"},{"name":"reg-out","status":"Rejected"}],
              "last_sent":null,"last_received":null,
              "arm":{"armed":true,"until":"2026-09-29T16:35:00+00:00","remaining_min":60,"ext":"300","changed":null,"raw":""}}
@@ -349,7 +349,6 @@ public class FaxApiTests : IDisposable
     [InlineData("received", true)]
     [InlineData("cancelled", true)]
     [InlineData("queued", false)]
-    [InlineData("converting", false)]
     [InlineData("dialing", false)]
     [InlineData("sending", false)]
     public void TerminalStatesMatchFaxdSpec(string state, bool terminal)

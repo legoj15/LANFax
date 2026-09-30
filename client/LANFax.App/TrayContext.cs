@@ -206,6 +206,12 @@ internal sealed class TrayContext : ApplicationContext
                 Balloon(NotificationText.Unauthorized, OpenSettings);
             }
         });
+        es.Resync += since => OnUi(() =>
+        {
+            if (ct.IsCancellationRequested) return;
+            FileLog.Info($"event stream: resync requested (since {since?.ToString("o") ?? "unknown"}); polling tracked jobs");
+            _ = PollTrackedAsync();
+        });
         es.JobChanged += j => OnUi(() => OnJobChanged(j));
         es.Received += j => OnUi(() => Balloon(NotificationText.ForReceived(j)));
         UpdateConnectionState(false);

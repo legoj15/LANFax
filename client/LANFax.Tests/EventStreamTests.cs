@@ -46,6 +46,29 @@ public class EventStreamTests : IDisposable
     private const string JobJson = """{"type":"job","ts":"t","id":"lf1","direction":"out","state":"sending","filename":"f.pdf","to_number":"1","pages":2,"created_at":"2026-09-29T15:00:00+00:00","updated_at":"2026-09-29T15:00:01+00:00","finished_at":null}""";
 
     [Fact]
+    public async Task ResyncEventRaisesWithParsedSinceOrNull()
+    {
+        _srv.Handler = async (ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, "event: resync\ndata: {\"reason\":\"too_many_events\",\"since\":\"2026-09-29T15:00:00+00:00\"}\n\n");
+            await Write(ctx, "event: resync\ndata: {\"reason\":\"too_many_events\"}\n\n");
+            await Write(ctx, "event: resync\ndata: {\"since\":\"garbage\"}\n\n");
+            await Task.Delay(Timeout.Infinite, _cts.Token);
+        };
+        var es = Stream();
+        var got = new List<DateTimeOffset?>();
+        es.Resync += s => { lock (got) got.Add(s); };
+        var run = es.StartAsync(_cts.Token);
+        await WaitFor(() => { lock (got) return got.Count >= 3; });
+        _cts.Cancel();
+        await run;
+        Assert.Equal(DateTimeOffset.Parse("2026-09-29T15:00:00+00:00"), got[0]);
+        Assert.Null(got[1]);
+        Assert.Null(got[2]);
+    }
+
+    [Fact]
     public async Task ParsesTypedEventsAndIgnoresKeepalive()
     {
         _srv.Handler = async (ctx, _) =>

@@ -185,6 +185,9 @@ client/
   `yyyy-MM-ddTHH:mm:ssZ` in UTC). If no line (event or the 15 s keepalive)
   arrives for `StallTimeout` (45 s) the stream is aborted, `Disconnected`
   gets a `TimeoutException`, and it reconnects with `Last-Event-ID`.
+- A `resync` event (`{"reason","since"}`, sent when the replay gap is too large)
+  raises `EventStream.Resync(since)`; the tray polls tracked jobs, and the
+  grids reload with `GET /jobs?updated_since=<since>` instead of expecting replay.
 - `FaxApi`, `EventStream` and `SpoolWatcher` each take an optional
   `Log` (`Action<string>`) for diagnostics (skipped list rows, malformed
   events, stalls, spool errors); none of them ever passes the token to it.
