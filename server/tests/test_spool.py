@@ -223,6 +223,32 @@ class SpoolTests(unittest.TestCase):
         self.assertIsNotNone(row["finished_at"])
         self.assertEqual(self.job_events(), [("job", "received"), ("received", "received")])
 
+    def test_6b_inbox_counts_pages(self):
+        fn = "fax_20260929-113600_from_5551234567.pdf"
+        body = \
+            "%PDF-1.4\n1 0 obj\n<< /Type /Pages /Kids [2 0 R 3 0 R] /Count 2 >>\nendobj\n" \
+            "2 0 obj\n<< /Type /Page /Parent 1 0 R >>\nendobj\n" \
+            "3 0 obj\n<< /Type/Page /Parent 1 0 R >>\nendobj\n%%EOF\n"
+        _write(os.path.join(self.cfg.inbox, fn), body)
+        self.obs.scan_once()
+        self.assertEqual(self.only()["pages"], 2)
+
+    def test_6c_inbox_unreadable_page_count_stays_null(self):
+        _write(os.path.join(self.cfg.inbox, "fax_20260929-113700_from_5551234567.pdf"), "%PDF")
+        self.obs.scan_once()
+        self.assertIsNone(self.only()["pages"])
+
+    def test_6d_inbox_backfills_pages_of_an_existing_row(self):
+        fn = "fax_20260929-113800_from_5551234567.pdf"
+        path = os.path.join(self.cfg.inbox, fn)
+        _write(path, "%PDF-1.4\n1 0 obj\n<< /Type /Page >>\nendobj\n%%EOF\n")
+        self.reg.upsert_job({"id": "in0old", "direction": "in", "state": "received",
+                              "filename": fn, "pdf_path": path, "from_number": "5551234567",
+                              "created_at": "2026-09-29T15:38:00Z"})
+        self.obs.scan_once()
+        self.assertEqual(self.only()["pages"], 1)
+        self.assertEqual(len(self.reg.list_jobs(direction="in")), 1)
+
     def test_7_failed_recv(self):
         _write(os.path.join(self.cfg.failed, "recv_20260929-120000_from_unknown.txt"),
                "Status: FAILED\nError: negotiation failed\n")

@@ -28,10 +28,25 @@ _RECV_FAIL_RE = re.compile(r"^recv_(\d{8}-\d{6})_from_(.+)\.txt$", re.IGNORECASE
 _JOBID_RE = re.compile(r"^j\d{8}-\d{6}-")
 _API_ID_RE = re.compile(r"^lf[0-9a-f]{12}$")
 _ACTIVE = ("queued", "dialing", "sending")
+_PAGE_OBJ_RE = re.compile(rb"/Type\s*/Page(?![A-Za-z])")
 _STAMP = "%Y%m%d-%H%M%S"
+PDF_COUNT_MAX = 32 * 1024 * 1024   # a received fax is far smaller; never slurp more than this
 MIN_POLL = 0.2              # seconds; a 0/negative FAXD_POLL_INTERVAL must not busy-loop
 STUCK_QUEUED_AFTER = 300    # seconds a queued row may point at a missing file
 PRUNE_EVERY = 3600          # seconds between job_events retention passes
+
+
+def pdf_page_count(path: str) -> Optional[int]:
+    """Pages of a plain (uncompressed page objects) PDF such as ghostscript writes, or None when
+    the file is unreadable, too big or has no page objects (object streams, truncated)."""
+    try:
+        if os.path.getsize(path) > PDF_COUNT_MAX:
+            return None
+        with open(path, "rb") as f:
+            n = len(_PAGE_OBJ_RE.findall(f.read()))
+    except OSError:
+        return None
+    return n or None
 
 
 def _norm(s: str) -> str:
@@ -139,6 +154,7 @@ class SpoolObserver:
         # the receipt or the files beside it change
         self._receipts_skipped: dict[str, tuple] = {}
         self._warned: set[str] = set()                        # ambiguous receipts already logged
+        self._pages_tried: set[str] = set()                   # inbox rows already tried for a page count
         self._last_prune: Optional[float] = None              # time.monotonic() of the last prune
 
     # ---- helpers ------------------------------------------------------
@@ -481,13 +497,21 @@ class SpoolObserver:
         for name in ls[self.cfg.inbox]:
             m = _INBOX_RE.match(name)
             path = os.path.join(self.cfg.inbox, name)
-            if not m or not _isfile(path) or self.reg.find_by_filename(name):
+            if not m or not _isfile(path):
+                continue
+            known = self.reg.find_by_filename(name)
+            if known:
+                if known["pages"] is None and known["id"] not in self._pages_tried:
+                    self._pages_tried.add(known["id"])   # one attempt per run; old rows predate counting
+                    n = pdf_page_count(path)
+                    if n is not None:
+                        self.bus.publish("received", **self.reg.upsert_job({"id": known["id"], "pages": n}))
                 continue
             created = local_to_utc_iso(m.group(1), _STAMP) or utcnow_iso()
             row = self._create({
                 "_prefix": "in", "direction": "in", "state": "received", "filename": name,
                 "from_number": m.group(2), "origin": "inbound", "pdf_path": path,
-                "created_at": created,
+                "pages": pdf_page_count(path), "created_at": created,
             })
             row = self.reg.upsert_job({"id": row["id"], "finished_at": created})
             self.bus.publish("received", **row)
