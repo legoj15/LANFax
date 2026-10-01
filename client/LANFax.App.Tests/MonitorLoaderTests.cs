@@ -6,7 +6,7 @@ namespace LANFax.App.Tests;
 
 /// <summary>
 /// The monitor's loads without a window: one at a time with one coalesced follow-up, a load that straddles a server
-/// change is dropped, and a failed load leaves no stale follow-up behind.
+/// change is dropped, and a failed load still runs the pass queued behind it.
 /// </summary>
 public sealed class MonitorLoaderTests
 {
@@ -55,21 +55,39 @@ public sealed class MonitorLoaderTests
     }
 
     [Fact]
-    public async Task A_failed_load_drops_its_queued_follow_up_and_leaves_no_stale_since()
+    public async Task A_failed_load_still_runs_its_queued_follow_up_once_and_leaves_no_stale_since()
     {
         var full = _api.HoldNextFullLoad();
         var loader = Make();
         var first = loader.ReloadAsync(null);
-        await loader.ReloadAsync(T0); // queued behind the failing load
+        await loader.ReloadAsync(T0); // queued behind the failing load (a reconnect or resync meanwhile)
         full.SetException(new FaxApiException(0, "cannot reach faxd"));
         await first;
         Assert.IsType<FaxApiException>(Assert.Single(_failures));
-        Assert.Empty(_api.Sinces);
-
-        await loader.ReloadAsync(null); // the next trigger: exactly one load, a full one (nothing loaded yet)
-        Assert.Equal(2, _api.FullLoads);
+        Assert.Equal(2, _api.FullLoads); // the queued pass ran: nothing loaded yet, so a full one
         Assert.Empty(_api.Sinces);
         Assert.Equal(1, _loaded);
+        Assert.Single(_model.Jobs);
+
+        await loader.ReloadAsync(null); // the next trigger: one plain since-load, not the old resync cursor
+        Assert.Equal(2, _api.FullLoads);
+        Assert.NotEqual(T0, Assert.Single(_api.Sinces));
+    }
+
+    [Fact]
+    public async Task A_stale_load_that_fails_after_ServerChanged_still_runs_the_load_queued_for_the_new_server()
+    {
+        var full = _api.HoldNextFullLoad();
+        var loader = Make();
+        var first = loader.ReloadAsync(null); // the old, unreachable server
+        loader.ServerChanged();
+        await loader.ReloadAsync(null); // the new server's stream connected: queued
+        full.SetException(new FaxApiException(0, "cannot reach faxd"));
+        await first;
+        Assert.Empty(_failures); // the old server's failure is not shown
+        Assert.Equal(2, _api.FullLoads);
+        Assert.Equal(1, _loaded);
+        Assert.Single(_model.Jobs);
     }
 
     [Fact]

@@ -432,14 +432,16 @@ public sealed class ClientRuntimeTests : IDisposable
         var rt = Make();
         var watch = new ArmExpiryWatch();
         var balloons = new ConcurrentQueue<string>();
+        var mismatches = new ConcurrentQueue<string>(); // asserted on the test thread: a throw here would only time out
         rt.ArmChanged += a =>
         {
-            Assert.Equal(a, rt.Arm);
+            if (!Equals(a, rt.Arm)) mismatches.Enqueue($"event {a} but snapshot {rt.Arm}");
             if (watch.Check(rt.Arm, new DateTimeOffset(2026, 10, 1, 12, 0, 0, TimeSpan.Zero)) is { } text) balloons.Enqueue(text);
         };
         _owner.Invoke(() => rt.Start());
         await WaitFor(() => !balloons.IsEmpty);
         Assert.Single(balloons);
+        Assert.Empty(mismatches);
     }
 
     [Fact]

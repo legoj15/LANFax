@@ -18,6 +18,15 @@ public class FaxApiException(int statusCode, string message, Exception? inner = 
 public sealed class FaxApiUnauthorizedException() : FaxApiException(401, "unauthorized (check the token in Settings)");
 
 /// <summary>
+/// <see cref="FaxApi.DownloadPdfAsync"/> fetched the whole PDF but could not put it in place: the destination is held
+/// open (a viewer; Windows answers access denied or a sharing violation). The old copy there is intact. Any other file
+/// failure (the <c>.part</c> file cannot be created or written: disk full, a read-only folder) stays a plain
+/// <see cref="IOException"/> or <see cref="UnauthorizedAccessException"/>.
+/// </summary>
+public sealed class PdfFileInUseException(string path, Exception inner)
+    : IOException($"{Path.GetFileName(path)} is open in another program: {inner.Message}", inner);
+
+/// <summary>
 /// The settings cannot form a request (a server with a port or path in it, a port outside 1..65535, a token that is not
 /// a valid Bearer parameter). Thrown before any request is built, so it proves nothing was sent; never retried.
 /// StatusCode is 0.
@@ -136,7 +145,11 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi, IMonit
                 if (!resp.IsSuccessStatusCode) throw await ToException(resp);
                 await CopyBodyAsync(resp, tmp, ct);
             }
-            File.Move(tmp, destPath, overwrite: true);
+            try { File.Move(tmp, destPath, overwrite: true); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException && File.Exists(destPath))
+            {
+                throw new PdfFileInUseException(destPath, e);
+            }
         }
         finally { try { File.Delete(tmp); } catch { } }
     }

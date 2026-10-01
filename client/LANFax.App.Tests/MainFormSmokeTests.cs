@@ -48,13 +48,24 @@ public sealed class MainFormSmokeTests
                 Pump(() => settingsOpened == 1);
                 src.Api.ArmError = null;
 
-                // A new fax at the top keeps a scrolled view on the same rows (anchored by id, not by index).
+                // A small window, so 40-odd rows overflow the grid whatever the display's size.
+                form.WindowState = FormWindowState.Normal;
+                form.Size = form.MinimumSize;
                 for (int i = 0; i < 40; i++) src.RaiseJob(J("lfs" + i, "out", "queued") with { CreatedAt = T0.AddMinutes(i + 1) });
-                var grid = (DataGridView)typeof(MainForm).GetField("_jobsGrid", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(form)!;
+                var grid = form.JobsGrid;
+                Assert.True(grid.DisplayedRowCount(false) < grid.Rows.Count - 12, "the grid must overflow for the scroll checks");
+
+                // At the top (waiting for a fax), a new fax shows at the top.
+                grid.FirstDisplayedScrollingRowIndex = 0;
+                src.RaiseJob(J("lftop", "out", "queued") with { CreatedAt = T0.AddHours(4) });
+                Assert.Equal(0, grid.FirstDisplayedScrollingRowIndex);
+                Assert.Equal("lftop", grid.Rows[0].Tag);
+
+                // Scrolled down, a new fax at the top keeps the view on the same rows (anchored by id, not by index).
                 grid.FirstDisplayedScrollingRowIndex = 10;
                 var anchor = grid.Rows[grid.FirstDisplayedScrollingRowIndex].Tag;
                 src.RaiseJob(J("lfnew", "out", "queued") with { CreatedAt = T0.AddHours(5) });
-                Assert.Equal(43, form.JobRowCount);
+                Assert.Equal(44, form.JobRowCount);
                 Assert.Equal(anchor, grid.Rows[grid.FirstDisplayedScrollingRowIndex].Tag);
 
                 form.Close(); // the user's close hides; the app lives in the tray

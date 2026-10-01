@@ -361,6 +361,35 @@ public class FaxApiTests : IDisposable
     }
 
     [Fact]
+    public async Task DownloadPdf_a_destination_held_open_is_PdfFileInUse_and_a_blocked_part_file_is_not()
+    {
+        var bytes = Encoding.ASCII.GetBytes("%PDF-1.4 ...%%EOF");
+        _srv.Handler = async (ctx, _) =>
+        {
+            ctx.Response.ContentType = "application/pdf";
+            ctx.Response.ContentLength64 = bytes.Length;
+            await ctx.Response.OutputStream.WriteAsync(bytes);
+            ctx.Response.Close();
+        };
+        var dir = Path.Combine(Path.GetTempPath(), "lanfax-" + Guid.NewGuid().ToString("N"));
+        var dest = Path.Combine(dir, "x.pdf");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(dest, "old copy");
+            using (new FileStream(dest, FileMode.Open, FileAccess.Read, FileShare.Read)) // a viewer holds it
+                await Assert.ThrowsAsync<PdfFileInUseException>(() => Api().DownloadPdfAsync("lfabc", dest));
+            Assert.False(File.Exists(dest + ".part"));
+
+            Directory.CreateDirectory(dest + ".part"); // the .part file cannot be created: not the in-use case
+            var e = await Assert.ThrowsAnyAsync<Exception>(() => Api().DownloadPdfAsync("lfabc", dest));
+            Assert.IsNotType<PdfFileInUseException>(e);
+            Assert.True(e is IOException or UnauthorizedAccessException, e.GetType().Name);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
     public async Task TestSendArmDisarmReceiveTest()
     {
         _srv.Handler = (ctx, r) => r.PathAndQuery.StartsWith("/test/send")

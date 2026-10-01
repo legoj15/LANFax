@@ -88,6 +88,18 @@ public sealed class PdfOpenerTests : IDisposable
     }
 
     [Fact]
+    public async Task A_cache_folder_that_cannot_take_the_download_is_an_error_not_the_stale_cached_copy()
+    {
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(CachePath("lfabc"), "old copy");
+        Directory.CreateDirectory(CachePath("lfabc") + ".part"); // stands in for a full disk or a read-only cache folder
+        var r = await Make().OpenAsync("lfabc");
+        Assert.Equal(PdfOpenOutcome.Failed, r!.Outcome);
+        Assert.StartsWith("Could not open the PDF", r.Message);
+        Assert.Empty(_opened);
+    }
+
+    [Fact]
     public async Task No_pdf_on_the_server()
     {
         _srv.Handler = (ctx, _) => FakeServer.Json(ctx, """{"error":"no pdf"}""", 404);
@@ -103,6 +115,7 @@ public sealed class PdfOpenerTests : IDisposable
         _srv.Handler = (ctx, _) => FakeServer.Json(ctx, """{"error":"unauthorized"}""", 401);
         var r = await Make().OpenAsync("lfabc");
         Assert.Equal(PdfOpenOutcome.Unauthorized, r!.Outcome);
+        Assert.Equal(NotificationText.WindowUnauthorized, r.Message);
         Assert.Empty(_opened);
     }
 

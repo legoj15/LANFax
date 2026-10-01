@@ -16,6 +16,9 @@
     <DebugType>none</DebugType>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="LANFax.App.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\LANFax.Core\LANFax.Core.csproj" />
   </ItemGroup>
   <ItemGroup>

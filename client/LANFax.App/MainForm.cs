@@ -104,6 +104,8 @@ public sealed class MainForm : Form
     public int JobRowCount => _jobsGrid.Rows.Count;
     /// <summary>Rows in the inbox grid.</summary>
     public int InboxRowCount => _inboxGrid.Rows.Count;
+    /// <summary>The jobs grid, for the smoke test's scroll checks.</summary>
+    internal DataGridView JobsGrid => _jobsGrid;
     /// <summary>Set by the tray at exit: a close then really closes instead of hiding.</summary>
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     public bool AllowClose { get; set; }
@@ -185,7 +187,7 @@ public sealed class MainForm : Form
 
     private void OnLoadFailed(Exception e)
     {
-        if (e is FaxApiUnauthorizedException) { Say(PdfOpener.Unauthorized); return; }
+        if (e is FaxApiUnauthorizedException) { Say(NotificationText.WindowUnauthorized); return; }
         FileLog.Error("monitor: loading the job lists failed", e);
         Say("Could not load the job lists: " + e.Message);
     }
@@ -213,7 +215,7 @@ public sealed class MainForm : Form
         }
         catch (FaxApiUnauthorizedException)
         {
-            Say("The server refused the token. Check it in Settings.");
+            Say(NotificationText.WindowUnauthorized);
             _openSettings?.Invoke();
         }
         catch (Exception e) when (e is FaxApiException or JsonException)
@@ -280,7 +282,7 @@ public sealed class MainForm : Form
         Fill(_inboxGrid, _model.Inbox, r => [r.Time, r.Party, r.Pages], badgeColumn: -1);
     }
 
-    /// <summary>Rebuilds a grid (at most <see cref="MonitorModel.Capacity"/> rows), keeping the selected fax selected and the top visible fax on top.</summary>
+    /// <summary>Rebuilds a grid (at most <see cref="MonitorModel.Capacity"/> rows), keeping the selected fax selected and, when scrolled down, the top visible fax on top.</summary>
     private static void Fill(DataGridView g, IReadOnlyList<MonitorRow> rows, Func<MonitorRow, object[]> cells, int badgeColumn)
     {
         var selected = g.CurrentRow?.Tag as string;
@@ -303,9 +305,10 @@ public sealed class MainForm : Form
         g.ClearSelection();
         foreach (DataGridViewRow row in g.Rows)
             if (selected != null && (string?)row.Tag == selected) { row.Selected = true; g.CurrentCell = row.Cells[0]; break; }
-        // Keep the view on the same fax, not the same index: a new one at the top must not shift a scrolled view.
+        // Scrolled down: keep the view on the same fax, not the same index, so a new one at the top does not shift
+        // it. At the top (waiting for a fax) stay at the top, so the new one shows.
         int at = first;
-        for (int i = 0; firstId != null && i < rows.Count; i++)
+        for (int i = 0; first > 0 && firstId != null && i < rows.Count; i++)
             if (rows[i].Id == firstId) { at = i; break; }
         if (at >= 0 && at < g.Rows.Count) g.FirstDisplayedScrollingRowIndex = at;
     }

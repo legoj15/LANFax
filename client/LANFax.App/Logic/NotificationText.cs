@@ -65,6 +65,9 @@ public static class NotificationText
 
     public const string Unauthorized = "The server rejected the LANFax token. Click here to open Settings.";
 
+    /// <summary>The monitor window's message line for a refused token (any of its calls: loads, arm, PDF).</summary>
+    public const string WindowUnauthorized = "The server refused the token. Check it in Settings.";
+
     public static string ConfigProblem(string loadError) =>
         $"LANFax settings could not be read ({loadError}). Click here to open Settings.";
 

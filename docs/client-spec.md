@@ -582,15 +582,19 @@ smoke test fakes it).
   and queued" grid (time, to, state badge, pages, error); "Inbox" grid (time,
   from, pages); a message line. Double-click any row: download to
   `%LocalAppData%\LANFax\cache\<id>.pdf` (fresh each time: the server says
-  `no-store`), then ShellExecute. When the copy there cannot be replaced (a
-  viewer holds it open: Windows answers `UnauthorizedAccessException`,
-  measured 2026-10-01, or a sharing violation) that copy is opened and the
-  message line says so. A body that breaks off or stalls is an error, never
-  the stale copy: `FaxApi.DownloadPdfAsync` raises read failures as
+  `no-store`), then ShellExecute. When the finished download cannot be
+  moved over the copy there (a viewer holds it open: Windows answers
+  `UnauthorizedAccessException`, measured 2026-10-01, or a sharing
+  violation), `DownloadPdfAsync` raises `PdfFileInUseException` (an
+  `IOException`) and that copy is opened, the message line saying so. Any
+  other file failure (the `.part` cannot be created or written: disk full,
+  read-only cache folder) is an error, as is a body that breaks off or
+  stalls; never the stale copy: `FaxApi.DownloadPdfAsync` raises read failures as
   `FaxApiException` (StatusCode 0) and gives each body read the HttpClient's
   `Timeout` (30 s) again, since `ResponseHeadersRead` ends that timeout at
   the headers. A 404 says "The server has no PDF for this fax"; a 401 the
-  token line. A second double-click on a fax still downloading is ignored. The job id
+  token line (`NotificationText.WindowUnauthorized`, the window's one
+  wording for a refused token: loads, arm buttons, PDF). A second double-click on a fax still downloading is ignored. The job id
   must match `^[A-Za-z0-9_-]{1,64}$` and the full path must stay in the cache
   dir (`MonitorModel.PdfCachePath`). The cache is never pruned.
 - **Model rules (`MonitorModel`, tested in `MonitorModelTests`).**
@@ -626,12 +630,15 @@ smoke test fakes it).
     load failed, or after `ServerChanged`) every load is full, a resync's
     too. One load at a time (`MonitorLoader`): requests meanwhile coalesce
     into one more pass after it, from the earliest resync `since`. A load in
-    flight across `ServerChanged` lands nowhere. A failed load drops its
-    queued pass (the next reconnect or resync loads again); a 401 shows the
-    token line.
-  - Grids are rebuilt on every change; the selected fax stays selected and
-    the top visible fax stays on top (by id), so a new fax arriving does not
-    shift a scrolled view.
+    flight across `ServerChanged` lands nowhere. A failed load still runs
+    the pass queued behind it, once, from the queued `since` (the reconnect,
+    resync or new server's connect that queued it will not come again; a
+    failure of a load already dropped by `ServerChanged` is not shown); a
+    401 shows the token line.
+  - Grids are rebuilt on every change; the selected fax stays selected. A
+    view scrolled down keeps its top visible fax on top (by id), so a new
+    fax arriving does not shift it; a view at the top stays at the top, so
+    the new fax shows.
 - **Balloons:** fax received (from), job sent, job failed (tray, as before),
   and "Fax receiving ends in N min (at HH:mm)" once per arm window when 5 min
   or less is left (`ArmExpiryWatch`; a window is its end time, so extending
