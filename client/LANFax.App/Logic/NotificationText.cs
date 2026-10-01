@@ -56,6 +56,10 @@ public static class NotificationText
         ? $"1 document printed to \"{printerName}\" before LANFax started is stuck in the printer queue with an error. Click here to open the queue and restart it. A restart can deliver it twice: send only one copy."
         : $"{count} documents printed to \"{printerName}\" before LANFax started are stuck in the printer queue with an error. Click here to open the queue and restart them. A restart can deliver a document twice: send only one copy.";
 
+    /// <summary>The arm window ends soon; minutes rounded up, so "in 5 min" at exactly five.</summary>
+    public static string ArmExpiring(DateTimeOffset until, TimeSpan left) =>
+        $"Fax receiving ends in {Math.Max(1, (int)Math.Ceiling(left.TotalMinutes))} min (at {until.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture)}). Click here to keep it on.";
+
     public static string ReceiveArmed(DateTimeOffset until) =>
         $"Fax line will answer until {until.ToLocalTime():t}";
 

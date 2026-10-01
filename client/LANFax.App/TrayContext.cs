@@ -31,7 +31,12 @@ internal sealed class TrayContext : ApplicationContext
     private readonly ToolStripMenuItem _retryItem;
     private readonly RegisteredWaitHandle? _showWait;
     private readonly EventWaitHandle _showEvent;
+    /// <summary>"Arm window ends in 5 minutes", once per window; checked on arm changes and by <see cref="_armTimer"/>.</summary>
+    private readonly ArmExpiryWatch _armWatch = new();
+    private readonly System.Windows.Forms.Timer _armTimer = new() { Interval = 15_000 };
     private SendDialog? _openDialog;
+    /// <summary>The one monitor window, made on first open; closing it only hides it.</summary>
+    private MainForm? _monitor;
     private long _noticeId;
     private bool _settingsOpen;
     private bool _exiting;
@@ -50,7 +55,10 @@ internal sealed class TrayContext : ApplicationContext
         _noticeTimer.Tick += (_, _) => { _noticeTimer.Stop(); _notices.OnTimeout(_noticeId); };
 
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Open LANFax", null, (_, _) => OpenWeb());
+        var open = new ToolStripMenuItem("Open LANFax", null, (_, _) => ShowMonitor());
+        open.Font = new Font(open.Font, FontStyle.Bold); // the double-click action
+        menu.Items.Add(open);
+        menu.Items.Add("Open web page", null, (_, _) => OpenWeb());
         _unsentItem = new ToolStripMenuItem("", null, (_, _) => OpenOffers(OfferCategory.Unsent)) { Visible = false };
         _retryItem = new ToolStripMenuItem("", null, (_, _) => OpenOffers(OfferCategory.Retry)) { Visible = false };
         menu.Items.Add(_unsentItem);
@@ -75,7 +83,7 @@ internal sealed class TrayContext : ApplicationContext
         };
 
         _tray = new NotifyIcon { Icon = _iconOff, ContextMenuStrip = menu, Visible = true };
-        _tray.DoubleClick += (_, _) => OpenWeb();
+        _tray.DoubleClick += (_, _) => ShowMonitor();
         _tray.BalloonTipClicked += (_, _) => _notices.OnClicked();
         _tray.BalloonTipClosed += (_, _) => _notices.OnClosed();
         UpdateConnectionState(false);
@@ -87,6 +95,8 @@ internal sealed class TrayContext : ApplicationContext
         // Stop runs on the UI thread inside WM_ENDSESSION: nothing it raises while stopping needs the UI thread.
         _shutdown = new ShutdownBlocker(() => _runtime.IsReceiving, _runtime.StopListener, m => FileLog.Info("shutdown: " + m));
         Subscribe();
+        _armTimer.Tick += (_, _) => CheckArmExpiry();
+        _armTimer.Start();
 
         // Problems found while starting (old port leftover, pipe) are raised from inside, so subscribe first.
         var start = _runtime.Start();
@@ -115,6 +125,7 @@ internal sealed class TrayContext : ApplicationContext
         _runtime.PrinterProblem += AnnouncePrinter;
         _runtime.StuckPrintJobs += n => Balloon(NotificationText.StuckPrintJobs(_cfg.PrinterName, n), OpenPrinterQueue);
         _runtime.Notice += text => Balloon(text);
+        _runtime.ArmChanged += _ => CheckArmExpiry();
     }
 
     /// <summary>Balloon for a printer that is missing or prints somewhere else; clicking it installs or repairs.</summary>
@@ -128,6 +139,32 @@ internal sealed class TrayContext : ApplicationContext
         }
         FileLog.Error($"printer \"{_cfg.PrinterName}\" prints to {s.ActualPort}, expected {PrinterSetup.ExpectedPort()}");
         Balloon(NotificationText.PrinterMisconfigured(_cfg.PrinterName, s.ActualPort ?? ""), () => _ = InstallPrinterAsync());
+    }
+
+    // ---- monitor window ----
+
+    /// <summary>Shows the monitor window, making it the first time; raises it when it is already open.</summary>
+    private void ShowMonitor()
+    {
+        if (_exiting || _exitPending) return;
+        try
+        {
+            if (_monitor == null || _monitor.IsDisposed)
+            {
+                var form = new MainForm(_runtime, openSettings: OpenSettings);
+                form.FormClosed += (_, _) => { if (_monitor == form) _monitor = null; form.Dispose(); };
+                _monitor = form;
+            }
+            if (!_monitor.Visible) _monitor.Show();
+            if (_monitor.WindowState == FormWindowState.Minimized) _monitor.WindowState = FormWindowState.Normal;
+            _monitor.Activate();
+        }
+        catch (Exception e) { FileLog.Error("opening the monitor window failed", e); }
+    }
+
+    private void CheckArmExpiry()
+    {
+        if (_armWatch.Check(_runtime.Arm, DateTimeOffset.UtcNow) is { } text) Balloon(text, ShowMonitor);
     }
 
     // ---- threading and notifications ----
@@ -352,6 +389,7 @@ internal sealed class TrayContext : ApplicationContext
             if (dlg.ShowDialog() == DialogResult.OK)
             {
                 FileLog.Info($"settings saved: {_cfg.Server}:{_cfg.Port}, token set={!string.IsNullOrEmpty(_cfg.Token)}");
+                _monitor?.ServerChanged(); // maybe another server: its rows load on the next connect
                 _runtime.SettingsSaved();
             }
         }
@@ -385,6 +423,8 @@ internal sealed class TrayContext : ApplicationContext
         }
         _exiting = true;
         _noticeTimer.Stop();
+        _armTimer.Stop();
+        _monitor?.Hide();
         // A document still arriving gets PrintPipeListener.StopGrace: say so, and keep the UI thread free meanwhile.
         if (_runtime.IsReceiving) _tray.Text = "LANFax: finishing a document that is still printing...";
         await _runtime.StopAsync();
@@ -398,6 +438,9 @@ internal sealed class TrayContext : ApplicationContext
         {
             _exiting = true;
             _noticeTimer.Dispose();
+            _armTimer.Dispose();
+            var monitor = _monitor; _monitor = null;
+            if (monitor != null) { monitor.AllowClose = true; monitor.Dispose(); }
             _showWait?.Unregister(null);
             _shutdown.Dispose();
             var open = _openDialog; _openDialog = null;

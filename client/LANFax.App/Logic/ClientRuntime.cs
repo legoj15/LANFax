@@ -21,7 +21,7 @@ public sealed record RuntimeStart(IReadOnlyList<SendRequest> Unsent, PrinterStat
 /// posts through <see cref="Owner"/>. Nothing is raised once <see cref="StopAsync"/> or <see cref="Dispose"/> began.
 /// </para>
 /// </summary>
-public sealed class ClientRuntime : IDisposable
+public sealed class ClientRuntime : IDisposable, IMonitorSource
 {
     public static readonly TimeSpan DefaultPollInterval = TimeSpan.FromSeconds(60);
     /// <summary>How often the listener and the printer's port (a registry read) are re-checked.</summary>
@@ -102,6 +102,8 @@ public sealed class ClientRuntime : IDisposable
     /// <summary>The owner thread's context: post through it to get back to the thread every event is raised on.</summary>
     public SynchronizationContext Owner => _owner;
     public FaxApi Api { get; }
+    /// <summary><see cref="Api"/> as the monitor window sees it.</summary>
+    public IMonitorApi MonitorApi => Api;
     /// <summary>Owner thread only (the send dialog records its sends here).</summary>
     public JobTracker Tracker { get; }
 
@@ -162,6 +164,11 @@ public sealed class ClientRuntime : IDisposable
     /// For the inbox grid (the catch-up's list is raised only through <see cref="FaxesCaughtUp"/>).
     /// </summary>
     public event Action<Job>? InboxChanged;
+    /// <summary>
+    /// A <c>resync</c> event (the server's replay gap was too large), with its <c>since</c>; raised after the poll and
+    /// the inbound catch-up started. The monitor's grids reload from it.
+    /// </summary>
+    public event Action<DateTimeOffset?>? Resynced;
 
     // ---- lifecycle ----
 
@@ -322,6 +329,7 @@ public sealed class ClientRuntime : IDisposable
             Info($"event stream: resync requested (since {since?.ToString("o") ?? "unknown"}); reloading jobs and inbox");
             _ = PollTrackedAsync();
             _ = CatchUpInboundAsync(since);
+            Raise(Resynced, since);
         });
         es.StatusChanged += el => PostLive(() =>
         {

@@ -174,6 +174,9 @@ public sealed class ClientRuntimeTests : IDisposable
         var rt = Make();
         var finished = new ConcurrentQueue<(Job Job, TerminalResult? Tracked)>();
         rt.JobFinished += (j, r) => finished.Enqueue((j, r));
+        Assert.Same(rt.Api, ((IMonitorSource)rt).MonitorApi); // the monitor window's view of the runtime
+        var resyncs = new ConcurrentQueue<DateTimeOffset?>();
+        rt.Resynced += since => resyncs.Enqueue(since); // the monitor's grids reload from here
         _owner.Invoke(() => rt.TrackSubmitted("lf1"));
         _owner.Invoke(() => rt.Start());
 
@@ -190,6 +193,7 @@ public sealed class ClientRuntimeTests : IDisposable
         Assert.Single(_srv.Requests, r => r.PathAndQuery == "/jobs/lf1"); // finished: not polled again
         Assert.Single(_srv.Requests, r => r.PathAndQuery == "/jobs/lf2");
         Assert.Equal(1, _eventsConnections); // a resync reloads; it does not reconnect
+        Assert.Equal(new DateTimeOffset(2026, 9, 30, 10, 0, 0, TimeSpan.Zero), Assert.Single(resyncs));
     }
 
     // ---- (c) the snapshot follows the stream and is there for a late reader ----

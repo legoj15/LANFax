@@ -54,12 +54,24 @@ public interface ISendApi
     Task<Job> SendTestPageAsync(SendEndpoint endpoint, string to, string? note, string idempotencyKey, CancellationToken ct = default);
 }
 
+/// <summary>The reads and arm calls the monitor window makes; its smoke test fakes them.</summary>
+public interface IMonitorApi
+{
+    Task<IReadOnlyList<Job>> GetJobsAsync(string? direction = null, IEnumerable<string>? states = null,
+        int limit = 100, DateTimeOffset? updatedSince = null, CancellationToken ct = default);
+    Task<IReadOnlyList<Job>> GetInboxAsync(int limit = 50, CancellationToken ct = default);
+    Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default);
+    Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default);
+    Task<ArmState> DisarmAsync(CancellationToken ct = default);
+    Task<ArmState> ReceiveTestAsync(int minutes = 20, CancellationToken ct = default);
+}
+
 /// <summary>
 /// HttpClient wrapper for the faxd API. The token is sent as a Bearer header and never logged. Calls without a
 /// <see cref="SendEndpoint"/> snapshot the config once per call; a config that cannot form a URI throws
 /// <see cref="FaxApiConfigException"/> before any request.
 /// </summary>
-public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi
+public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi, IMonitorApi
 {
     public const int MaxAttempts = 3;
 
