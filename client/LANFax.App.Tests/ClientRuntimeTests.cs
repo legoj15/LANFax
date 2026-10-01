@@ -420,6 +420,29 @@ public sealed class ClientRuntimeTests : IDisposable
     }
 
     [Fact]
+    public async Task ArmChanged_is_raised_after_the_snapshot_moved_so_the_trays_expiry_check_reads_the_new_window()
+    {
+        // TrayContext.CheckArmExpiry reads rt.Arm (not the event argument), on ArmChanged and on its timer.
+        _events = async (_, ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, "event: arm\ndata: {\"armed\":true,\"until\":\"2026-10-01T12:04:00+00:00\",\"remaining_min\":4,\"ext\":\"300\"}\n\n");
+            await Hold(ctx);
+        };
+        var rt = Make();
+        var watch = new ArmExpiryWatch();
+        var balloons = new ConcurrentQueue<string>();
+        rt.ArmChanged += a =>
+        {
+            Assert.Equal(a, rt.Arm);
+            if (watch.Check(rt.Arm, new DateTimeOffset(2026, 10, 1, 12, 0, 0, TimeSpan.Zero)) is { } text) balloons.Enqueue(text);
+        };
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => !balloons.IsEmpty);
+        Assert.Single(balloons);
+    }
+
+    [Fact]
     public async Task A_restart_clears_the_previous_servers_snapshot()
     {
         _events = async (n, ctx, _) =>

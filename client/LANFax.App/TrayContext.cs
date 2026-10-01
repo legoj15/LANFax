@@ -90,7 +90,7 @@ internal sealed class TrayContext : ApplicationContext
 
         _showEvent = showSignal;
         _showWait = ThreadPool.RegisterWaitForSingleObject(_showEvent,
-            (_, _) => OnUi(() => Balloon("LANFax is already running")), null, Timeout.Infinite, false);
+            (_, _) => OnUi(ShowMonitor), null, Timeout.Infinite, false); // started again: show the window
 
         // Stop runs on the UI thread inside WM_ENDSESSION: nothing it raises while stopping needs the UI thread.
         _shutdown = new ShutdownBlocker(() => _runtime.IsReceiving, _runtime.StopListener, m => FileLog.Info("shutdown: " + m));

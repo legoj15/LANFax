@@ -134,13 +134,44 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi, IMonit
             using (resp)
             {
                 if (!resp.IsSuccessStatusCode) throw await ToException(resp);
-                await using var src = await resp.Content.ReadAsStreamAsync(ct);
-                await using (var dst = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
-                    await src.CopyToAsync(dst, ct);
+                await CopyBodyAsync(resp, tmp, ct);
             }
             File.Move(tmp, destPath, overwrite: true);
         }
         finally { try { File.Delete(tmp); } catch { } }
+    }
+
+    /// <summary>
+    /// The body into <paramref name="path"/>. <c>HttpClient.Timeout</c> stops at the headers with
+    /// <c>ResponseHeadersRead</c>, so each read here gets that long again (a stalled body ends, a slow one does not).
+    /// A read that fails or stalls is a network error (<see cref="FaxApiException"/>, StatusCode 0); only the file
+    /// writes can throw <see cref="IOException"/>, so a caller can tell a broken download from a locked file.
+    /// </summary>
+    private async Task CopyBodyAsync(HttpResponseMessage resp, string path, CancellationToken ct)
+    {
+        using var idle = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var limit = http.Timeout;
+        var buf = new byte[81920];
+        try
+        {
+            await using var src = await resp.Content.ReadAsStreamAsync(ct);
+            await using var dst = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
+            while (true)
+            {
+                if (limit != Timeout.InfiniteTimeSpan) idle.CancelAfter(limit);
+                int n;
+                try { n = await src.ReadAsync(buf, idle.Token); }
+                catch (Exception e) when (!ct.IsCancellationRequested && e is IOException or HttpRequestException or OperationCanceledException)
+                {
+                    throw new FaxApiException(0, idle.IsCancellationRequested
+                        ? $"the PDF download stalled (nothing for {limit.TotalSeconds:0} s)"
+                        : "the PDF download broke off: " + e.Message, e);
+                }
+                if (n == 0) return;
+                await dst.WriteAsync(buf.AsMemory(0, n), ct);
+            }
+        }
+        catch (Exception e) when (IsNetwork(e, ct)) { throw new FaxApiException(0, "cannot reach faxd: " + e.Message, e); }
     }
 
     // ---- writes ----

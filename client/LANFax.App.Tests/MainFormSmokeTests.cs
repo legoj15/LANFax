@@ -6,7 +6,7 @@ namespace LANFax.App.Tests;
 
 /// <summary>
 /// The monitor window built against a fake runtime on an STA thread with a message pump: it loads, takes live events,
-/// hides on close and lets go of the runtime when disposed. Skipped (passes empty) without an interactive desktop.
+/// hides on close and lets go of the runtime when disposed. Reported as skipped without an interactive desktop.
 /// </summary>
 public sealed class MainFormSmokeTests
 {
@@ -15,18 +15,17 @@ public sealed class MainFormSmokeTests
     private static Job J(string id, string dir, string state) =>
         new(id, dir, state, null, dir == "out" ? "5551234" : null, dir == "in" ? "5559876" : null, null, null, 1, null, T0, T0, null);
 
-    [Fact]
+    [InteractiveFact]
     public void MainForm_loads_takes_events_hides_on_close_and_disposes_cleanly()
     {
-        if (!Environment.UserInteractive) return; // no desktop session: nothing to show a window on
-
         var src = new FakeSource();
+        int settingsOpened = 0;
         Exception? failure = null;
         var t = new Thread(() =>
         {
             try
             {
-                using var form = new MainForm(src, cacheDir: Path.GetTempPath(), openFile: _ => { });
+                using var form = new MainForm(src, cacheDir: Path.GetTempPath(), openFile: _ => { }, openSettings: () => settingsOpened++);
                 form.Show();
                 Pump(() => form.JobRowCount == 1 && form.InboxRowCount == 1);
                 Assert.Equal(1, src.Api.FullLoads);
@@ -43,6 +42,21 @@ public sealed class MainFormSmokeTests
                 Assert.Equal(1, form.InboxRowCount);
                 Assert.Equal(T0, src.Api.LastSince);
 
+                // A refused token on an arm call opens Settings.
+                src.Api.ArmError = new FaxApiUnauthorizedException();
+                Find<Button>(form, b => b.Text == "Arm 1 h").PerformClick();
+                Pump(() => settingsOpened == 1);
+                src.Api.ArmError = null;
+
+                // A new fax at the top keeps a scrolled view on the same rows (anchored by id, not by index).
+                for (int i = 0; i < 40; i++) src.RaiseJob(J("lfs" + i, "out", "queued") with { CreatedAt = T0.AddMinutes(i + 1) });
+                var grid = (DataGridView)typeof(MainForm).GetField("_jobsGrid", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(form)!;
+                grid.FirstDisplayedScrollingRowIndex = 10;
+                var anchor = grid.Rows[grid.FirstDisplayedScrollingRowIndex].Tag;
+                src.RaiseJob(J("lfnew", "out", "queued") with { CreatedAt = T0.AddHours(5) });
+                Assert.Equal(43, form.JobRowCount);
+                Assert.Equal(anchor, grid.Rows[grid.FirstDisplayedScrollingRowIndex].Tag);
+
                 form.Close(); // the user's close hides; the app lives in the tray
                 Pump(() => !form.Visible);
                 Assert.False(form.IsDisposed);
@@ -56,6 +70,18 @@ public sealed class MainFormSmokeTests
         Assert.True(t.Join(TimeSpan.FromSeconds(30)), "the form thread hung");
         if (failure != null) throw new Xunit.Sdk.XunitException("MainForm smoke failed: " + failure);
         Assert.Equal(0, src.Subscribers); // disposed: no handler left on the runtime
+    }
+
+    private static T Find<T>(Control root, Func<T, bool> match) where T : Control =>
+        All(root).OfType<T>().FirstOrDefault(match) ?? throw new InvalidOperationException("control not found");
+
+    private static IEnumerable<Control> All(Control root)
+    {
+        foreach (Control c in root.Controls)
+        {
+            yield return c;
+            foreach (var d in All(c)) yield return d;
+        }
     }
 
     private static void Pump(Func<bool> until)
@@ -73,6 +99,7 @@ public sealed class MainFormSmokeTests
     {
         public int FullLoads, SinceLoads;
         public DateTimeOffset? LastSince;
+        public Exception? ArmError;
 
         public Task<IReadOnlyList<Job>> GetJobsAsync(string? direction = null, IEnumerable<string>? states = null, int limit = 100,
             DateTimeOffset? updatedSince = null, CancellationToken ct = default)
@@ -87,7 +114,8 @@ public sealed class MainFormSmokeTests
             Task.FromResult<IReadOnlyList<Job>>([J("in1", "in", "received")]);
 
         public Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default) => Task.CompletedTask;
-        public Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default) => Task.FromResult(new ArmState(true, null, minutes, "300"));
+        public Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default) =>
+            ArmError is { } e ? Task.FromException<ArmState>(e) : Task.FromResult(new ArmState(true, null, minutes, "300"));
         public Task<ArmState> DisarmAsync(CancellationToken ct = default) => Task.FromResult(new ArmState(false, null, 0, "300"));
         public Task<ArmState> ReceiveTestAsync(int minutes = 20, CancellationToken ct = default) => ArmAsync(minutes, ct);
     }
@@ -115,5 +143,14 @@ public sealed class MainFormSmokeTests
         public void RaiseJob(Job j) => JobChanged?.Invoke(j);
         public void RaiseInbox(Job j) => InboxChanged?.Invoke(j);
         public void RaiseResynced(DateTimeOffset? since) => Resynced?.Invoke(since);
+    }
+}
+
+/// <summary>A fact that needs a desktop session to show a window on; reported as skipped (not passed) without one.</summary>
+public sealed class InteractiveFactAttribute : FactAttribute
+{
+    public InteractiveFactAttribute()
+    {
+        if (!Environment.UserInteractive) Skip = "needs an interactive desktop session to show a window";
     }
 }

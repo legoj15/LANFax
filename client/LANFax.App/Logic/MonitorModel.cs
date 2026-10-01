@@ -121,10 +121,11 @@ public sealed partial class MonitorModel(TimeZoneInfo zone)
     // ---- reload cursor ----
 
     /// <summary>
-    /// Where a reload starts: a resync's own <c>since</c> (the server's cursor) if it gave one, else the last load less
-    /// <see cref="SkewMargin"/>; null means a full load (nothing loaded yet).
+    /// Where a reload starts: null (a full load) while nothing is loaded yet, even for a resync; else a resync's own
+    /// <c>since</c> (the server's cursor) if it gave one, else the last load less <see cref="SkewMargin"/>.
     /// </summary>
-    public DateTimeOffset? ReloadSince(DateTimeOffset? resyncSince) => resyncSince ?? LastLoad - SkewMargin;
+    public DateTimeOffset? ReloadSince(DateTimeOffset? resyncSince) =>
+        LastLoad is { } last ? resyncSince ?? last - SkewMargin : null;
 
     /// <summary>The <c>updated_since</c> form faxd reads: UTC, <c>yyyy-MM-ddTHH:mm:ssZ</c>, any culture.</summary>
     public static string FormatSince(DateTimeOffset t) =>

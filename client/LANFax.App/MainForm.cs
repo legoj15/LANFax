@@ -19,8 +19,6 @@ public sealed class MainForm : Form
 
     private readonly IMonitorSource _src;
     private readonly MonitorModel _model = new(TimeZoneInfo.Local);
-    private readonly string _cacheDir;
-    private readonly Action<string> _openFile;
     private readonly Action? _openSettings;
     private readonly Icon _icon = IconFactory.Create(true);
     private readonly Label _pill = new() { AutoSize = true, Padding = new Padding(8, 3, 8, 3), Anchor = AnchorStyles.Right, Font = new Font(SystemFonts.MessageBoxFont!, FontStyle.Bold) };
@@ -31,13 +29,9 @@ public sealed class MainForm : Form
     private readonly DataGridView _jobsGrid = MakeGrid(("Time", 22), ("To", 22), ("State", 16), ("Pages", 10), ("Error", 40));
     private readonly DataGridView _inboxGrid = MakeGrid(("Time", 30), ("From", 50), ("Pages", 20));
     private readonly System.Windows.Forms.Timer _tick = new() { Interval = 1000 };
-    private readonly HashSet<string> _opening = [];
+    private readonly MonitorLoader _loader;
+    private readonly PdfOpener _pdf;
     private ArmState _arm;
-    private bool _loading;
-    private bool _reloadQueued;
-    private DateTimeOffset? _queuedSince;
-    /// <summary>Bumped by <see cref="ServerChanged"/>: a load that started before it is dropped (old server's rows).</summary>
-    private int _generation;
 
     /// <param name="src">The runtime (its events arrive on this thread).</param>
     /// <param name="cacheDir">Where opened PDFs are downloaded; <see cref="MonitorModel.DefaultCacheDir"/> by default.</param>
@@ -46,10 +40,10 @@ public sealed class MainForm : Form
     public MainForm(IMonitorSource src, string? cacheDir = null, Action<string>? openFile = null, Action? openSettings = null)
     {
         _src = src;
-        _cacheDir = cacheDir ?? MonitorModel.DefaultCacheDir;
-        _openFile = openFile ?? ShellOpen;
         _openSettings = openSettings;
         _arm = src.Status.Arm;
+        _loader = new MonitorLoader(_model, () => _src.MonitorApi, OnLoaded, OnLoadFailed);
+        _pdf = new PdfOpener(() => _src.MonitorApi, cacheDir ?? MonitorModel.DefaultCacheDir, openFile ?? ShellOpen);
 
         Text = "LANFax";
         Icon = _icon;
@@ -117,15 +111,14 @@ public sealed class MainForm : Form
     /// <summary>The settings may name another server: drop the rows; the stream's next connect loads afresh.</summary>
     public void ServerChanged()
     {
-        _generation++;
-        _model.Clear();
+        _loader.ServerChanged();
         RenderGrids();
     }
 
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
-        _ = ReloadAsync(null); // the first load is a full one
+        _ = _loader.ReloadAsync(null); // the first load is a full one
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -148,6 +141,7 @@ public sealed class MainForm : Form
             _src.JobChanged -= OnJob;
             _src.InboxChanged -= OnJob;
             _src.Resynced -= OnResynced;
+            _loader.Stop();
             _tick.Dispose();
             _icon.Dispose();
         }
@@ -159,7 +153,7 @@ public sealed class MainForm : Form
     private void OnConnectionChanged(bool connected)
     {
         RenderPill();
-        if (connected && IsHandleCreated) _ = ReloadAsync(null); // whatever changed while disconnected
+        if (connected && IsHandleCreated) _ = _loader.ReloadAsync(null); // whatever changed while disconnected
     }
 
     private void OnStatusChanged(ServerStatus s)
@@ -177,56 +171,23 @@ public sealed class MainForm : Form
 
     private void OnResynced(DateTimeOffset? since)
     {
-        if (IsHandleCreated) _ = ReloadAsync(since);
+        if (IsHandleCreated) _ = _loader.ReloadAsync(since);
     }
 
-    // ---- loading ----
+    // ---- loading (MonitorLoader) ----
 
-    /// <summary>
-    /// A full load the first time (and after <see cref="ServerChanged"/>), else <c>GET /jobs?updated_since=</c> from
-    /// <see cref="MonitorModel.ReloadSince"/>; merged by id. One at a time: a request meanwhile runs once more after.
-    /// </summary>
-    private async Task ReloadAsync(DateTimeOffset? resyncSince)
+    private void OnLoaded()
     {
-        if (_loading)
-        {
-            _reloadQueued = true;
-            if (resyncSince is { } r && (_queuedSince is not { } q || r < q)) _queuedSince = r;
-            return;
-        }
-        _loading = true;
-        try
-        {
-            while (true)
-            {
-                var generation = _generation;
-                var since = _model.ReloadSince(resyncSince);
-                var started = DateTimeOffset.UtcNow;
-                IEnumerable<Job> got;
-                if (since == null)
-                {
-                    var jobs = await _src.MonitorApi.GetJobsAsync(direction: "out", limit: MonitorModel.FullLoadLimit);
-                    var inbox = await _src.MonitorApi.GetInboxAsync(MonitorModel.FullLoadLimit);
-                    got = jobs.Concat(inbox);
-                }
-                else got = await _src.MonitorApi.GetJobsAsync(limit: MonitorModel.SinceLoadLimit, updatedSince: since);
-                if (IsDisposed) return;
-                if (generation == _generation) _model.ApplyLoad(got, started);
-                RenderGrids();
-                _message.Text = Hint;
-                if (!_reloadQueued) break;
-                _reloadQueued = false;
-                resyncSince = _queuedSince;
-                _queuedSince = null;
-            }
-        }
-        catch (FaxApiUnauthorizedException) { Say("The server refused the token. Check it in Settings."); }
-        catch (Exception e) when (e is FaxApiException or JsonException)
-        {
-            FileLog.Error("monitor: loading the job lists failed", e);
-            Say("Could not load the job lists: " + e.Message);
-        }
-        finally { _loading = false; }
+        if (IsDisposed) return;
+        RenderGrids();
+        _message.Text = Hint;
+    }
+
+    private void OnLoadFailed(Exception e)
+    {
+        if (e is FaxApiUnauthorizedException) { Say(PdfOpener.Unauthorized); return; }
+        FileLog.Error("monitor: loading the job lists failed", e);
+        Say("Could not load the job lists: " + e.Message);
     }
 
     // ---- actions ----
@@ -272,33 +233,13 @@ public sealed class MainForm : Form
         _ = OpenPdfAsync(id);
     }
 
-    /// <summary>Downloads the fax's PDF to the cache (fresh each time: the server says no-store), then opens it.</summary>
+    /// <summary>Downloads the fax's PDF and opens it (<see cref="PdfOpener"/>).</summary>
     private async Task OpenPdfAsync(string id)
     {
-        if (!_opening.Add(id)) return; // a double double-click
-        try
-        {
-            var path = MonitorModel.PdfCachePath(_cacheDir, id);
-            Say("Downloading the PDF...");
-            try { await _src.MonitorApi.DownloadPdfAsync(id, path); }
-            catch (IOException e) when (File.Exists(path))
-            {
-                // Most likely still open in a viewer that locks it: show the copy already here.
-                FileLog.Info($"monitor: pdf {id} not replaced ({e.Message}); opening the cached copy");
-            }
-            if (IsDisposed) return;
-            _message.Text = Hint;
-            _openFile(path);
-        }
-        catch (FaxApiUnauthorizedException) { Say("The server refused the token. Check it in Settings."); }
-        catch (FaxApiException e) when (e.StatusCode == 404) { Say("The server has no PDF for this fax."); }
-        catch (Exception e) when (e is FaxApiException or IOException or UnauthorizedAccessException or ArgumentException
-                                      or System.ComponentModel.Win32Exception)
-        {
-            FileLog.Error($"monitor: opening the pdf of {id} failed", e);
-            Say("Could not open the PDF: " + e.Message);
-        }
-        finally { _opening.Remove(id); }
+        Say("Downloading the PDF...");
+        var r = await _pdf.OpenAsync(id);
+        if (r == null || IsDisposed) return;
+        _message.Text = r.Message ?? Hint;
     }
 
     private static void ShellOpen(string path)
@@ -339,11 +280,12 @@ public sealed class MainForm : Form
         Fill(_inboxGrid, _model.Inbox, r => [r.Time, r.Party, r.Pages], badgeColumn: -1);
     }
 
-    /// <summary>Rebuilds a grid (at most <see cref="MonitorModel.Capacity"/> rows), keeping the selected fax selected.</summary>
+    /// <summary>Rebuilds a grid (at most <see cref="MonitorModel.Capacity"/> rows), keeping the selected fax selected and the top visible fax on top.</summary>
     private static void Fill(DataGridView g, IReadOnlyList<MonitorRow> rows, Func<MonitorRow, object[]> cells, int badgeColumn)
     {
         var selected = g.CurrentRow?.Tag as string;
         var first = g.FirstDisplayedScrollingRowIndex;
+        var firstId = first >= 0 && first < g.Rows.Count ? g.Rows[first].Tag as string : null;
         g.Rows.Clear();
         foreach (var r in rows)
         {
@@ -361,7 +303,11 @@ public sealed class MainForm : Form
         g.ClearSelection();
         foreach (DataGridViewRow row in g.Rows)
             if (selected != null && (string?)row.Tag == selected) { row.Selected = true; g.CurrentCell = row.Cells[0]; break; }
-        if (first >= 0 && first < g.Rows.Count) g.FirstDisplayedScrollingRowIndex = first;
+        // Keep the view on the same fax, not the same index: a new one at the top must not shift a scrolled view.
+        int at = first;
+        for (int i = 0; firstId != null && i < rows.Count; i++)
+            if (rows[i].Id == firstId) { at = i; break; }
+        if (at >= 0 && at < g.Rows.Count) g.FirstDisplayedScrollingRowIndex = at;
     }
 
     private static (Color Back, Color Fore) BadgeColors(BadgeColor c) => c switch

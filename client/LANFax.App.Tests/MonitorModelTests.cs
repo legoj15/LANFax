@@ -193,7 +193,7 @@ public sealed class MonitorModelTests
         var m = new MonitorModel(Zone);
         Assert.Null(m.ReloadSince(null)); // never loaded: a full load
         var resync = new DateTimeOffset(2026, 9, 30, 10, 0, 0, TimeSpan.FromHours(2));
-        Assert.Equal(resync, m.ReloadSince(resync));
+        Assert.Null(m.ReloadSince(resync)); // a resync before any load still needs the full load
 
         m.ApplyLoad([], T0);
         Assert.Equal(T0, m.LastLoad);
@@ -209,6 +209,7 @@ public sealed class MonitorModelTests
         m.Clear(); // another server: start over
         Assert.Null(m.LastLoad);
         Assert.Empty(m.Jobs);
+        Assert.Null(m.ReloadSince(resync)); // and a resync then is a full load too
     }
 
     // ---- live rows ----

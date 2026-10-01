@@ -31,7 +31,7 @@ client/
   LANFax.Core/                      net10.0 class library: no UI
     ClientConfig.cs                 %ProgramData%\LANFax\config.json (server, port, printer name, spool dir) + per-user %LocalAppData%\LANFax\token.bin; Validate(); Load never throws, sets LoadError
     Dpapi.cs                        DPAPI via crypt32 P/Invoke (no NuGet package); Protect takes a DpapiScope (CurrentUser for the token)
-    FaxApi.cs                       ISendApi (post job, test send, both to a SendEndpoint snapshot, PDF as byte[]) + IMonitorApi (jobs, inbox, pdf download, arm/disarm/test receive; what MainForm calls) + HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download; FaxApiConfigException
+    FaxApi.cs                       ISendApi (post job, test send, both to a SendEndpoint snapshot, PDF as byte[]) + IMonitorApi (jobs, inbox, pdf download, arm/disarm/test receive; what MainForm calls) + HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download (body read failures and stalls -> FaxApiException 0, per-read idle limit = HttpClient.Timeout); FaxApiConfigException
     EventStream.cs                  SSE client: GET /events?token=, Last-Event-ID, stall detection, reconnect with backoff, raises typed events
     IPrintListener.cs               what ClientRuntime needs from the listener (start, stop, running/receiving, events); PrintPipeListener implements it, tests fake it
     PrintPipeListener.cs            serves the printer's pipe port \\.\pipe\LANFax (ACL: deny NETWORK, allow SYSTEM + current user, job-writing rights for Authenticated Users; first instance only, retried while taken; 2 instances); streams each connection to jobs/<guid>.pdf.part, flushes, renames to jobs/<guid>.pdf (or moves to rejected/); raises NewPrintJob / Error; EofCounter
@@ -42,13 +42,13 @@ client/
   LANFax.App/                       net10.0-windows WinForms, single-file self-contained win-x64
     Program.cs                      machine-wide single-instance mutex (Global\LANFax.Tray, see "One active session"); loads the config; installs the UI thread's WindowsFormsSynchronizationContext, builds the one ClientRuntime on that context and hands it to TrayContext; no console
     Logic/ClientRuntime.cs          everything non-UI, one instance per process: FaxApi + HttpClients, the one EventStream and its restart, connection/status/arm snapshot, JobTracker + 60 s poll, InboundAnnouncer + InboundCatchUp, print listener + ListenerWatch + session-end stop, PrinterWatch + stuck-print-job checks (System.Threading timers); takes the owner (UI) thread's SynchronizationContext, raises plain events on it, exposes it as `Owner`; implements IMonitorSource (Logic/IMonitorSource.cs) for MainForm
-    TrayContext.cs                  UI only, consumes ClientRuntime: NotifyIcon + menu (Open LANFax = the MainForm, also on icon double-click; Open web page; Unsent documents (N); Retry failed fax (N); Send a test page...; Receive a test (arm 20 min); Install printer; Settings; Exit), balloons (incl. arm window ending, via ArmExpiryWatch), send dialogs one at a time, the one MainForm, ShutdownBlocker, Exit; gets back to the UI thread only through `ClientRuntime.Owner`
+    TrayContext.cs                  UI only, consumes ClientRuntime: NotifyIcon + menu (Open LANFax = the MainForm, also on icon double-click and on a second start's show signal; Open web page; Unsent documents (N); Retry failed fax (N); Send a test page...; Receive a test (arm 20 min); Install printer; Settings; Exit), balloons (incl. arm window ending, via ArmExpiryWatch), send dialogs one at a time, the one MainForm, ShutdownBlocker, Exit; gets back to the UI thread only through `ClientRuntime.Owner`
     SendDialog.cs                   non-modal; number, subject, page count, Send / Cancel; "Send test page instead" checkbox
-    Logic/                          testable plain classes: ClientRuntime, MonitorModel + ArmExpiryWatch, SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer + InboundCatchUp, InstanceGuard, ...
-    MainForm.cs                     monitor window over IMonitorSource + MonitorModel: status pill, arm card with countdown and buttons, jobs grid, inbox grid, double-click opens the PDF; one instance, close hides it
+    Logic/                          testable plain classes: ClientRuntime, MonitorModel + ArmExpiryWatch, MonitorLoader, PdfOpener, SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer + InboundCatchUp, InstanceGuard, ...
+    MainForm.cs                     monitor window over IMonitorSource + MonitorModel + MonitorLoader + PdfOpener: status pill, arm card with countdown and buttons, jobs grid, inbox grid, double-click opens the PDF; one instance, close hides it
     SettingsDialog.cs               server host/ip, port, token, "Clear token", "Test connection"
   LANFax.Tests/                     xunit: Core (config, FaxApi, EventStream, PrintPipeListener against real pipes, numbers) + install/Inno script checks
-  LANFax.App.Tests/                 xunit: App Logic classes; MonitorModelTests; MainFormSmokeTests (the one WinForms file built in a test: STA thread, fake IMonitorSource, returns early without an interactive desktop); ClientRuntimeTests run the runtime on a dedicated owner thread against FakeServer (linked from LANFax.Tests) and a fake IPrintListener
+  LANFax.App.Tests/                 xunit: App Logic classes; MonitorModelTests; MonitorLoaderTests; PdfOpenerTests; MainFormSmokeTests (the one WinForms file built in a test: STA thread, fake IMonitorSource; [InteractiveFact] reports it skipped without an interactive desktop); ClientRuntimeTests run the runtime on a dedicated owner thread against FakeServer (linked from LANFax.Tests) and a fake IPrintListener
   install/
     Install-LANFaxPrinter.ps1       elevated: Add-PrinterPort -Name \\.\pipe\<PipeName>; Add-Printer -Name "LAN Fax" -DriverName "Microsoft Print To PDF" -PortName <pipe port>, or Set-Printer -PortName <pipe port> when the printer exists on another port; removes the old file port spool\print.pdf when unused; KeepPrintedJobs off (lists jobs it kept, removes none); resumes a paused queue; removes the superseded Users manage ACE if present; idempotent
     Uninstall-LANFaxPrinter.ps1     removes printer, pipe port and an unused old file port; leaves %ProgramData%\LANFax
@@ -524,8 +524,8 @@ client/
 
 - The spool file and `spool\jobs` journal are machine-wide, so only one
   LANFax runs per machine: the mutex is `Global\LANFax.Tray`. A second start
-  in the same session asks the running tray for its "already running"
-  balloon (`Local\LANFax.Tray.ShowRunning`); a start in another Windows
+  in the same session signals the running tray to show its monitor window
+  (`Local\LANFax.Tray.ShowRunning`; as "Open LANFax"); a start in another Windows
   session (fast user switching, RDP) shows "LANFax is already running in
   another session" and exits. `InstanceGuard.Acquire` creates the show event
   the moment it owns the mutex (before the tray is built), and a second start
@@ -543,8 +543,11 @@ client/
 ## Monitor (phase 3)
 
 Built 2026-10-01: `MainForm` (thin WinForms view), `Logic/MonitorModel.cs`
-(view-model, no UI, tested) and `Logic/IMonitorSource.cs` (what the form
-needs from `ClientRuntime`; the smoke test fakes it).
+(view-model, no UI, tested), `Logic/MonitorLoader.cs` (the loads, tested in
+`MonitorLoaderTests`), `Logic/PdfOpener.cs` (double-click to PDF, tested in
+`PdfOpenerTests` against FakeServer and the real `FaxApi`) and
+`Logic/IMonitorSource.cs` (what the form needs from `ClientRuntime`; the
+smoke test fakes it).
 
 - **Runtime underneath.** `ClientRuntime` owns the non-UI state the tray and
   the form share. It merges `status` and `arm` events into a `Status` / `Arm`
@@ -579,8 +582,15 @@ needs from `ClientRuntime`; the smoke test fakes it).
   and queued" grid (time, to, state badge, pages, error); "Inbox" grid (time,
   from, pages); a message line. Double-click any row: download to
   `%LocalAppData%\LANFax\cache\<id>.pdf` (fresh each time: the server says
-  `no-store`; a copy locked by an open viewer is opened as it is), then
-  ShellExecute. A 404 says "The server has no PDF for this fax". The job id
+  `no-store`), then ShellExecute. When the copy there cannot be replaced (a
+  viewer holds it open: Windows answers `UnauthorizedAccessException`,
+  measured 2026-10-01, or a sharing violation) that copy is opened and the
+  message line says so. A body that breaks off or stalls is an error, never
+  the stale copy: `FaxApi.DownloadPdfAsync` raises read failures as
+  `FaxApiException` (StatusCode 0) and gives each body read the HttpClient's
+  `Timeout` (30 s) again, since `ResponseHeadersRead` ends that timeout at
+  the headers. A 404 says "The server has no PDF for this fax"; a 401 the
+  token line. A second double-click on a fax still downloading is ignored. The job id
   must match `^[A-Za-z0-9_-]{1,64}$` and the full path must stay in the cache
   dir (`MonitorModel.PdfCachePath`). The cache is never pruned.
 - **Model rules (`MonitorModel`, tested in `MonitorModelTests`).**
@@ -612,8 +622,16 @@ needs from `ClientRuntime`; the smoke test fakes it).
     (both directions; the 5 min `SkewMargin` absorbs a client clock ahead of
     the server's, the merge absorbs the overlap). On `resync`:
     `updated_since=<the event's since>`. `updated_since` is UTC
-    `yyyy-MM-ddTHH:mm:ssZ`, invariant. One load at a time; one more runs after
-    if asked meanwhile.
+    `yyyy-MM-ddTHH:mm:ssZ`, invariant. While nothing is loaded yet (first
+    load failed, or after `ServerChanged`) every load is full, a resync's
+    too. One load at a time (`MonitorLoader`): requests meanwhile coalesce
+    into one more pass after it, from the earliest resync `since`. A load in
+    flight across `ServerChanged` lands nowhere. A failed load drops its
+    queued pass (the next reconnect or resync loads again); a 401 shows the
+    token line.
+  - Grids are rebuilt on every change; the selected fax stays selected and
+    the top visible fax stays on top (by id), so a new fax arriving does not
+    shift a scrolled view.
 - **Balloons:** fax received (from), job sent, job failed (tray, as before),
   and "Fax receiving ends in N min (at HH:mm)" once per arm window when 5 min
   or less is left (`ArmExpiryWatch`; a window is its end time, so extending

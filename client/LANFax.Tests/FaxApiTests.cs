@@ -316,6 +316,51 @@ public class FaxApiTests : IDisposable
     }
 
     [Fact]
+    public async Task DownloadPdf_a_body_that_stalls_after_the_headers_times_out_as_a_network_error()
+    {
+        using var release = new CancellationTokenSource();
+        _srv.Handler = async (ctx, _) =>
+        {
+            ctx.Response.ContentType = "application/pdf";
+            ctx.Response.ContentLength64 = 1000;
+            await ctx.Response.OutputStream.WriteAsync(Encoding.ASCII.GetBytes("%PDF-1.4"));
+            await ctx.Response.OutputStream.FlushAsync();
+            try { await Task.Delay(TimeSpan.FromSeconds(30), release.Token); } catch (OperationCanceledException) { }
+            ctx.Response.Abort();
+        };
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(1) }; // the idle limit for the body too
+        var api = new FaxApi(new ClientConfig { Server = "127.0.0.1", Port = _srv.Port, Token = "tok123" }, http);
+        var dest = Path.Combine(Path.GetTempPath(), "lanfax-" + Guid.NewGuid().ToString("N"), "x.pdf");
+        try
+        {
+            var e = await Assert.ThrowsAsync<FaxApiException>(() => api.DownloadPdfAsync("lfabc", dest).WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.Equal(0, e.StatusCode);
+            Assert.False(File.Exists(dest));
+            Assert.False(File.Exists(dest + ".part"));
+        }
+        finally { release.Cancel(); }
+    }
+
+    [Fact]
+    public async Task DownloadPdf_a_body_cut_off_midway_is_a_network_error_and_leaves_the_old_copy()
+    {
+        _srv.Handler = async (ctx, _) =>
+        {
+            ctx.Response.ContentType = "application/pdf";
+            ctx.Response.ContentLength64 = 1000;
+            await ctx.Response.OutputStream.WriteAsync(Encoding.ASCII.GetBytes("%PDF-1.4"));
+            await ctx.Response.OutputStream.FlushAsync();
+            ctx.Response.Abort();
+        };
+        var dest = Path.Combine(Path.GetTempPath(), "lanfax-" + Guid.NewGuid().ToString("N"), "x.pdf");
+        Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+        File.WriteAllText(dest, "old copy");
+        var e = await Assert.ThrowsAsync<FaxApiException>(() => Api().DownloadPdfAsync("lfabc", dest).WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(0, e.StatusCode);
+        Assert.Equal("old copy", File.ReadAllText(dest));
+    }
+
+    [Fact]
     public async Task TestSendArmDisarmReceiveTest()
     {
         _srv.Handler = (ctx, r) => r.PathAndQuery.StartsWith("/test/send")
