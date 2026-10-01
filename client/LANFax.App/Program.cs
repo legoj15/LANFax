@@ -1,4 +1,5 @@
 using LANFax.App.Logic;
+using LANFax.Core;
 
 namespace LANFax.App;
 
@@ -28,7 +29,18 @@ internal static class Program
             FileLog.Error("Unhandled exception", e.ExceptionObject as Exception);
 
         FileLog.Info("LANFax starting");
-        using var ctx = new TrayContext(claim.ShowSignal!);
+        var loc = ConfigLocation.Default();
+        var cfg = ClientConfig.Load(loc.ReadPath, ClientConfig.DefaultTokenPath); // never throws; problems land in LoadError
+        FileLog.Info($"config: {loc.ReadPath} (save to {loc.Path}, fallback={loc.IsFallback}), server {cfg.Server}:{cfg.Port}, token set={!string.IsNullOrEmpty(cfg.Token)}");
+        if (cfg.LoadError != null) FileLog.Error("config: " + cfg.LoadError);
+
+        // The runtime's owner thread is this (the UI) thread: its stream, listener and timer callbacks are posted here,
+        // and await continuations come back here. Disposed after the tray (declared first), so the tray's shutdown
+        // guard is gone before the listener it guards.
+        var ui = new WindowsFormsSynchronizationContext();
+        SynchronizationContext.SetSynchronizationContext(ui);
+        using var runtime = new ClientRuntime(cfg, a => ui.Post(_ => a(), null));
+        using var ctx = new TrayContext(runtime, loc, claim.ShowSignal!);
         Application.Run(ctx);
         FileLog.Info("LANFax exiting");
     }

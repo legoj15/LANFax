@@ -33,20 +33,22 @@ client/
     Dpapi.cs                        DPAPI via crypt32 P/Invoke (no NuGet package); Protect takes a DpapiScope (CurrentUser for the token)
     FaxApi.cs                       ISendApi (post job, test send, both to a SendEndpoint snapshot, PDF as byte[]) + HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download; FaxApiConfigException
     EventStream.cs                  SSE client: GET /events?token=, Last-Event-ID, stall detection, reconnect with backoff, raises typed events
+    IPrintListener.cs               what ClientRuntime needs from the listener (start, stop, running/receiving, events); PrintPipeListener implements it, tests fake it
     PrintPipeListener.cs            serves the printer's pipe port \\.\pipe\LANFax (ACL: deny NETWORK, allow SYSTEM + current user, job-writing rights for Authenticated Users; first instance only, retried while taken; 2 instances); streams each connection to jobs/<guid>.pdf.part, flushes, renames to jobs/<guid>.pdf (or moves to rejected/); raises NewPrintJob / Error; EofCounter
     OldPortLeftover.cs              sorts a document left in the old file port spool\print.pdf into jobs/ (one complete PDF) or rejected/; the tray runs it at start and after an install
     Numbers.cs                      normalize_number / check_number mirror (shared vectors: LANFax.Tests/numbers-vectors.json)
     Models.cs                       Job, ArmState, ServerStatus records mirroring faxd JSON
   (PrinterSetup, which detects the printer and launches the elevated install/uninstall script, lives in LANFax.App)
   LANFax.App/                       net10.0-windows WinForms, single-file self-contained win-x64
-    Program.cs                      machine-wide single-instance mutex (Global\LANFax.Tray, see "One active session"); tray icon; no console
-    TrayContext.cs                  NotifyIcon + menu: Open, Send a test..., Receive a test (arm 20 min), Settings, Install printer, Exit
+    Program.cs                      machine-wide single-instance mutex (Global\LANFax.Tray, see "One active session"); loads the config; installs the UI thread's WindowsFormsSynchronizationContext, builds the one ClientRuntime posting onto it and hands it to TrayContext; no console
+    Logic/ClientRuntime.cs          everything non-UI, one instance per process: FaxApi + HttpClients, the one EventStream and its restart, connection/status/arm snapshot, JobTracker + 60 s poll, InboundAnnouncer + InboundCatchUp, print listener + ListenerWatch + session-end stop, PrinterWatch + stuck-print-job checks (System.Threading timers); raises plain events on its owner (UI) thread
+    TrayContext.cs                  UI only, consumes ClientRuntime: NotifyIcon + menu (Open, Unsent documents (N), Retry failed fax (N), Send a test page..., Receive a test (arm 20 min), Install printer, Settings, Exit), balloons, send dialogs one at a time, ShutdownBlocker, Exit
     SendDialog.cs                   non-modal; number, subject, page count, Send / Cancel; "Send test page instead" checkbox
-    Logic/                          testable plain classes: SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer + InboundCatchUp, InstanceGuard, ...
+    Logic/                          testable plain classes: ClientRuntime, SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer + InboundCatchUp, InstanceGuard, ...
     MainForm.cs                     (phase 3, NOT YET WRITTEN) status header, arm card with countdown, jobs grid, inbox grid, open PDF
     SettingsDialog.cs               server host/ip, port, token, "Clear token", "Test connection"
   LANFax.Tests/                     xunit: Core (config, FaxApi, EventStream, PrintPipeListener against real pipes, numbers) + install/Inno script checks
-  LANFax.App.Tests/                 xunit: App Logic classes (no UI; the WinForms files are not tested)
+  LANFax.App.Tests/                 xunit: App Logic classes (no UI; the WinForms files are not tested); ClientRuntimeTests run the runtime on a dedicated owner thread against FakeServer (linked from LANFax.Tests) and a fake IPrintListener
   install/
     Install-LANFaxPrinter.ps1       elevated: Add-PrinterPort -Name \\.\pipe\<PipeName>; Add-Printer -Name "LAN Fax" -DriverName "Microsoft Print To PDF" -PortName <pipe port>, or Set-Printer -PortName <pipe port> when the printer exists on another port; removes the old file port spool\print.pdf when unused; KeepPrintedJobs off (lists jobs it kept, removes none); resumes a paused queue; removes the superseded Users manage ACE if present; idempotent
     Uninstall-LANFaxPrinter.ps1     removes printer, pipe port and an unused old file port; leaves %ProgramData%\LANFax
@@ -489,7 +491,7 @@ client/
 | `SendKind` (why a dialog opens, `DialogQueue.cs`) | `New`, `Retry`, `Draft`, `Resume`, `Suspect` | `JobTracker.Scan` at startup (by record state), `RequestFor` (failed -> Retry, unknown -> Suspect), a fresh print job (New) |
 | `AttemptOutcome` (`SendSession.cs`) | `NotSent`, `Rejected`, `Uncertain` | `SendOutcome.Classify` via `SendSession.Failed`: NotSent before `Started` or on `FaxApiConfigException`; 4xx except 409 = Rejected; the rest Uncertain. A locked session unlocks only on Rejected with a status other than 401 |
 | `DialogOutcome` (`SendDialog.cs`) | `Accepted`, `Cancelled`, `Kept`, `Abandoned` | `SendDialog.OnClosing`: user close keeps the document (Kept) when `SendSession.CancelKeepsDocumentFor` says so (locked or Suspect), else Cancelled; app exit/shutdown = Abandoned. `TrayContext.OnSendDialogClosed` acts on it |
-| `OfferCategory` (tray items, `DialogQueue.cs`) | `Unsent`, `Retry` | `TrayContext`: Kept dialogs and dialogs that failed to open -> Unsent; `OnJobChanged` failed -> Retry |
+| `OfferCategory` (tray items, `DialogQueue.cs`) | `Unsent`, `Retry` | `TrayContext`: Kept dialogs and dialogs that failed to open -> Unsent; `OnJobFinished` (`ClientRuntime.JobFinished`, kept for retry) -> Retry |
 
 ## Inbound catch-up (phase 2, tray)
 
@@ -541,10 +543,19 @@ client/
 ## Monitor (phase 3, pending)
 
 - **Not implemented yet.** There is no `MainForm`; "Open LANFax" opens the web
-  page. Core's `GetStatusAsync`, `ServerStatus.Merge`, `ArmState`,
-  `GetInboxAsync`, `DownloadPdfAsync`, `ArmAsync`/`DisarmAsync` and the
-  `EventStream.StatusChanged`/`ArmChanged` events exist for it and have no
-  production caller until then (only the inbound catch-up uses `GetJobsAsync`).
+  page. Step 1 is done: `ClientRuntime` (`Logic/ClientRuntime.cs`) owns the
+  non-UI state the tray and a MainForm share. It merges `StatusChanged` and
+  `ArmChanged` into a `Status` / `Arm` snapshot (plus `Connected`,
+  `EverConnected`), raises `StatusChanged` / `ArmChanged` / `ConnectionChanged`,
+  and a window that opens later reads the snapshot instead of waiting for an
+  event. It does not call `GET /status` at connect: faxd's stream opens with a
+  full `status` and an `arm` event. Every runtime member is called on, and
+  every event raised on, the owner thread (the UI thread); nothing is raised
+  once `StopAsync` (Exit: timers die, run cancelled, listener stopped on
+  purpose, run awaited up to 5 s) or `Dispose` began. Core's `GetStatusAsync`,
+  `GetInboxAsync`, `DownloadPdfAsync` and `ArmAsync`/`DisarmAsync` exist for
+  the MainForm and have no production caller until then (only the inbound
+  catch-up uses `GetJobsAsync`).
   The arm-window-expiring balloon is part of this phase.
 - `MainForm` mirrors the web page: status pill (registrations, daemon,
   receiving), arm card with countdown and buttons (1 h, 4 h, 8 h, 20 min test
@@ -554,7 +565,10 @@ client/
 - One `EventStream` for the app's lifetime (it reads the config at each
   connect). Saving Settings cancels the run, waits for it to end and calls
   `StartAsync` again with a new token, so `LastEventId` survives; events a
-  cancelled run raises are dropped.
+  cancelled run raises are dropped (connected, disconnected, resync, status,
+  arm; job and received events are kept, as the stream already counted them
+  in `LastEventId`). Implemented in `ClientRuntime.RestartStream` /
+  `SettingsSaved`.
 - Live updates from `EventStream`; on reconnect reload both grids
   (`GET /jobs?updated_since=`, formatted culture-invariant as
   `yyyy-MM-ddTHH:mm:ssZ` in UTC). If no line (event or the 15 s keepalive)

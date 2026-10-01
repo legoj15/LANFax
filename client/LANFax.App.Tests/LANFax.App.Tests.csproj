@@ -10,6 +10,10 @@
     <Using Include="Xunit" />
   </ItemGroup>
   <ItemGroup>
+    <!-- The in-process faxd fake, shared with the Core tests (ClientRuntimeTests talk to it over HTTP). -->
+    <Compile Include="..\LANFax.Tests\FakeServer.cs" Link="FakeServer.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\LANFax.App\LANFax.App.csproj" />
   </ItemGroup>
   <ItemGroup>

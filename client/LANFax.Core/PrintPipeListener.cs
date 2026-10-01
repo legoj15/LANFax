@@ -29,7 +29,7 @@ namespace LANFax.Core;
 /// prevent it.
 /// </para>
 /// </summary>
-public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPipeListener.DefaultPipeName) : IDisposable
+public sealed class PrintPipeListener(string spoolDir, string pipeName = PrintPipeListener.DefaultPipeName) : IPrintListener
 {
     public const string DefaultPipeName = "LANFax";
     /// <summary>Jobs larger than this are rejected (a fax of hundreds of pages is still far below it).</summary>
