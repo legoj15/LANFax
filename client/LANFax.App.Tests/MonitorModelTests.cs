@@ -177,6 +177,15 @@ public sealed class MonitorModelTests
     }
 
     [Fact]
+    public void Expiring_balloon_says_what_its_click_does()
+    {
+        // The tray wires the click to ShowMonitor: it opens the window, where an arm button extends the window.
+        var text = NotificationText.ArmExpiring(T0 + TimeSpan.FromMinutes(4), TimeSpan.FromMinutes(4));
+        Assert.EndsWith("Click here to open LANFax and extend it.", text);
+        Assert.DoesNotContain("keep it on", text);
+    }
+
+    [Fact]
     public void Expiring_balloon_ignores_windows_without_an_end_or_already_over()
     {
         var w = new ArmExpiryWatch();
@@ -243,6 +252,25 @@ public sealed class MonitorModelTests
         m.Apply(J("a", state: "sent", updated: T0.AddMinutes(2)));
         Assert.False(m.Apply(J("a", state: "dialing", updated: T0.AddMinutes(1)))); // a slow reload arriving late
         Assert.Equal("Sent", Assert.Single(m.Jobs).Badge);
+    }
+
+    [Fact]
+    public void At_equal_updated_at_a_less_advanced_state_never_overwrites_a_more_advanced_one()
+    {
+        // faxd stamps updated_at to the second, so a same-second queued->failed is one timestamp; the tray re-applies the
+        // POST's queued row after the dialog closes, which may land after the stream's failed.
+        var m = new MonitorModel(Zone);
+        m.Apply(J("a", state: "failed", updated: T0, error: "busy"));
+        Assert.False(m.Apply(J("a", state: "queued", updated: T0)));
+        Assert.Equal("Failed", Assert.Single(m.Jobs).Badge);
+
+        // The forward direction at the same second (stream in order: queued, then dialing) still applies.
+        m.Apply(J("b", state: "queued", created: T0.AddMinutes(1)));
+        Assert.True(m.Apply(J("b", state: "dialing", created: T0.AddMinutes(1), updated: T0.AddMinutes(1))));
+        Assert.Equal("Dialing", m.Jobs.Single(r => r.Id == "b").Badge);
+
+        // Same state, same second (a reload replaying the row): a no-op, nothing to redraw.
+        Assert.False(m.Apply(J("b", state: "dialing", created: T0.AddMinutes(1), updated: T0.AddMinutes(1))));
     }
 
     [Fact]

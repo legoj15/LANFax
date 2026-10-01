@@ -303,7 +303,9 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
     /// <summary>
     /// Handlers capture the live run's token when the event is raised (on the stream's thread), so what a cancelled
     /// run raises is dropped even if it reaches the owner thread after the next run started. Job and received events
-    /// are kept: the stream already counted them in LastEventId, so they would not be replayed.
+    /// still reach the tracker and the announcer: the stream already counted them in LastEventId, so they would not be
+    /// replayed. Only their pass-through to the grids (<see cref="JobChanged"/>, <see cref="InboxChanged"/>) is
+    /// dropped: the save may have switched servers, and the monitor has just cleared its grids for the new one.
     /// </summary>
     private EventStream CreateEventStream()
     {
@@ -345,12 +347,20 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
             Raise(StatusChanged, Status);
             Raise(ArmChanged, a);
         });
-        es.JobChanged += j => Post(() => ApplyJobUpdate(j));
-        es.Received += j => Post(() =>
+        es.JobChanged += j =>
         {
-            Raise(InboxChanged, j);
-            if (_inbound?.TryAnnounce(j) == true) Raise(FaxReceived, j);
-        });
+            var ct = LiveStreamToken; // read on the stream's thread, at raise time
+            Post(() => ApplyJobUpdate(j, live: !ct.IsCancellationRequested));
+        };
+        es.Received += j =>
+        {
+            var ct = LiveStreamToken;
+            Post(() =>
+            {
+                if (!ct.IsCancellationRequested) Raise(InboxChanged, j);
+                if (_inbound?.TryAnnounce(j) == true) Raise(FaxReceived, j);
+            });
+        };
         return es;
     }
 
@@ -414,9 +424,16 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
     /// a terminal one goes to the tracker. The tracker is updated even after <see cref="StopAsync"/> (a send that
     /// finishes while exiting must be recorded); only the events are not raised.
     /// </summary>
-    public void ApplyJobUpdate(Job j)
+    public void ApplyJobUpdate(Job j) => ApplyJobUpdate(j, live: true);
+
+    /// <summary>
+    /// As <see cref="ApplyJobUpdate(Job)"/>; an update that is not <paramref name="live"/> (from a stream run, or a
+    /// poll asked under one, that a restart cancelled since) skips <see cref="JobChanged"/> but still reaches the
+    /// tracker.
+    /// </summary>
+    private void ApplyJobUpdate(Job j, bool live)
     {
-        Raise(JobChanged, j);
+        if (live) Raise(JobChanged, j);
         if (!j.IsTerminal) return;
         if (Tracker.OnJobUpdate(j) is { } r)
         {
@@ -438,7 +455,10 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
         {
             foreach (var id in ids)
             {
-                try { ApplyJobUpdate(await Api.GetJobAsync(id)); }
+                // The run live when asking: a restart (a settings save, maybe to another server) before the answer
+                // makes it an old server's row, kept from the grids.
+                var ct = LiveStreamToken;
+                try { var j = await Api.GetJobAsync(id); ApplyJobUpdate(j, live: !ct.IsCancellationRequested); }
                 catch (FaxApiConfigException e)
                 {
                     Info($"poll: settings unusable ({e.Message}); next tick");

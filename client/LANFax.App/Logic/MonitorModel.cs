@@ -82,7 +82,9 @@ public sealed partial class MonitorModel(TimeZoneInfo zone)
 
     /// <summary>
     /// A live update (stream or reload): inserts or replaces the row with that id in the grid its direction names.
-    /// An update older than the row (a slow reload landing after a newer event) is ignored. True if a row changed.
+    /// An update older than the row (a slow reload landing after a newer event) is ignored. faxd stamps
+    /// <c>updated_at</c> to the second, so two states can share one: then the less advanced state (by
+    /// <see cref="StateRank"/>) never replaces the more advanced, and the same state is a no-op. True if a row changed.
     /// </summary>
     public bool Apply(Job j)
     {
@@ -90,7 +92,9 @@ public sealed partial class MonitorModel(TimeZoneInfo zone)
         var at = list.FindIndex(x => x.Id == j.Id);
         if (at >= 0)
         {
-            if (j.UpdatedAt < list[at].UpdatedAt) return false;
+            var cur = list[at];
+            if (j.UpdatedAt < cur.UpdatedAt) return false;
+            if (j.UpdatedAt == cur.UpdatedAt && StateRank(j.State) <= StateRank(cur.State)) return false;
             list.RemoveAt(at);
         }
         // Newest first by creation; ties by id so the order is stable.
@@ -101,6 +105,15 @@ public sealed partial class MonitorModel(TimeZoneInfo zone)
         if (list.Count > Capacity) list.RemoveRange(Capacity, list.Count - Capacity);
         return true;
     }
+
+    /// <summary>How far along faxd's pipeline a state is: queued, dialing, sending, then any terminal state. Unknown states rank with queued.</summary>
+    public static int StateRank(string state) => state switch
+    {
+        "dialing" => 1,
+        "sending" => 2,
+        "sent" or "failed" or "received" or "cancelled" => 3,
+        _ => 0,
+    };
 
     /// <summary>A load's answer, merged by id (rows it does not mention stay); <paramref name="startedAt"/> becomes <see cref="LastLoad"/>.</summary>
     public void ApplyLoad(IEnumerable<Job> jobs, DateTimeOffset startedAt)

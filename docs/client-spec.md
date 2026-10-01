@@ -560,7 +560,11 @@ smoke test fakes it).
   through (stream, poll, a send just accepted; before the tracker, so before
   `JobFinished`), `InboxChanged` every `received` event (before
   `FaxReceived`), and `Resynced(since)` every `resync` event (after the
-  tracked-job poll and the inbound catch-up started).
+  tracked-job poll and the inbound catch-up started). Not passed through: a
+  job or received event from a run a restart cancelled, or a poll answer to
+  a request made under such a run (the save may have switched servers, and
+  the window just cleared its grids); those still reach the tracker,
+  `JobFinished` and the announcer.
 - **Threading.** The runtime takes the owner (UI) thread's
   `SynchronizationContext` (callbacks are posted through it; `Start` throws
   unless it runs under it) and exposes it as `Owner`; the tray posts through
@@ -618,8 +622,11 @@ smoke test fakes it).
     stream's arm event follows.
   - Rows merge by id into the grid their direction names, newest first by
     `created_at`, capped at 200; an update older (`updated_at`) than the row
-    is ignored, so a slow reload never undoes a newer event. Rows an answer
-    omits stay.
+    is ignored, so a slow reload never undoes a newer event; at an equal
+    `updated_at` (faxd stamps to the second) a less advanced state (queued <
+    dialing < sending < terminal) is ignored too, so the tray's re-apply of
+    the POST's `queued` row never undoes a same-second stream state. Rows an
+    answer omits stay.
   - Loads: the first (and after `ServerChanged`) is full: `GET
     /jobs?direction=out&limit=50` + `GET /inbox?limit=50`. On every
     reconnect: `GET /jobs?limit=500&updated_since=<last load start - 5 min>`
@@ -643,7 +650,8 @@ smoke test fakes it).
   and "Fax receiving ends in N min (at HH:mm)" once per arm window when 5 min
   or less is left (`ArmExpiryWatch`; a window is its end time, so extending
   or re-arming warns again). Checked on every `ArmChanged` and by a 15 s tray
-  timer; clicking it opens the window.
+  timer; clicking it opens the window ("Click here to open LANFax and
+  extend it."), where an Arm button extends the window.
 - "Send a test page..." in the tray opens `SendDialog` in test-page mode:
   number prompt -> `POST /test/send`.
 - "Receive a test" in the tray: confirm -> `POST /test/receive
@@ -652,7 +660,7 @@ smoke test fakes it).
 - One `EventStream` for the app's lifetime; a Settings save cancels the run,
   waits for it and starts again so `LastEventId` survives; a cancelled run's
   connected/disconnected/resync/status/arm events are dropped (job and
-  received are kept). Stall: no line for 45 s aborts and reconnects with
+  received still reach the tracker and the announcer, not the grids). Stall: no line for 45 s aborts and reconnects with
   `Last-Event-ID`.
 - `FaxApi`, `EventStream` and `PrintPipeListener` each take an optional
   `Log`; none ever passes the token to it.

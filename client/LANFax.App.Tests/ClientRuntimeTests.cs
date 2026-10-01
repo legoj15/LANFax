@@ -59,7 +59,7 @@ public sealed class ClientRuntimeTests : IDisposable
     private DateTime _now = DateTime.UtcNow;
 
     private ClientRuntime Make(TimeSpan? poll = null, TimeSpan? printerCheck = null, PrinterSetup? printer = null,
-        IReadOnlyList<QueuedJob>? queue = null)
+        IReadOnlyList<QueuedJob>? queue = null, Func<string, IReadOnlyList<QueuedJob>?>? listQueue = null)
     {
         var cfg = new ClientConfig
         {
@@ -71,7 +71,7 @@ public sealed class ClientRuntimeTests : IDisposable
             Printer = printer ?? new PrinterSetup(_keys),
             UtcNow = () => _now,
             AnnouncedPath = Path.Combine(_dir, "announced.json"),
-            ListPrintQueue = _ => queue ?? [],
+            ListPrintQueue = listQueue ?? (_ => queue ?? []),
             PollInterval = poll ?? TimeSpan.FromHours(1),
             PrinterCheckInterval = printerCheck ?? TimeSpan.FromHours(1),
             Info = m => { lock (_log) _log.Add(m); },
@@ -152,6 +152,98 @@ public sealed class ClientRuntimeTests : IDisposable
         Assert.Equal(1, status.Queue["queued"]);
         Assert.Equal("7", resumedFrom); // the one EventStream kept LastEventId across the restart
         Assert.False(connections.First()); // the restart itself reports "not connected" first
+    }
+
+    [Fact]
+    public async Task A_cancelled_runs_late_job_and_received_events_reach_the_tracker_and_announcer_but_not_the_grids()
+    {
+        // A settings save may switch servers: the old run's job/received events must not put old-server rows into the
+        // monitor's freshly cleared grids, but a send that finished there is still recorded and a fax still announced.
+        _srv.Handler = WithJobState("sending", _srv.Handler); // the connect's poll: not terminal
+        var sendStale = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _events = async (n, ctx, _) =>
+        {
+            Open(ctx);
+            if (n == 0)
+            {
+                await Write(ctx, ": hello\n\n");
+                await sendStale.Task;
+                await Write(ctx, "id: 7\nevent: job\ndata: " + JobJson("lf7", "sent") + "\n\n");
+                await Write(ctx, "id: 8\nevent: received\ndata: " + InJson("in7") + "\n\n");
+            }
+            else await Write(ctx, "id: 9\nevent: status\ndata: {\"queue\":{\"queued\":1}}\n\n");
+            await Hold(ctx);
+        };
+        var rt = Make();
+        var changed = new ConcurrentQueue<Job>();
+        var inbox = new ConcurrentQueue<Job>();
+        var finished = new ConcurrentQueue<(Job Job, TerminalResult? Tracked)>();
+        var announced = new ConcurrentQueue<Job>();
+        rt.JobChanged += changed.Enqueue;
+        rt.InboxChanged += inbox.Enqueue;
+        rt.JobFinished += (j, r) => finished.Enqueue((j, r));
+        rt.FaxReceived += announced.Enqueue;
+        _owner.Invoke(() => rt.Start());
+        TrackPlan(rt, "lf7");
+        await WaitFor(() => rt.Connected);
+        await Settle();
+
+        // On the owner thread, as a settings save is: both stale events are queued behind this action, then the run
+        // is cancelled before they get to run.
+        _owner.Invoke(() =>
+        {
+            int before = _owner.Pending;
+            sendStale.SetResult();
+            var end = DateTime.UtcNow.AddSeconds(8);
+            while (_owner.Pending < before + 2 && DateTime.UtcNow < end) Thread.Sleep(5);
+            Assert.True(_owner.Pending >= before + 2, "the stale job and received events never reached the owner queue");
+            rt.RestartStream();
+        });
+
+        await WaitFor(() => _owner.Invoke(() => rt.Status.Queue.GetValueOrDefault("queued")) == 1);
+        await WaitFor(() => !finished.IsEmpty && !announced.IsEmpty);
+        _owner.Drain();
+        Assert.DoesNotContain(changed, j => j.Id == "lf7" && j.State == "sent");
+        Assert.DoesNotContain(inbox, j => j.Id == "in7");
+        var (job, tracked) = Assert.Single(finished);
+        Assert.Equal("lf7", job.Id);
+        Assert.NotNull(tracked); // the tracker recorded the outcome
+        Assert.DoesNotContain(_owner.Invoke(() => rt.Tracker.Pending), t => t.ServerId == "lf7");
+        Assert.Equal("in7", Assert.Single(announced).Id);
+    }
+
+    [Fact]
+    public async Task A_poll_answer_that_straddles_a_restart_reaches_the_tracker_but_not_the_grids()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var asked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var inner = _srv.Handler;
+        _srv.Handler = async (ctx, rec) =>
+        {
+            if (rec.PathAndQuery == "/jobs/lf8")
+            {
+                asked.TrySetResult();
+                await release.Task;
+                await FakeServer.Json(ctx, JobJson("lf8", "sent"));
+            }
+            else await inner(ctx, rec);
+        };
+        var rt = Make();
+        var changed = new ConcurrentQueue<Job>();
+        var finished = new ConcurrentQueue<Job>();
+        rt.JobChanged += changed.Enqueue;
+        rt.JobFinished += (j, _) => finished.Enqueue(j);
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => rt.Connected);
+        await Settle(); // the connect's poll (nothing tracked) is over
+
+        _owner.Invoke(() => { rt.TrackSubmitted("lf8"); _ = rt.PollTrackedAsync(); });
+        await asked.Task.WaitAsync(TimeSpan.FromSeconds(8)); // asking the old server
+        _owner.Invoke(rt.RestartStream); // the settings were saved meanwhile
+        release.SetResult();
+        await WaitFor(() => finished.Any(j => j.Id == "lf8"));
+        _owner.Drain();
+        Assert.DoesNotContain(changed, j => j.Id == "lf8");
     }
 
     // ---- (b) connect and resync trigger the inbound catch-up and the tracked-job poll ----
@@ -265,6 +357,7 @@ public sealed class ClientRuntimeTests : IDisposable
         rt.Unauthorized += After;
         _owner.Invoke(() => rt.TrackSubmitted("lf1"));
         _owner.Invoke(() => rt.Start());
+        TrackPlan(rt, "lf2"); // a send still going when the app exits
         await WaitFor(() => rt.Connected);
         await WaitFor(() => Polls() >= 3 && _keys.Reads >= 3); // both timers tick
 
@@ -282,11 +375,49 @@ public sealed class ClientRuntimeTests : IDisposable
         _listener.RaiseReceiving(true);
         _listener.RaiseError();
         _owner.Invoke(() => rt.ApplyJobUpdate(Job("lf1", "sent")));
+        _owner.Invoke(() => rt.ApplyJobUpdate(Job("lf2", "sent"))); // finished while exiting: still recorded
+        Assert.DoesNotContain(_owner.Invoke(() => rt.Tracker.Pending), t => t.ServerId == "lf2");
         _listener.IsRunning = false;
         _owner.Invoke(rt.CheckNow);
         _owner.Drain();
         Assert.Equal(0, raisedAfterStop);
         Assert.Equal(1, _listener.StartCalls); // a stop on purpose is not a listener to restart
+    }
+
+    [Fact]
+    public async Task After_StopAsync_a_second_stop_a_restart_and_a_late_stuck_check_do_nothing()
+    {
+        var start = _now;
+        using var gate = new ManualResetEventSlim();
+        var listing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var rt = Make(listQueue: _ =>
+        {
+            listing.TrySetResult();
+            gate.Wait(TimeSpan.FromSeconds(10));
+            return [new QueuedJob(5, PrintQueueJobs.JobStatusError, start.AddMinutes(-1), "doc", "me")];
+        });
+        var raised = new ConcurrentQueue<string>();
+        rt.StuckPrintJobs += n => raised.Enqueue("stuck " + n);
+        rt.ConnectionChanged += c => raised.Enqueue("connection " + c);
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => rt.Connected);
+
+        _now = start + ClientRuntime.StuckCheckDelay;
+        _owner.Invoke(rt.CheckNow);
+        await listing.Task.WaitAsync(TimeSpan.FromSeconds(8)); // the check is reading the queue
+        await _owner.InvokeAsync(rt.StopAsync);
+        int connections = Volatile.Read(ref _eventsConnections);
+        raised.Clear();
+
+        gate.Set(); // the stuck check completes after the stop
+        await _owner.InvokeAsync(rt.StopAsync); // a second stop is safe
+        _owner.Invoke(rt.RestartStream); // and a restart after it is a no-op
+        await Task.Delay(300);
+        _owner.Drain();
+        Assert.Empty(raised);
+        Assert.Equal(0, Volatile.Read(ref _activeRuns));
+        Assert.Equal(connections, Volatile.Read(ref _eventsConnections));
+        Assert.Equal(1, _listener.StopCalls);
     }
 
     [Fact]
@@ -632,6 +763,19 @@ public sealed class ClientRuntimeTests : IDisposable
     }
 
     // ---- helpers ----
+
+    /// <summary>Tracks a send the server knows as <paramref name="serverId"/>, as the send executor does once it is accepted.</summary>
+    private void TrackPlan(ClientRuntime rt, string serverId)
+    {
+        var id = Guid.NewGuid();
+        _owner.Invoke(() =>
+        {
+            var pdf = rt.Tracker.PdfPath(id);
+            Directory.CreateDirectory(Path.GetDirectoryName(pdf)!);
+            File.WriteAllText(pdf, "%PDF-1.4");
+            rt.Tracker.Track(SendPlan.Create(id, pdf, "5552345678", null, false, false, "k-" + serverId), Job(serverId, "queued"));
+        });
+    }
 
     private string[] CatchUps() => _srv.Requests.Select(r => r.PathAndQuery)
         .Where(p => p.StartsWith("/jobs?direction=in")).ToArray();

@@ -58,7 +58,7 @@ public static class NotificationText
 
     /// <summary>The arm window ends soon; minutes rounded up, so "in 5 min" at exactly five.</summary>
     public static string ArmExpiring(DateTimeOffset until, TimeSpan left) =>
-        $"Fax receiving ends in {Math.Max(1, (int)Math.Ceiling(left.TotalMinutes))} min (at {until.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture)}). Click here to keep it on.";
+        $"Fax receiving ends in {Math.Max(1, (int)Math.Ceiling(left.TotalMinutes))} min (at {until.ToLocalTime().ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture)}). Click here to open LANFax and extend it.";
 
     public static string ReceiveArmed(DateTimeOffset until) =>
         $"Fax line will answer until {until.ToLocalTime():t}";

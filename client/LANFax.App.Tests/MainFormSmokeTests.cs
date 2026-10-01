@@ -25,9 +25,11 @@ public sealed class MainFormSmokeTests
         {
             try
             {
+                var beforeLoad = DateTimeOffset.UtcNow;
                 using var form = new MainForm(src, cacheDir: Path.GetTempPath(), openFile: _ => { }, openSettings: () => settingsOpened++);
                 form.Show();
                 Pump(() => form.JobRowCount == 1 && form.InboxRowCount == 1);
+                var afterLoad = DateTimeOffset.UtcNow;
                 Assert.Equal(1, src.Api.FullLoads);
 
                 src.RaiseJob(J("lf2", "out", "sending"));
@@ -36,6 +38,8 @@ public sealed class MainFormSmokeTests
                 src.RaiseConnection(false);
                 src.RaiseConnection(true); // a reconnect reloads with updated_since
                 Pump(() => src.Api.SinceLoads == 1);
+                // A plain reconnect asks from the first load's start less the skew margin.
+                Assert.InRange(src.Api.LastSince!.Value, beforeLoad - MonitorModel.SkewMargin, afterLoad - MonitorModel.SkewMargin);
                 src.RaiseResynced(T0);
                 Pump(() => src.Api.SinceLoads == 2);
                 Assert.Equal(2, form.JobRowCount);
