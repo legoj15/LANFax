@@ -13,11 +13,12 @@ public sealed record RuntimeStart(IReadOnlyList<SendRequest> Unsent, PrinterStat
 /// server-status snapshot, the job tracker and its poll, the inbound catch-up, the print listener with its watch and
 /// stop, and the printer and stuck-print-job checks.
 /// <para>
-/// Threading: one owner thread. <c>post</c> must run each action on it, in order, and that thread's
-/// SynchronizationContext must bring await continuations back to it (the WinForms UI thread does both). Every public
-/// member is called on the owner thread, and every event is raised on it, so subscribers touch UI directly. Stream,
-/// listener and timer callbacks arrive on pool threads and are posted. Nothing is raised once <see cref="StopAsync"/>
-/// or <see cref="Dispose"/> began.
+/// Threading: one owner thread, named by the one <see cref="SynchronizationContext"/> the runtime is given. Its Post
+/// must run each callback on that thread, in order (the WinForms UI thread's context does). Stream, listener and timer
+/// callbacks arrive on pool threads and are posted through it, and await continuations come back through it because
+/// <see cref="Start"/> refuses to run anywhere but under it. Every public member is called on the owner thread, and
+/// every event is raised on it, so subscribers touch UI directly; a UI that needs to get back to the owner thread
+/// posts through <see cref="Owner"/>. Nothing is raised once <see cref="StopAsync"/> or <see cref="Dispose"/> began.
 /// </para>
 /// </summary>
 public sealed class ClientRuntime : IDisposable
@@ -32,7 +33,7 @@ public sealed class ClientRuntime : IDisposable
     /// <summary>The longest <see cref="StopAsync"/> waits for the cancelled stream run to end.</summary>
     public static readonly TimeSpan StreamStopWait = TimeSpan.FromSeconds(5);
 
-    private readonly Action<Action> _post;
+    private readonly SynchronizationContext _owner;
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(30) };
     private readonly HttpClient _sseHttp = new() { Timeout = Timeout.InfiniteTimeSpan };
     private readonly UnauthorizedNotice _unauthorized = new();
@@ -60,13 +61,17 @@ public sealed class ClientRuntime : IDisposable
     private bool _polling;
     private bool _stuckChecking;
     private volatile bool _stopped;
+    private bool _disposed;
 
     /// <param name="cfg">Shared with the settings dialog, which edits it in place; read at each call and connect.</param>
-    /// <param name="post">Runs an action on the owner thread, queued and in order (the tray's UI thread).</param>
-    public ClientRuntime(ClientConfig cfg, Action<Action> post)
+    /// <param name="owner">
+    /// The owner thread's context (the UI thread's WindowsFormsSynchronizationContext): every callback is posted
+    /// through it, and <see cref="Start"/> must run under it so await continuations come back the same way.
+    /// </param>
+    public ClientRuntime(ClientConfig cfg, SynchronizationContext owner)
     {
         Config = cfg;
-        _post = post;
+        _owner = owner;
         Api = new FaxApi(cfg, _http) { Log = m => Info("api: " + m) };
         Tracker = new JobTracker(cfg.SpoolDir, m => Info("tracker: " + m));
         _events = CreateEventStream();
@@ -74,7 +79,10 @@ public sealed class ClientRuntime : IDisposable
 
     // ---- seams (set before Start) ----
 
-    /// <summary>Default: a <see cref="PrintPipeListener"/> on the spool folder, created at <see cref="Start"/>.</summary>
+    /// <summary>
+    /// Default: a <see cref="PrintPipeListener"/> on the spool folder, created at <see cref="Start"/> and disposed by
+    /// <see cref="Dispose"/>. One given here is started and stopped by the runtime but disposed by whoever made it.
+    /// </summary>
     public IPrintListener? Listener { get; init; }
     public PrinterSetup Printer { get; init; } = new();
     public string? AnnouncedPath { get; init; } = InboundAnnouncer.DefaultPath;
@@ -83,12 +91,16 @@ public sealed class ClientRuntime : IDisposable
     public Func<string, IReadOnlyList<QueuedJob>?> ListPrintQueue { get; init; } = PrintQueueJobs.List;
     /// <summary>Runs one stream run; tests wrap it to watch the runs.</summary>
     public Func<EventStream, CancellationToken, Task> RunStream { get; init; } = (es, ct) => es.StartAsync(ct);
+    /// <summary>The clock for the stuck-job window; tests move it.</summary>
+    public Func<DateTime> UtcNow { get; init; } = () => DateTime.UtcNow;
     public Action<string> Info { get; init; } = FileLog.Info;
     public Action<string, Exception?> Error { get; init; } = FileLog.Error;
 
     // ---- shared parts ----
 
     public ClientConfig Config { get; }
+    /// <summary>The owner thread's context: post through it to get back to the thread every event is raised on.</summary>
+    public SynchronizationContext Owner => _owner;
     public FaxApi Api { get; }
     /// <summary>Owner thread only (the send dialog records its sends here).</summary>
     public JobTracker Tracker { get; }
@@ -99,7 +111,11 @@ public sealed class ClientRuntime : IDisposable
     public bool Connected { get; private set; }
     /// <summary>Some run connected at least once since start.</summary>
     public bool EverConnected { get; private set; }
-    /// <summary>The last server status, merged from every status and arm event (partial ones included).</summary>
+    /// <summary>
+    /// The server status, merged from every status and arm event (partial ones included). While not
+    /// <see cref="Connected"/> it is the last one known; <see cref="RestartStream"/> (a settings save, maybe another
+    /// server) resets it to <see cref="ServerStatus.Empty"/>, and faxd's stream opens with a full status and arm event.
+    /// </summary>
     public ServerStatus Status { get; private set; } = ServerStatus.Empty;
     public ArmState Arm => Status.Arm;
     /// <summary>A print job is arriving through the pipe (the tray blocks sign-out meanwhile). Any thread.</summary>
@@ -111,9 +127,9 @@ public sealed class ClientRuntime : IDisposable
 
     /// <summary>Raised whenever the state is set, also to the same value (a restart reports "not connected" again).</summary>
     public event Action<bool>? ConnectionChanged;
-    /// <summary>The merged <see cref="Status"/> after a status event.</summary>
+    /// <summary>The merged <see cref="Status"/> after a status event, an arm event that changed it, or a restart's reset.</summary>
     public event Action<ServerStatus>? StatusChanged;
-    /// <summary>The arm state changed (an arm event, or a status event that carried a different one).</summary>
+    /// <summary>The arm state changed (an arm or status event that carried a different one, or a restart's reset).</summary>
     public event Action<ArmState>? ArmChanged;
     /// <summary>The stream was refused with 401; raised once until <see cref="SettingsSaved"/>.</summary>
     public event Action? Unauthorized;
@@ -136,6 +152,16 @@ public sealed class ClientRuntime : IDisposable
     public event Action<int>? StuckPrintJobs;
     /// <summary>Something the user should be told that needs no action from the runtime (text for a balloon).</summary>
     public event Action<string>? Notice;
+    /// <summary>
+    /// Every outbound job update, terminal or not: stream events, poll results and a send just accepted. Raised before
+    /// the tracker sees it (so before <see cref="JobFinished"/>); for the jobs grid.
+    /// </summary>
+    public event Action<Job>? JobChanged;
+    /// <summary>
+    /// Every received-fax event from the stream, announced before or not; raised before <see cref="FaxReceived"/>.
+    /// For the inbox grid (the catch-up's list is raised only through <see cref="FaxesCaughtUp"/>).
+    /// </summary>
+    public event Action<Job>? InboxChanged;
 
     // ---- lifecycle ----
 
@@ -147,6 +173,8 @@ public sealed class ClientRuntime : IDisposable
     public RuntimeStart Start()
     {
         if (_started) throw new InvalidOperationException("ClientRuntime.Start runs once");
+        if (SynchronizationContext.Current != _owner)
+            throw new InvalidOperationException("ClientRuntime.Start must run on its owner thread, under the SynchronizationContext it was given");
         _started = true;
         _inbound = new InboundAnnouncer(AnnouncedPath, m => Info("inbound: " + m));
         _catchUp = new InboundCatchUp(_inbound,
@@ -193,7 +221,7 @@ public sealed class ClientRuntime : IDisposable
             Post(() => Raise(Notice, NotificationText.PrintPipeProblem(Config.PrinterName, reason)));
         };
         // A pipe that cannot be created (another LANFax has it) is reported through Error, not thrown.
-        _listenerStart = DateTime.UtcNow;
+        _listenerStart = UtcNow();
         try { _listener.Start(); }
         catch (Exception e)
         {
@@ -230,12 +258,27 @@ public sealed class ClientRuntime : IDisposable
         }
     }
 
+    /// <summary>
+    /// Without a <see cref="StopAsync"/> first (the message loop ended another way: session end, a fault path), stops
+    /// the same way synchronously, so the stream run ends before its HttpClient goes: timers, run cancelled, listener
+    /// stopped on purpose, run waited for (at most <see cref="StreamStopWait"/>; its callbacks do not need this
+    /// thread). Then disposes the listener it created (not an injected one) and the HttpClients.
+    /// </summary>
     public void Dispose()
     {
-        _stopped = true;
-        StopTimers();
-        _sseCts?.Cancel();
-        _listener?.Dispose();
+        if (_disposed) return;
+        _disposed = true;
+        if (!_stopped)
+        {
+            _stopped = true;
+            StopTimers();
+            _sseCts?.Cancel();
+            _listenerWatch.StoppedOnPurpose();
+            try { _listener?.Stop(); }
+            catch (Exception e) { Error("stopping the print pipe failed", e); }
+            if (_sseTask is { } run && !run.Wait(StreamStopWait)) Info("event stream: still ending at dispose; left behind");
+        }
+        if (Listener == null) _listener?.Dispose();
         _http.Dispose();
         _sseHttp.Dispose();
     }
@@ -289,18 +332,24 @@ public sealed class ClientRuntime : IDisposable
         });
         es.ArmChanged += a => PostLive(() =>
         {
+            if (a == Status.Arm) return;
             Status = Status with { Arm = a };
             Raise(StatusChanged, Status);
             Raise(ArmChanged, a);
         });
         es.JobChanged += j => Post(() => ApplyJobUpdate(j));
-        es.Received += j => Post(() => { if (_inbound?.TryAnnounce(j) == true) Raise(FaxReceived, j); });
+        es.Received += j => Post(() =>
+        {
+            Raise(InboxChanged, j);
+            if (_inbound?.TryAnnounce(j) == true) Raise(FaxReceived, j);
+        });
         return es;
     }
 
     /// <summary>
     /// (Re)starts the one <see cref="EventStream"/>: cancels the current run, waits for it to end (one run at a time,
-    /// so LastEventId has a single writer), then runs again with a new token if a token is configured.
+    /// so LastEventId has a single writer), then runs again with a new token if a token is configured. The snapshot is
+    /// reset: the settings may name another server, and the new run's connect brings the full status again.
     /// </summary>
     public void RestartStream()
     {
@@ -309,6 +358,7 @@ public sealed class ClientRuntime : IDisposable
         var oldTask = _sseTask;
         oldCts?.Cancel();
         SetConnected(false);
+        ResetStatus();
         // Nothing to authenticate with, a token that cannot be sent, or nowhere to connect: do not run.
         bool run = !string.IsNullOrEmpty(Config.Token) && ClientConfig.TokenError(Config.Token) == null && Config.EndpointError() == null;
         var cts = run ? new CancellationTokenSource() : null;
@@ -331,6 +381,15 @@ public sealed class ClientRuntime : IDisposable
         RestartStream();
     }
 
+    private void ResetStatus()
+    {
+        if (ReferenceEquals(Status, ServerStatus.Empty)) return;
+        var arm = Status.Arm;
+        Status = ServerStatus.Empty;
+        Raise(StatusChanged, Status);
+        if (Status.Arm != arm) Raise(ArmChanged, Status.Arm);
+    }
+
     private void SetConnected(bool connected)
     {
         Connected = connected;
@@ -343,11 +402,13 @@ public sealed class ClientRuntime : IDisposable
     public void TrackSubmitted(string serverId) => _submitted.Add(serverId);
 
     /// <summary>
-    /// A job update from the stream, the poll or a send just accepted. The tracker is updated even after
-    /// <see cref="StopAsync"/> (a send that finishes while exiting must be recorded); only the event is not raised.
+    /// A job update from the stream, the poll or a send just accepted: raised through <see cref="JobChanged"/>, then
+    /// a terminal one goes to the tracker. The tracker is updated even after <see cref="StopAsync"/> (a send that
+    /// finishes while exiting must be recorded); only the events are not raised.
     /// </summary>
     public void ApplyJobUpdate(Job j)
     {
+        Raise(JobChanged, j);
         if (!j.IsTerminal) return;
         if (Tracker.OnJobUpdate(j) is { } r)
         {
@@ -420,7 +481,7 @@ public sealed class ClientRuntime : IDisposable
         CheckListener();
         if (Installing) return; // the install reports its own result
         if (_printerWatch.Observe(PrinterStatusNow()) is { } changed) Raise(PrinterProblem, changed);
-        var sinceStart = DateTime.UtcNow - _listenerStart;
+        var sinceStart = UtcNow() - _listenerStart;
         if (sinceStart >= StuckCheckDelay && sinceStart < StuckCheckWindow && !_stuckChecking) _ = CheckStuckPrintJobsAsync(_listenerStart);
     }
 
@@ -433,7 +494,7 @@ public sealed class ClientRuntime : IDisposable
         var action = _listenerWatch.Observe(_listener!.IsRunning);
         if (action == ListenerAction.None) return;
         Error("print pipe listener was not running; starting it again", null);
-        _listenerStart = DateTime.UtcNow;
+        _listenerStart = UtcNow();
         try { _listener.Start(); }
         catch (Exception e) { Error("restarting the print pipe failed", e); }
         OfferRescuedDocuments(); // a job the stopped loop saved in jobs\ but never raised
@@ -497,7 +558,8 @@ public sealed class ClientRuntime : IDisposable
                 else Info("printer install: " + line);
             }
             if (r.Error != null) Error("printer install: " + r.Error, null);
-            report(r);
+            try { report(r); }
+            catch (Exception e) { Error("printer install: reporting the result failed", e); } // the rescue still runs
             RescueOldPortLeftover();
             OfferRescuedDocuments();
             return r;
@@ -569,12 +631,12 @@ public sealed class ClientRuntime : IDisposable
         if (_stopped) return;
         try
         {
-            _post(() =>
+            _owner.Post(_ =>
             {
                 if (_stopped) return;
                 try { a(); }
                 catch (Exception e) { Error("runtime action failed", e); }
-            });
+            }, null);
         }
         catch (Exception) { /* the owner thread is gone: shutting down */ }
     }

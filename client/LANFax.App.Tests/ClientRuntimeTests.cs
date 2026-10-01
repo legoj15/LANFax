@@ -55,18 +55,23 @@ public sealed class ClientRuntimeTests : IDisposable
         Assert.Empty(_owner.Errors);
     }
 
-    private ClientRuntime Make(TimeSpan? poll = null, TimeSpan? printerCheck = null)
+    /// <summary>The runtime's clock (the stuck-job window); tests move it.</summary>
+    private DateTime _now = DateTime.UtcNow;
+
+    private ClientRuntime Make(TimeSpan? poll = null, TimeSpan? printerCheck = null, PrinterSetup? printer = null,
+        IReadOnlyList<QueuedJob>? queue = null)
     {
         var cfg = new ClientConfig
         {
             Server = "127.0.0.1", Port = _srv.Port, Token = "tok123", SpoolDir = Path.Combine(_dir, "spool"),
         };
-        _rt = new ClientRuntime(cfg, _owner.Post)
+        _rt = new ClientRuntime(cfg, _owner.Context)
         {
             Listener = _listener,
-            Printer = new PrinterSetup(_keys),
+            Printer = printer ?? new PrinterSetup(_keys),
+            UtcNow = () => _now,
             AnnouncedPath = Path.Combine(_dir, "announced.json"),
-            ListPrintQueue = _ => [],
+            ListPrintQueue = _ => queue ?? [],
             PollInterval = poll ?? TimeSpan.FromHours(1),
             PrinterCheckInterval = printerCheck ?? TimeSpan.FromHours(1),
             Info = m => { lock (_log) _log.Add(m); },
@@ -76,6 +81,7 @@ public sealed class ClientRuntimeTests : IDisposable
                 Interlocked.Increment(ref _runsEntered);
                 int now = Interlocked.Increment(ref _activeRuns);
                 lock (_log) _maxActiveRuns = Math.Max(_maxActiveRuns, now);
+                es.Delay = (_, c) => Task.Delay(20, c); // reconnect at once (the real backoff starts at 1 s)
                 try { await es.StartAsync(ct); }
                 finally { Interlocked.Decrement(ref _activeRuns); }
             },
@@ -339,6 +345,263 @@ public sealed class ClientRuntimeTests : IDisposable
         Assert.Equal(id, Assert.Single(offered).SpoolId);
     }
 
+    // ---- (e) pass-through events for the MainForm grids ----
+
+    [Fact]
+    public async Task Every_job_and_received_event_is_passed_through_before_the_tracker_and_the_announcer()
+    {
+        _srv.Handler = WithJobState("sending", _srv.Handler); // the connect's poll: not terminal
+        var go = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _events = async (_, ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, ": hello\n\n");
+            await go.Task;
+            await Write(ctx, "event: job\ndata: " + JobJson("lf5", "queued") + "\n\n");
+            await Write(ctx, "event: job\ndata: " + JobJson("lf5", "sent") + "\n\n");
+            await Write(ctx, "event: received\ndata: " + InJson("in1") + "\n\n");
+            await Write(ctx, "event: received\ndata: " + InJson("in1") + "\n\n");
+            await Hold(ctx);
+        };
+        var rt = Make();
+        var order = new ConcurrentQueue<string>();
+        rt.JobChanged += j => order.Enqueue($"changed {j.Id} {j.State}");
+        rt.JobFinished += (j, _) => order.Enqueue($"finished {j.Id}");
+        rt.InboxChanged += j => order.Enqueue($"inbox {j.Id}");
+        rt.FaxReceived += j => order.Enqueue($"announced {j.Id}");
+        _owner.Invoke(() => rt.TrackSubmitted("lf5"));
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => order.Contains("changed lf5 sending")); // the connect's poll, passed through too
+        _owner.Drain();
+        order.Clear();
+        go.SetResult();
+        await WaitFor(() => order.Count(o => o.StartsWith("inbox")) == 2);
+        _owner.Drain();
+        Assert.Equal(["changed lf5 queued", "changed lf5 sent", "finished lf5", "inbox in1", "announced in1", "inbox in1"], order);
+    }
+
+    [Fact]
+    public async Task A_polled_job_is_passed_through_too()
+    {
+        _srv.Handler = WithJobState("sending", _srv.Handler);
+        var rt = Make();
+        var changed = new ConcurrentQueue<Job>();
+        rt.JobChanged += changed.Enqueue;
+        _owner.Invoke(() => rt.Start());
+        _owner.Invoke(() => rt.TrackSubmitted("lf1"));
+        await _owner.InvokeAsync(rt.PollTrackedAsync); // or the connect's poll, already running, asks
+        await WaitFor(() => changed.Any(j => j.Id == "lf1" && j.State == "sending"));
+    }
+
+    // ---- (f) arm and snapshot ----
+
+    [Fact]
+    public async Task ArmChanged_is_raised_only_when_the_arm_state_changes()
+    {
+        const string arm = "{\"armed\":true,\"until\":null,\"remaining_min\":5,\"ext\":\"300\"}";
+        _events = async (_, ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, "event: arm\ndata: " + arm + "\n\n");
+            await Write(ctx, "event: arm\ndata: " + arm + "\n\n");
+            await Write(ctx, "event: status\ndata: {\"receiving\":true,\"arm\":" + arm + "}\n\n");
+            await Hold(ctx);
+        };
+        var rt = Make();
+        int arms = 0;
+        rt.ArmChanged += _ => arms++;
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => _owner.Invoke(() => rt.Status.Receiving));
+        Assert.Equal(1, _owner.Invoke(() => arms));
+    }
+
+    [Fact]
+    public async Task A_restart_clears_the_previous_servers_snapshot()
+    {
+        _events = async (n, ctx, _) =>
+        {
+            Open(ctx);
+            if (n == 0) await Write(ctx, "event: status\ndata: {\"registrations\":[{\"name\":\"fax\",\"status\":\"Registered\"}],\"arm\":{\"armed\":true,\"until\":null,\"remaining_min\":5,\"ext\":\"300\"}}\n\n");
+            else await Write(ctx, ": hello\n\n");
+            await Hold(ctx);
+        };
+        var rt = Make();
+        var statuses = new ConcurrentQueue<ServerStatus>();
+        var arms = new ConcurrentQueue<ArmState>();
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => _owner.Invoke(() => rt.Status.Registrations.Count) == 1);
+        var after = _owner.Invoke(() =>
+        {
+            rt.StatusChanged += statuses.Enqueue;
+            rt.ArmChanged += arms.Enqueue;
+            rt.RestartStream();
+            return rt.Status;
+        });
+        Assert.Same(ServerStatus.Empty, after);
+        Assert.Same(ServerStatus.Empty, Assert.Single(statuses));
+        Assert.False(Assert.Single(arms).Armed);
+    }
+
+    // ---- (g) unauthorized ----
+
+    [Fact]
+    public async Task Unauthorized_is_raised_once_until_the_settings_are_saved()
+    {
+        _events = (_, ctx, _) => { ctx.Response.StatusCode = 401; ctx.Response.Close(); return Task.CompletedTask; };
+        var rt = Make();
+        int raised = 0;
+        rt.Unauthorized += () => raised++;
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => Volatile.Read(ref _eventsConnections) >= 4); // refused again and again
+        _owner.Drain();
+        Assert.Equal(1, _owner.Invoke(() => raised));
+
+        int before = Volatile.Read(ref _eventsConnections);
+        _owner.Invoke(rt.SettingsSaved);
+        await WaitFor(() => Volatile.Read(ref _eventsConnections) >= before + 3);
+        _owner.Drain();
+        Assert.Equal(2, _owner.Invoke(() => raised));
+    }
+
+    // ---- (h) a job the server lost ----
+
+    [Fact]
+    public async Task A_poll_404_offers_the_document_again_once()
+    {
+        var inner = _srv.Handler;
+        _srv.Handler = (ctx, rec) =>
+        {
+            if (rec.PathAndQuery == "/jobs/lf9") { ctx.Response.StatusCode = 404; ctx.Response.Close(); return Task.CompletedTask; }
+            return inner(ctx, rec);
+        };
+        var rt = Make();
+        var offered = new ConcurrentQueue<SendRequest>();
+        rt.SendOffered += offered.Enqueue;
+        _owner.Invoke(() => rt.Start());
+        var id = Guid.NewGuid();
+        _owner.Invoke(() =>
+        {
+            var pdf = rt.Tracker.PdfPath(id);
+            Directory.CreateDirectory(Path.GetDirectoryName(pdf)!);
+            File.WriteAllText(pdf, "%PDF-1.4");
+            rt.Tracker.Track(SendPlan.Create(id, pdf, "5552345678", null, false, false, "k1"), Job("lf9", "queued"));
+        });
+        await _owner.InvokeAsync(rt.PollTrackedAsync); // may find the connect's poll running: then that one asks
+        await WaitFor(() => !offered.IsEmpty);
+        await _owner.InvokeAsync(rt.PollTrackedAsync); // no longer pollable: not offered twice
+        await Task.Delay(100);
+        _owner.Drain();
+        var req = Assert.Single(offered);
+        Assert.Equal(id, req.SpoolId);
+        Assert.Equal(SendKind.Suspect, req.Kind);
+    }
+
+    // ---- (i) printer and print queue checks ----
+
+    [Fact]
+    public void CheckNow_reports_each_printer_change_once()
+    {
+        var rt = Make();
+        var problems = new List<PrinterStatus>();
+        rt.PrinterProblem += problems.Add;
+        _owner.Invoke(() => rt.Start());
+        _keys.PortValue = "LPT1:";
+        _owner.Invoke(rt.CheckNow);
+        _owner.Invoke(rt.CheckNow);
+        _keys.PortValue = null;
+        _owner.Invoke(rt.CheckNow);
+        Assert.Equal([PrinterState.Misconfigured, PrinterState.Missing], problems.Select(p => p.State));
+    }
+
+    [Fact]
+    public async Task CheckNow_reports_documents_stuck_since_before_the_start_once_inside_the_window()
+    {
+        var start = _now;
+        IReadOnlyList<QueuedJob> queue = [new QueuedJob(5, PrintQueueJobs.JobStatusError, start.AddMinutes(-1), "doc", "me")];
+        var rt = Make(queue: queue);
+        var stuck = new ConcurrentQueue<int>();
+        rt.StuckPrintJobs += stuck.Enqueue;
+        _owner.Invoke(() => rt.Start());
+
+        _now = start + ClientRuntime.StuckCheckDelay - TimeSpan.FromSeconds(1); // too early: the spooler still retries
+        _owner.Invoke(rt.CheckNow);
+        await Task.Delay(100);
+        _owner.Drain();
+        Assert.Empty(stuck);
+
+        _now = start + ClientRuntime.StuckCheckDelay;
+        _owner.Invoke(rt.CheckNow);
+        await WaitFor(() => !stuck.IsEmpty);
+        Assert.Equal(1, Assert.Single(stuck));
+
+        _owner.Invoke(rt.CheckNow); // seen: not again
+        await Task.Delay(100);
+        _owner.Drain();
+        Assert.Single(stuck);
+    }
+
+    // ---- (j) install ----
+
+    [Fact]
+    public async Task Install_reports_its_result_before_offering_what_reached_jobs()
+    {
+        var rt = Make(printer: new PrinterSetup(_keys, (_, _) => Task.FromResult(0)));
+        var order = new ConcurrentQueue<string>();
+        rt.SendOffered += r => order.Enqueue("offer " + r.SpoolId);
+        _owner.Invoke(() => rt.Start());
+        var id = PlantJobsPdf();
+        var result = await _owner.InvokeAsync(() => rt.InstallPrinterAsync(_ => order.Enqueue("report")));
+        Assert.NotNull(result);
+        Assert.Equal(["report", "offer " + id], order);
+        Assert.False(_owner.Invoke(() => rt.Installing));
+    }
+
+    [Fact]
+    public async Task Install_still_offers_what_reached_jobs_when_the_report_throws()
+    {
+        var rt = Make(printer: new PrinterSetup(_keys, (_, _) => Task.FromResult(0)));
+        var offered = new ConcurrentQueue<SendRequest>();
+        rt.SendOffered += offered.Enqueue;
+        _owner.Invoke(() => rt.Start());
+        var id = PlantJobsPdf();
+        var result = await _owner.InvokeAsync(() => rt.InstallPrinterAsync(_ => throw new InvalidOperationException("balloon")));
+        Assert.NotNull(result);
+        Assert.Equal(id, Assert.Single(offered).SpoolId);
+        lock (_log) Assert.Contains(_log, l => l.StartsWith("ERROR") && l.Contains("balloon"));
+    }
+
+    // ---- (k) threading contract and disposal ----
+
+    [Fact]
+    public void Start_off_the_owner_context_is_refused()
+    {
+        var rt = Make();
+        Assert.Throws<InvalidOperationException>(() => rt.Start()); // the test thread has no owner context
+    }
+
+    [Fact]
+    public async Task Dispose_without_StopAsync_ends_the_stream_run_before_the_clients_go()
+    {
+        var rt = Make();
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => rt.Connected);
+        _owner.Invoke(rt.Dispose);
+        Assert.Equal(0, Volatile.Read(ref _activeRuns));
+        Assert.True(_listener.StopCalls >= 1);
+        await Task.Delay(200);
+        lock (_log) Assert.DoesNotContain(_log, l => l.StartsWith("ERROR"));
+    }
+
+    [Fact]
+    public void Dispose_stops_an_injected_listener_but_leaves_its_disposal_to_its_owner()
+    {
+        var rt = Make();
+        _owner.Invoke(() => rt.Start());
+        _owner.Invoke(rt.Dispose);
+        Assert.Equal(0, _listener.DisposeCalls);
+        Assert.False(_listener.IsRunning);
+    }
+
     // ---- helpers ----
 
     private string[] CatchUps() => _srv.Requests.Select(r => r.PathAndQuery)
@@ -361,6 +624,19 @@ public sealed class ClientRuntimeTests : IDisposable
 
     private static Job Job(string id, string state) => new(id, "out", state, null, "5551234", null, null, null, 1, null,
         DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null);
+
+    private static string InJson(string id) =>
+        $$"""{"id":"{{id}}","direction":"in","state":"received","from_number":"5559876","pages":1,"created_at":"2026-09-30T10:00:00+00:00","updated_at":"2026-09-30T10:00:05+00:00","finished_at":"2026-09-30T10:00:05+00:00"}""";
+
+    /// <summary>A document that reached spool\jobs with no record (as an install's rescue leaves one).</summary>
+    private Guid PlantJobsPdf()
+    {
+        var id = Guid.NewGuid();
+        var jobs = Path.Combine(_dir, "spool", "jobs");
+        Directory.CreateDirectory(jobs);
+        File.WriteAllText(Path.Combine(jobs, id + ".pdf"), "%PDF-1.4");
+        return id;
+    }
 
     private static string JobJson(string id, string state) =>
         $$"""{"id":"{{id}}","direction":"out","state":"{{state}}","to_number":"5551234","pages":1,"created_at":"2026-09-30T10:00:00+00:00","updated_at":"2026-09-30T10:00:05+00:00","finished_at":null}""";
@@ -404,8 +680,10 @@ public sealed class ClientRuntimeTests : IDisposable
     {
         private int _reads;
         public int Reads => Volatile.Read(ref _reads);
-        public bool Exists(string printerName) => true;
-        public string? Port(string printerName) { Interlocked.Increment(ref _reads); return PrinterSetup.ExpectedPort(); }
+        /// <summary>The printer's port; null is a missing printer.</summary>
+        public volatile string? PortValue = PrinterSetup.ExpectedPort();
+        public bool Exists(string printerName) => PortValue != null;
+        public string? Port(string printerName) { Interlocked.Increment(ref _reads); return PortValue; }
     }
 
     private sealed class FakeListener : IPrintListener
@@ -415,12 +693,12 @@ public sealed class ClientRuntimeTests : IDisposable
         public event Action<bool>? ReceivingChanged;
         public volatile bool IsRunning;
         public volatile bool IsReceiving;
-        public int StartCalls, StopCalls;
+        public int StartCalls, StopCalls, DisposeCalls;
         bool IPrintListener.IsRunning => IsRunning;
         bool IPrintListener.IsReceiving => IsReceiving;
         public void Start() { Interlocked.Increment(ref StartCalls); IsRunning = true; }
         public void Stop() { Interlocked.Increment(ref StopCalls); IsRunning = false; }
-        public void Dispose() => Stop();
+        public void Dispose() { Interlocked.Increment(ref DisposeCalls); Stop(); }
         public Guid RaiseNewPrintJob() { var id = Guid.NewGuid(); NewPrintJob?.Invoke(id, id + ".pdf"); return id; }
         public void RaiseReceiving(bool on) => ReceivingChanged?.Invoke(on);
         public void RaiseError() => Error?.Invoke("test", new IOException("test"));
@@ -437,18 +715,21 @@ public sealed class ClientRuntimeTests : IDisposable
         private int _pending;
         public readonly ConcurrentQueue<Exception> Errors = new();
         public int ThreadId => _thread.ManagedThreadId;
+        /// <summary>The owner thread's SynchronizationContext, the one the runtime is given.</summary>
+        public SynchronizationContext Context { get; }
         /// <summary>Actions posted and not yet started.</summary>
         public int Pending => Volatile.Read(ref _pending);
 
         public OwnerThread()
         {
+            Context = new OwnerContext(this);
             _thread = new Thread(Loop) { IsBackground = true, Name = "runtime owner" };
             _thread.Start();
         }
 
         private void Loop()
         {
-            SynchronizationContext.SetSynchronizationContext(new Context(this));
+            SynchronizationContext.SetSynchronizationContext(Context);
             foreach (var a in _queue.GetConsumingEnumerable())
             {
                 Interlocked.Decrement(ref _pending);
@@ -472,10 +753,12 @@ public sealed class ClientRuntimeTests : IDisposable
 
         public void Invoke(Action a) => Invoke(() => { a(); return 0; });
 
-        public Task InvokeAsync(Func<Task> f)
+        public Task InvokeAsync(Func<Task> f) => InvokeAsync(async () => { await f(); return 0; });
+
+        public Task<T> InvokeAsync<T>(Func<Task<T>> f)
         {
-            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            Post(async () => { try { await f(); tcs.SetResult(); } catch (Exception e) { tcs.SetException(e); } });
+            var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Post(async () => { try { tcs.SetResult(await f()); } catch (Exception e) { tcs.SetException(e); } });
             return tcs.Task.WaitAsync(TimeSpan.FromSeconds(20));
         }
 
@@ -484,7 +767,7 @@ public sealed class ClientRuntimeTests : IDisposable
 
         public void Dispose() => _queue.CompleteAdding();
 
-        private sealed class Context(OwnerThread owner) : SynchronizationContext
+        private sealed class OwnerContext(OwnerThread owner) : SynchronizationContext
         {
             public override void Post(SendOrPostCallback d, object? state) => owner.Post(() => d(state));
             public override void Send(SendOrPostCallback d, object? state) => owner.Invoke(() => d(state));

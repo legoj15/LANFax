@@ -40,9 +40,9 @@ client/
     Models.cs                       Job, ArmState, ServerStatus records mirroring faxd JSON
   (PrinterSetup, which detects the printer and launches the elevated install/uninstall script, lives in LANFax.App)
   LANFax.App/                       net10.0-windows WinForms, single-file self-contained win-x64
-    Program.cs                      machine-wide single-instance mutex (Global\LANFax.Tray, see "One active session"); loads the config; installs the UI thread's WindowsFormsSynchronizationContext, builds the one ClientRuntime posting onto it and hands it to TrayContext; no console
-    Logic/ClientRuntime.cs          everything non-UI, one instance per process: FaxApi + HttpClients, the one EventStream and its restart, connection/status/arm snapshot, JobTracker + 60 s poll, InboundAnnouncer + InboundCatchUp, print listener + ListenerWatch + session-end stop, PrinterWatch + stuck-print-job checks (System.Threading timers); raises plain events on its owner (UI) thread
-    TrayContext.cs                  UI only, consumes ClientRuntime: NotifyIcon + menu (Open, Unsent documents (N), Retry failed fax (N), Send a test page..., Receive a test (arm 20 min), Install printer, Settings, Exit), balloons, send dialogs one at a time, ShutdownBlocker, Exit
+    Program.cs                      machine-wide single-instance mutex (Global\LANFax.Tray, see "One active session"); loads the config; installs the UI thread's WindowsFormsSynchronizationContext, builds the one ClientRuntime on that context and hands it to TrayContext; no console
+    Logic/ClientRuntime.cs          everything non-UI, one instance per process: FaxApi + HttpClients, the one EventStream and its restart, connection/status/arm snapshot, JobTracker + 60 s poll, InboundAnnouncer + InboundCatchUp, print listener + ListenerWatch + session-end stop, PrinterWatch + stuck-print-job checks (System.Threading timers); takes the owner (UI) thread's SynchronizationContext, raises plain events on it, exposes it as `Owner`
+    TrayContext.cs                  UI only, consumes ClientRuntime: NotifyIcon + menu (Open, Unsent documents (N), Retry failed fax (N), Send a test page..., Receive a test (arm 20 min), Install printer, Settings, Exit), balloons, send dialogs one at a time, ShutdownBlocker, Exit; gets back to the UI thread only through `ClientRuntime.Owner`
     SendDialog.cs                   non-modal; number, subject, page count, Send / Cancel; "Send test page instead" checkbox
     Logic/                          testable plain classes: ClientRuntime, SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer + InboundCatchUp, InstanceGuard, ...
     MainForm.cs                     (phase 3, NOT YET WRITTEN) status header, arm card with countdown, jobs grid, inbox grid, open PDF
@@ -549,10 +549,25 @@ client/
   `EverConnected`), raises `StatusChanged` / `ArmChanged` / `ConnectionChanged`,
   and a window that opens later reads the snapshot instead of waiting for an
   event. It does not call `GET /status` at connect: faxd's stream opens with a
-  full `status` and an `arm` event. Every runtime member is called on, and
-  every event raised on, the owner thread (the UI thread); nothing is raised
-  once `StopAsync` (Exit: timers die, run cancelled, listener stopped on
-  purpose, run awaited up to 5 s) or `Dispose` began. Core's `GetStatusAsync`,
+  full `status` and an `arm` event. While `Connected` is false the snapshot is
+  the last one known; `RestartStream` (a settings save, maybe another server)
+  resets it to `ServerStatus.Empty` and raises `StatusChanged` (and
+  `ArmChanged` if the arm state was not the empty one). `ArmChanged` is raised
+  only when the arm state differs. For the grids, `JobChanged` passes every
+  outbound job update through (stream, poll, a send just accepted; before the
+  tracker, so before `JobFinished`) and `InboxChanged` every `received` event
+  (before the announcer's `FaxReceived`).
+- Threading: the runtime takes the owner thread's `SynchronizationContext`
+  (one contract: callbacks are posted through it, `Start` throws unless it
+  runs under it, so await continuations come back the same way) and exposes
+  it as `Owner`; the tray and a MainForm post through `Owner`, not a control
+  of their own. Every runtime member is called on, and every event raised on,
+  the owner thread; nothing is raised once `StopAsync` (Exit: timers die, run
+  cancelled, listener stopped on purpose, run awaited up to 5 s) or `Dispose`
+  began. `Dispose` without `StopAsync` (session end, a fault path) does the
+  same stop synchronously, so the stream run ends before its HttpClient goes.
+  An injected `Listener` is stopped but not disposed (its creator owns it);
+  the default one is disposed. Core's `GetStatusAsync`,
   `GetInboxAsync`, `DownloadPdfAsync` and `ArmAsync`/`DisarmAsync` exist for
   the MainForm and have no production caller until then (only the inbound
   catch-up uses `GetJobsAsync`).

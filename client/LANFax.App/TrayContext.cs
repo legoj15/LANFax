@@ -22,7 +22,6 @@ internal sealed class TrayContext : ApplicationContext
     private readonly NotificationQueue _notices;
     private readonly System.Windows.Forms.Timer _noticeTimer = new() { Interval = (int)NotificationQueue.Duration.TotalMilliseconds };
     private readonly NotifyIcon _tray;
-    private readonly Control _ui = new();
     private readonly Icon _iconOn = IconFactory.Create(true);
     private readonly Icon _iconOff = IconFactory.Create(false);
     /// <summary>Asks Windows to wait for sign-out/shutdown while a print job is arriving through the pipe.</summary>
@@ -43,7 +42,6 @@ internal sealed class TrayContext : ApplicationContext
     /// <param name="showSignal">The per-session "show yourself" event, created with the instance mutex (owned by Program).</param>
     public TrayContext(ClientRuntime runtime, ConfigLocation loc, EventWaitHandle showSignal)
     {
-        _ = _ui.Handle; // force handle creation on the UI thread so BeginInvoke works from workers
         _runtime = runtime;
         _loc = loc;
         _cfg = runtime.Config;
@@ -134,10 +132,18 @@ internal sealed class TrayContext : ApplicationContext
 
     // ---- threading and notifications ----
 
+    /// <summary>Queues <paramref name="a"/> on the UI thread through the runtime's owner context (the one way back to it).</summary>
     private void OnUi(Action a)
     {
-        if (_exiting || _ui.IsDisposed) return;
-        try { _ui.BeginInvoke(() => { try { a(); } catch (Exception e) { FileLog.Error("ui action failed", e); } }); }
+        if (_exiting) return;
+        try
+        {
+            _runtime.Owner.Post(_ =>
+            {
+                if (_exiting) return;
+                try { a(); } catch (Exception e) { FileLog.Error("ui action failed", e); }
+            }, null);
+        }
         catch (Exception) { /* shutting down */ }
     }
 
@@ -251,7 +257,7 @@ internal sealed class TrayContext : ApplicationContext
                     if (plan.Route == SendRoute.Document)
                     {
                         _runtime.Tracker.Track(plan, job);
-                        if (job.IsTerminal) _runtime.ApplyJobUpdate(job);
+                        _runtime.ApplyJobUpdate(job); // the jobs grid sees it; a terminal one also finishes the record
                     }
                     else
                     {
@@ -398,7 +404,6 @@ internal sealed class TrayContext : ApplicationContext
             open?.Dispose();
             _tray.Dispose();
             _iconOn.Dispose(); _iconOff.Dispose();
-            _ui.Dispose();
         }
         base.Dispose(disposing);
     }
