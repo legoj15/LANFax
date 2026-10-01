@@ -13,7 +13,7 @@ namespace LANFax.App.Logic;
 /// <param name="loaded">After every pass that reached the model: the rows may have changed.</param>
 /// <param name="failed">
 /// A load failed (<see cref="FaxApiException"/> or <see cref="JsonException"/>) for the current server; at most once
-/// per <see cref="ReloadAsync"/> call, however many of its passes fail.
+/// per <see cref="ReloadAsync"/> call and server, however many of its passes fail.
 /// </param>
 public sealed class MonitorLoader(MonitorModel model, Func<IMonitorApi> api, Action loaded, Action<Exception> failed)
 {
@@ -44,8 +44,9 @@ public sealed class MonitorLoader(MonitorModel model, Func<IMonitorApi> api, Act
             return;
         }
         _loading = true;
-        // One failure message per call: a queued pass that fails the same way says nothing new.
-        bool reported = false;
+        // One failure message per call and server: a queued pass that fails the same way says nothing new, but one
+        // for another server (ServerChanged since) does.
+        int reportedGeneration = -1;
         try
         {
             while (true)
@@ -73,9 +74,9 @@ public sealed class MonitorLoader(MonitorModel model, Func<IMonitorApi> api, Act
                 catch (Exception e) when (e is FaxApiException or JsonException)
                 {
                     if (_stopped) return;
-                    if (generation == _generation && !reported)
+                    if (generation == _generation && reportedGeneration != generation)
                     {
-                        reported = true;
+                        reportedGeneration = generation;
                         failed(e);
                     }
                 }

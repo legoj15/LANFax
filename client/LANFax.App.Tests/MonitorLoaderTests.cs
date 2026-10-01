@@ -108,6 +108,23 @@ public sealed class MonitorLoaderTests
     }
 
     [Fact]
+    public async Task A_failure_for_the_new_server_is_reported_even_after_one_was_reported_for_the_old()
+    {
+        var full1 = _api.HoldNextFullLoad();
+        var loader = Make();
+        var first = loader.ReloadAsync(null);
+        await loader.ReloadAsync(T0); // queued: pass 2
+        var full2 = _api.HoldNextFullLoad();
+        full1.SetException(new FaxApiException(0, "old server down")); // pass 1: reported
+        loader.ServerChanged(); // pass 2 is in flight for the old server
+        await loader.ReloadAsync(null); // the new server's connect: pass 3
+        _api.FullAnswer = () => Task.FromException<IReadOnlyList<Job>>(new FaxApiException(0, "new server down"));
+        full2.SetException(new FaxApiException(0, "old server still down")); // stale: not reported
+        await first;
+        Assert.Equal(["old server down", "new server down"], _failures.Select(f => f.Message));
+    }
+
+    [Fact]
     public async Task A_resync_before_any_load_is_a_full_load()
     {
         var loader = Make();
@@ -128,7 +145,7 @@ public sealed class MonitorLoaderTests
         _api.FullAnswer = null;
         var full = _api.HoldNextFullLoad();
         var load = loader.ReloadAsync(null);
-        loader.Stop(); // the window is gone
+        loader.Stop(); // the runtime stopped
         full.SetResult([J("lf1")]);
         await load;
         Assert.Empty(_model.Jobs);

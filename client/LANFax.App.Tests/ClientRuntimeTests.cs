@@ -302,7 +302,7 @@ public sealed class ClientRuntimeTests : IDisposable
         rt.JobFinished += (j, r) => finished.Enqueue((j, r));
         Assert.Same(rt.Api, ((IMonitorSource)rt).MonitorApi); // the monitor window's view of the runtime
         var resyncs = new ConcurrentQueue<DateTimeOffset?>();
-        rt.Resynced += since => resyncs.Enqueue(since); // the monitor's grids reload from here
+        rt.Resynced += since => resyncs.Enqueue(since);
         _owner.Invoke(() => rt.TrackSubmitted("lf1"));
         _owner.Invoke(() => rt.Start());
 
@@ -514,7 +514,7 @@ public sealed class ClientRuntimeTests : IDisposable
         Assert.Equal(id, Assert.Single(offered).SpoolId);
     }
 
-    // ---- (e) pass-through events for the MainForm grids ----
+    // ---- (e) pass-through events (the runtime's own monitor model takes the same ones) ----
 
     [Fact]
     public async Task Every_job_and_received_event_is_passed_through_before_the_tracker_and_the_announcer()
@@ -983,6 +983,97 @@ public sealed class ClientRuntimeTests : IDisposable
         Assert.Single(failures);
         Assert.Null(_owner.Invoke(() => rt.MonitorLoadError));
         Assert.Equal(2, FullLoads());
+    }
+
+    [Fact]
+    public async Task A_resync_without_since_reloads_from_the_last_load_not_in_full()
+    {
+        var sendResync = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _events = async (n, ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, ": hello\n\n");
+            await sendResync.Task;
+            await Write(ctx, "event: resync\ndata: {}\n\n");
+            await Hold(ctx);
+        };
+        var rt = Make();
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => LastLoad(rt) != null);
+        var last = LastLoad(rt)!.Value;
+        sendResync.SetResult();
+        await WaitFor(() => SinceLoads().Length == 1);
+        Assert.Contains("updated_since=" + MonitorModel.FormatSince(last - MonitorModel.SkewMargin), SinceLoads()[0]);
+        Assert.Equal(1, FullLoads()); // rows were loaded: no full load
+    }
+
+    [Fact]
+    public async Task A_status_event_with_receiving_makes_the_monitor_show_receiving()
+    {
+        _events = async (_, ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, "event: status\ndata: {\"receiving\":true}\n\n");
+            await Hold(ctx);
+        };
+        var rt = Make();
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => _owner.Invoke(() => rt.Status.Receiving));
+        Assert.True(_owner.Invoke(() => rt.Monitor.IsReceiving(rt.Status, DateTimeOffset.UtcNow)));
+    }
+
+    [Fact]
+    public async Task A_refused_token_on_a_monitor_load_reaches_MonitorLoadFailed_and_is_logged_as_info()
+    {
+        _inbox = ctx => { ctx.Response.StatusCode = 401; ctx.Response.Close(); return Task.CompletedTask; };
+        var rt = Make();
+        var failures = new ConcurrentQueue<Exception>();
+        rt.MonitorLoadFailed += failures.Enqueue;
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => !failures.IsEmpty);
+        Assert.IsType<FaxApiUnauthorizedException>(Assert.Single(failures));
+        Assert.IsType<FaxApiUnauthorizedException>(_owner.Invoke(() => rt.MonitorLoadError));
+        lock (_log)
+        {
+            Assert.Contains(_log, l => l == "monitor: loading the job lists refused (401)"); // the stream's notice is the error
+            Assert.DoesNotContain(_log, l => l.StartsWith("ERROR monitor"));
+        }
+    }
+
+    [Fact]
+    public async Task A_settings_save_resets_the_load_error()
+    {
+        _inbox = ctx => { ctx.Response.StatusCode = 500; ctx.Response.Close(); return Task.CompletedTask; };
+        var rt = Make();
+        var failures = new ConcurrentQueue<Exception>();
+        rt.MonitorLoadFailed += failures.Enqueue;
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => !failures.IsEmpty);
+        Assert.NotNull(_owner.Invoke(() => rt.MonitorLoadError));
+        Assert.Null(_owner.Invoke(() => { rt.SettingsSaved(); return rt.MonitorLoadError; })); // before the new run's load
+    }
+
+    [Fact]
+    public async Task Unusable_settings_after_a_save_empty_the_monitor_and_surface_the_config_error_without_a_request()
+    {
+        var rt = Make();
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => LastLoad(rt) != null);
+        await Settle();
+        Assert.NotEmpty(_owner.Invoke(() => rt.Monitor.Jobs));
+        int requests = _srv.Requests.Count(r => r.PathAndQuery.StartsWith("/jobs?") || r.PathAndQuery.StartsWith("/inbox"));
+
+        var failures = new ConcurrentQueue<Exception>();
+        int changes = 0;
+        _owner.Invoke(() => { rt.MonitorLoadFailed += failures.Enqueue; rt.MonitorChanged += () => changes++; });
+        _owner.Invoke(() => { rt.Config.Token = "bad token"; rt.SettingsSaved(); }); // a space cannot go in a Bearer header
+        Assert.Empty(_owner.Invoke(() => rt.Monitor.Jobs));
+        Assert.Empty(_owner.Invoke(() => rt.Monitor.Inbox));
+        Assert.True(_owner.Invoke(() => changes) >= 1);
+        Assert.IsType<FaxApiConfigException>(Assert.Single(failures));
+        Assert.IsType<FaxApiConfigException>(_owner.Invoke(() => rt.MonitorLoadError));
+        await Task.Delay(200);
+        Assert.Equal(requests, _srv.Requests.Count(r => r.PathAndQuery.StartsWith("/jobs?") || r.PathAndQuery.StartsWith("/inbox")));
     }
 
     // ---- helpers ----

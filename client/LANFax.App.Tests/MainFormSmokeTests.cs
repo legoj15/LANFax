@@ -128,6 +128,35 @@ public sealed class MainFormSmokeTests
         if (failure != null) throw new Xunit.Sdk.XunitException("MainForm arm reset failed: " + failure);
     }
 
+    [InteractiveFact]
+    public void A_load_failure_after_the_window_exists_is_shown_and_the_next_good_load_brings_the_hint_back()
+    {
+        var src = new FakeSource();
+        Exception? failure = null;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                using var form = new MainForm(src, cacheDir: Path.GetTempPath(), openFile: _ => { }, openSettings: () => { });
+                form.Show();
+                Assert.DoesNotContain("Could not load", form.MessageText);
+
+                src.FailLoad(new FaxApiException(0, "cannot reach faxd")); // the runtime's load failed while the window is open
+                Assert.StartsWith("Could not load the job lists", form.MessageText);
+
+                src.Load(J("lf1", "out", "queued")); // a later load succeeds: the error line goes
+                Pump(() => form.JobRowCount == 1);
+                Assert.DoesNotContain("Could not load", form.MessageText);
+                Assert.StartsWith("Double-click", form.MessageText);
+            }
+            catch (Exception e) { failure = e; }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        Assert.True(t.Join(TimeSpan.FromSeconds(30)), "the form thread hung");
+        if (failure != null) throw new Xunit.Sdk.XunitException("MainForm late load failure failed: " + failure);
+    }
+
     private static T Find<T>(Control root, Func<T, bool> match) where T : Control =>
         All(root).OfType<T>().FirstOrDefault(match) ?? throw new InvalidOperationException("control not found");
 

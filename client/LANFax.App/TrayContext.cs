@@ -363,7 +363,8 @@ internal sealed class TrayContext : ApplicationContext
         try
         {
             var arm = await _runtime.Api.ReceiveTestAsync(20);
-            if (gen == _runtime.ServerGeneration) _runtime.NoteArm(arm); // the window's card and the expiry check, at once
+            if (gen != _runtime.ServerGeneration) return; // saved meanwhile: the old server's answer, for no one
+            _runtime.NoteArm(arm); // the window's card and the expiry check, at once
             var until = arm.Until ?? DateTimeOffset.Now.AddMinutes(20);
             Balloon(NotificationText.ReceiveArmed(until));
         }

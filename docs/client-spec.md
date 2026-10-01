@@ -31,7 +31,7 @@ client/
   LANFax.Core/                      net10.0 class library: no UI
     ClientConfig.cs                 %ProgramData%\LANFax\config.json (server, port, printer name, spool dir) + per-user %LocalAppData%\LANFax\token.bin; Validate(); Load never throws, sets LoadError
     Dpapi.cs                        DPAPI via crypt32 P/Invoke (no NuGet package); Protect takes a DpapiScope (CurrentUser for the token)
-    FaxApi.cs                       ISendApi (post job, test send, both to a SendEndpoint snapshot, PDF as byte[]) + IMonitorApi (jobs, inbox, pdf download, arm/disarm/test receive; what MainForm calls) + HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download (body read failures and stalls -> FaxApiException 0, per-read idle limit = HttpClient.Timeout); FaxApiConfigException
+    FaxApi.cs                       ISendApi (post job, test send, both to a SendEndpoint snapshot, PDF as byte[]) + IMonitorApi (jobs, inbox, pdf download, arm/disarm/test receive; the runtime's loader loads through it, MainForm and the tray call its arm methods) + HttpClient wrapper for faxd: status, jobs, inbox, post job (Idempotency-Key), test send, arm/disarm, pdf download (body read failures and stalls -> FaxApiException 0, per-read idle limit = HttpClient.Timeout); FaxApiConfigException
     EventStream.cs                  SSE client: GET /events?token=, Last-Event-ID, stall detection, reconnect with backoff, raises typed events
     IPrintListener.cs               what ClientRuntime needs from the listener (start, stop, running/receiving, events); PrintPipeListener implements it, tests fake it
     PrintPipeListener.cs            serves the printer's pipe port \\.\pipe\LANFax (ACL: deny NETWORK, allow SYSTEM + current user, job-writing rights for Authenticated Users; first instance only, retried while taken; 2 instances); streams each connection to jobs/<guid>.pdf.part, flushes, renames to jobs/<guid>.pdf (or moves to rejected/); raises NewPrintJob / Error; EofCounter
@@ -45,7 +45,7 @@ client/
     TrayContext.cs                  UI only, consumes ClientRuntime: NotifyIcon + menu (Open LANFax = the MainForm, also on icon double-click and on a second start's show signal; Open web page; Unsent documents (N); Retry failed fax (N); Send a test page...; Receive a test (arm 20 min); Install printer; Settings; Exit), balloons (incl. arm window ending, via ArmExpiryWatch), send dialogs one at a time, the one MainForm, ShutdownBlocker, Exit; gets back to the UI thread only through `ClientRuntime.Owner`
     SendDialog.cs                   non-modal; number, subject, page count, Send / Cancel; "Send test page instead" checkbox
     Logic/                          testable plain classes: ClientRuntime, MonitorModel + ArmExpiryWatch, MonitorLoader, PdfOpener, SendSession, SendExecutor, JobTracker, DialogQueue, NotificationQueue, PdfInfo, PrinterSetup, InboundAnnouncer + InboundCatchUp, InstanceGuard, ...
-    MainForm.cs                     monitor window over IMonitorSource + MonitorModel + MonitorLoader + PdfOpener: status pill, arm card with countdown and buttons, jobs grid, inbox grid, double-click opens the PDF; one instance, close hides it
+    MainForm.cs                     monitor window, a view of IMonitorSource (the runtime's MonitorModel rows, loads and arm state) + PdfOpener: status pill, arm card with countdown and buttons, jobs grid, inbox grid, double-click opens the PDF; one instance, close hides it
     SettingsDialog.cs               server host/ip, port, token, "Clear token", "Test connection"
   LANFax.Tests/                     xunit: Core (config, FaxApi, EventStream, PrintPipeListener against real pipes, numbers) + install/Inno script checks
   LANFax.App.Tests/                 xunit: App Logic classes; MonitorModelTests; MonitorLoaderTests; PdfOpenerTests; MainFormSmokeTests (the one WinForms file built in a test: STA thread, fake IMonitorSource; [InteractiveFact] reports it skipped without an interactive desktop); ClientRuntimeTests run the runtime on a dedicated owner thread against FakeServer (linked from LANFax.Tests) and a fake IPrintListener
@@ -662,15 +662,20 @@ real `FaxApi`) and `Logic/IMonitorSource.cs` (what the form needs from
     the server's, the merge absorbs the overlap). On `resync`:
     `updated_since=<the event's since>`. `updated_since` is UTC
     `yyyy-MM-ddTHH:mm:ssZ`, invariant. While nothing is loaded yet (first
-    load failed, or after `ServerChanged`) every load is full, a resync's
+    load failed, or after a settings save) every load is full, a resync's
     too. One load at a time (`MonitorLoader`): requests meanwhile coalesce
     into one more pass after it, from the earliest resync `since`. A load in
-    flight across `ServerChanged` lands nowhere. A failed load still runs
+    flight across a settings save lands nowhere (`SettingsSaved` ->
+    `RestartStream` clears the model and bumps `ServerGeneration`; the
+    loader's own `ServerChanged` is only that reset). When the saved settings
+    are unusable no stream run starts, so `RestartStream` asks for one load
+    itself: the config error reaches `MonitorLoadFailed` before anything is
+    sent. A failed load still runs
     the pass queued behind it, once, from the queued `since` (the reconnect,
     resync or new server's connect that queued it will not come again; a
-    failure of a load already dropped by `ServerChanged` is not shown). A
-    failure is reported once per load request, however many of its passes
-    fail. A 401 shows the token line. A `resync` still fetches twice: this
+    failure of a load already dropped by a settings save is not shown). A
+    failure is reported once per load request and server, however many of
+    its passes fail. A 401 shows the token line. A `resync` still fetches twice: this
     since-load and the inbound catch-up (`GET
     /jobs?direction=in&state=received`, 100 then 1000); they are kept apart
     on purpose (the catch-up's baseline is decided before its request, it is

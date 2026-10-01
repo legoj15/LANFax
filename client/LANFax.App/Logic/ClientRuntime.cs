@@ -404,7 +404,8 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
     /// (Re)starts the one <see cref="EventStream"/>: cancels the current run, waits for it to end (one run at a time,
     /// so LastEventId has a single writer), then runs again with a new token if a token is configured. The snapshot and
     /// <see cref="Monitor"/> are reset (a load in flight lands nowhere): the settings may name another server, and the
-    /// new run's connect brings the full status and a full load again.
+    /// new run's connect brings the full status and a full load again. With no run (unusable settings) one load is asked
+    /// for here, so <see cref="MonitorLoadFailed"/> says why.
     /// </summary>
     public void RestartStream()
     {
@@ -422,6 +423,9 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
         bool run = !string.IsNullOrEmpty(Config.Token) && ClientConfig.TokenError(Config.Token) == null && Config.EndpointError() == null;
         var cts = run ? new CancellationTokenSource() : null;
         _sseCts = cts;
+        // No run means no connect, so no load: ask once anyway, so the window shows why (an unusable address or token
+        // throws before anything is sent; an empty token is refused by the server).
+        if (!run) _ = ReloadMonitorAsync(null);
         _sseTask = Task.Run(async () =>
         {
             if (oldTask != null) { try { await oldTask; } catch { /* logged by that run */ } }
