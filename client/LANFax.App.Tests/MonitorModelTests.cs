@@ -274,6 +274,21 @@ public sealed class MonitorModelTests
     }
 
     [Fact]
+    public void At_equal_updated_at_the_same_state_with_new_fields_still_applies()
+    {
+        // faxd's ami.py _annotate publishes a job event with pages and detail but no state change, and spool.py
+        // publishes received with finished_at; both can share the second of the row already shown.
+        var m = new MonitorModel(Zone);
+        m.Apply(J("a", state: "sending", updated: T0));
+        Assert.True(m.Apply(J("a", state: "sending", updated: T0, pages: 3)));
+        Assert.Equal("3", Assert.Single(m.Jobs).Pages);
+
+        m.Apply(J("in1", dir: "in", state: "received", from: "555", updated: T0));
+        var done = J("in1", dir: "in", state: "received", from: "555", updated: T0) with { FinishedAt = T0 };
+        Assert.True(m.Apply(done));
+    }
+
+    [Fact]
     public void Reconnect_reload_merges_rows_by_id()
     {
         var m = new MonitorModel(Zone);

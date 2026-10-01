@@ -32,6 +32,8 @@ public sealed class MainForm : Form
     private readonly MonitorLoader _loader;
     private readonly PdfOpener _pdf;
     private ArmState _arm;
+    /// <summary>Bumped by <see cref="ServerChanged"/>: an arm call asked before it answers for the old server.</summary>
+    private int _serverGeneration;
 
     /// <param name="src">The runtime (its events arrive on this thread).</param>
     /// <param name="cacheDir">Where opened PDFs are downloaded; <see cref="MonitorModel.DefaultCacheDir"/> by default.</param>
@@ -106,15 +108,24 @@ public sealed class MainForm : Form
     public int InboxRowCount => _inboxGrid.Rows.Count;
     /// <summary>The jobs grid, for the smoke test's scroll checks.</summary>
     internal DataGridView JobsGrid => _jobsGrid;
+    /// <summary>The arm card's title, for the smoke test.</summary>
+    internal string ArmTitleText => _armState.Text;
     /// <summary>Set by the tray at exit: a close then really closes instead of hiding.</summary>
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     public bool AllowClose { get; set; }
 
-    /// <summary>The settings may name another server: drop the rows; the stream's next connect loads afresh.</summary>
+    /// <summary>
+    /// The settings may name another server: drop the rows and the arm card (an arm call's answer is not in the
+    /// runtime's status, so the runtime's reset may raise nothing); the stream's next connect loads afresh.
+    /// </summary>
     public void ServerChanged()
     {
+        _serverGeneration++;
         _loader.ServerChanged();
+        _arm = ServerStatus.Empty.Arm;
         RenderGrids();
+        RenderArm();
+        RenderPill();
     }
 
     protected override void OnLoad(EventArgs e)
@@ -202,26 +213,32 @@ public sealed class MainForm : Form
         return b;
     }
 
-    /// <summary>Arm, test window or disarm: the answer shows at once; the stream's arm event confirms it.</summary>
+    /// <summary>
+    /// Arm, test window or disarm: the answer shows at once; the stream's arm event confirms it. An answer (or error)
+    /// that lands after <see cref="ServerChanged"/> is the old server's and is not shown.
+    /// </summary>
     private async Task ArmCallAsync(Func<Task<ArmState>> call, string what)
     {
         foreach (var b in _armButtons) b.Enabled = false;
+        int gen = _serverGeneration;
         try
         {
-            _arm = await call();
-            if (IsDisposed) return;
+            var answer = await call();
+            if (IsDisposed || gen != _serverGeneration) return; // saved meanwhile: the old server's answer
+            _arm = answer;
             _message.Text = Hint;
             RenderArm();
         }
         catch (FaxApiUnauthorizedException)
         {
+            if (gen != _serverGeneration) return; // the old server refused the old token: the save already answered it
             Say(NotificationText.WindowUnauthorized);
             _openSettings?.Invoke();
         }
         catch (Exception e) when (e is FaxApiException or JsonException)
         {
             FileLog.Error($"monitor: {what} failed", e);
-            Say($"{what} failed: {e.Message}");
+            if (gen == _serverGeneration) Say($"{what} failed: {e.Message}");
         }
         finally
         {

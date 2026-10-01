@@ -87,6 +87,45 @@ public sealed class MainFormSmokeTests
         Assert.Equal(0, src.Subscribers); // disposed: no handler left on the runtime
     }
 
+    [InteractiveFact]
+    public void A_server_change_drops_the_old_servers_arm_answer_even_one_still_in_flight()
+    {
+        var src = new FakeSource();
+        Exception? failure = null;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                using var form = new MainForm(src, cacheDir: Path.GetTempPath(), openFile: _ => { }, openSettings: () => { });
+                form.Show();
+                Pump(() => form.JobRowCount == 1);
+                Assert.Equal("Disarmed", form.ArmTitleText);
+
+                // The HTTP answer arms the card while the stream has brought no status (the runtime's stays Empty).
+                Find<Button>(form, b => b.Text == "Arm 1 h").PerformClick();
+                Pump(() => form.ArmTitleText == "ARMED");
+                // Settings saved to another server: the runtime raises nothing (its status is already Empty).
+                form.ServerChanged();
+                Assert.Equal("Disarmed", form.ArmTitleText);
+
+                // An arm call still in flight across the save: the old server's answer is not shown.
+                var gate = new TaskCompletionSource<ArmState>();
+                src.Api.ArmGate = gate;
+                var arm = Find<Button>(form, b => b.Text == "Arm 1 h");
+                arm.PerformClick();
+                form.ServerChanged();
+                gate.SetResult(new ArmState(true, null, 60, "300"));
+                Pump(() => arm.Enabled);
+                Assert.Equal("Disarmed", form.ArmTitleText);
+            }
+            catch (Exception e) { failure = e; }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        Assert.True(t.Join(TimeSpan.FromSeconds(30)), "the form thread hung");
+        if (failure != null) throw new Xunit.Sdk.XunitException("MainForm arm reset failed: " + failure);
+    }
+
     private static T Find<T>(Control root, Func<T, bool> match) where T : Control =>
         All(root).OfType<T>().FirstOrDefault(match) ?? throw new InvalidOperationException("control not found");
 
@@ -115,6 +154,7 @@ public sealed class MainFormSmokeTests
         public int FullLoads, SinceLoads;
         public DateTimeOffset? LastSince;
         public Exception? ArmError;
+        public TaskCompletionSource<ArmState>? ArmGate;
 
         public Task<IReadOnlyList<Job>> GetJobsAsync(string? direction = null, IEnumerable<string>? states = null, int limit = 100,
             DateTimeOffset? updatedSince = null, CancellationToken ct = default)
@@ -130,7 +170,9 @@ public sealed class MainFormSmokeTests
 
         public Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default) => Task.CompletedTask;
         public Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default) =>
-            ArmError is { } e ? Task.FromException<ArmState>(e) : Task.FromResult(new ArmState(true, null, minutes, "300"));
+            ArmError is { } e ? Task.FromException<ArmState>(e)
+            : ArmGate is { } g ? g.Task
+            : Task.FromResult(new ArmState(true, null, minutes, "300"));
         public Task<ArmState> DisarmAsync(CancellationToken ct = default) => Task.FromResult(new ArmState(false, null, 0, "300"));
         public Task<ArmState> ReceiveTestAsync(int minutes = 20, CancellationToken ct = default) => ArmAsync(minutes, ct);
     }

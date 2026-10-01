@@ -83,8 +83,10 @@ public sealed partial class MonitorModel(TimeZoneInfo zone)
     /// <summary>
     /// A live update (stream or reload): inserts or replaces the row with that id in the grid its direction names.
     /// An update older than the row (a slow reload landing after a newer event) is ignored. faxd stamps
-    /// <c>updated_at</c> to the second, so two states can share one: then the less advanced state (by
-    /// <see cref="StateRank"/>) never replaces the more advanced, and the same state is a no-op. True if a row changed.
+    /// <c>updated_at</c> to the second, so two updates can share one: then a strictly less advanced state (by
+    /// <see cref="StateRank"/>) never replaces a more advanced one, while an equal rank still applies, because faxd
+    /// sends same-state updates that carry new fields (ami.py's annotate adds pages and detail, spool.py's received
+    /// adds finished_at). An update identical to the row is a no-op. True if a row changed.
     /// </summary>
     public bool Apply(Job j)
     {
@@ -94,7 +96,7 @@ public sealed partial class MonitorModel(TimeZoneInfo zone)
         {
             var cur = list[at];
             if (j.UpdatedAt < cur.UpdatedAt) return false;
-            if (j.UpdatedAt == cur.UpdatedAt && StateRank(j.State) <= StateRank(cur.State)) return false;
+            if (j.UpdatedAt == cur.UpdatedAt && (j == cur || StateRank(j.State) < StateRank(cur.State))) return false;
             list.RemoveAt(at);
         }
         // Newest first by creation; ties by id so the order is stable.

@@ -525,7 +525,9 @@ client/
 - The spool file and `spool\jobs` journal are machine-wide, so only one
   LANFax runs per machine: the mutex is `Global\LANFax.Tray`. A second start
   in the same session signals the running tray to show its monitor window
-  (`Local\LANFax.Tray.ShowRunning`; as "Open LANFax"); a start in another Windows
+  (`Local\LANFax.Tray.ShowRunning`; as "Open LANFax"; while Exit waits for a
+  send in flight it gets the balloon "LANFax is exiting, waiting for a fax to
+  finish" instead, and once stopping nothing: `InstanceGuard.OnShowSignal`); a start in another Windows
   session (fast user switching, RDP) shows "LANFax is already running in
   another session" and exits. `InstanceGuard.Acquire` creates the show event
   the moment it owns the mutex (before the tray is built), and a second start
@@ -562,9 +564,11 @@ smoke test fakes it).
   `FaxReceived`), and `Resynced(since)` every `resync` event (after the
   tracked-job poll and the inbound catch-up started). Not passed through: a
   job or received event from a run a restart cancelled, or a poll answer to
-  a request made under such a run (the save may have switched servers, and
+  a request made before a restart (the save may have switched servers, and
   the window just cleared its grids); those still reach the tracker,
-  `JobFinished` and the announcer.
+  `JobFinished` and the announcer. A poll asked after a restart is live even
+  when the restart started no run (unusable settings): poll liveness is a
+  restart counter, not the stream run's token.
 - **Threading.** The runtime takes the owner (UI) thread's
   `SynchronizationContext` (callbacks are posted through it; `Start` throws
   unless it runs under it) and exposes it as `Owner`; the tray posts through
@@ -579,7 +583,9 @@ smoke test fakes it).
   (`CloseReason.UserClosing`) hides it; sign-out and shutdown close it for
   real (so it never refuses `WM_QUERYENDSESSION`), and the tray's Exit hides
   then disposes it. Saving Settings calls `MainForm.ServerChanged` (rows
-  dropped, the next load is full) before `SettingsSaved`.
+  dropped, the next load is full, the arm card back to Disarmed; an arm
+  call's answer or error landing after it is the old server's and is not
+  shown) before `SettingsSaved`.
 - **Layout, mirroring the web page.** Header pill; "Receive faxes" card with
   ARMED/Disarmed, the countdown line and Arm 1 h / 4 h / 8 h, Test window
   (20 min, `POST /test/receive`), Disarm (no confirm, as on the page); "Sent
@@ -623,10 +629,12 @@ smoke test fakes it).
   - Rows merge by id into the grid their direction names, newest first by
     `created_at`, capped at 200; an update older (`updated_at`) than the row
     is ignored, so a slow reload never undoes a newer event; at an equal
-    `updated_at` (faxd stamps to the second) a less advanced state (queued <
-    dialing < sending < terminal) is ignored too, so the tray's re-apply of
-    the POST's `queued` row never undoes a same-second stream state. Rows an
-    answer omits stay.
+    `updated_at` (faxd stamps to the second) a strictly less advanced state
+    (queued < dialing < sending < terminal) is ignored too, so the tray's
+    re-apply of the POST's `queued` row never undoes a same-second stream
+    state; an equal state still applies (faxd's annotate event adds pages and
+    detail, and `received` adds `finished_at`, with no state change), and an
+    update identical to the row is a no-op. Rows an answer omits stay.
   - Loads: the first (and after `ServerChanged`) is full: `GET
     /jobs?direction=out&limit=50` + `GET /inbox?limit=50`. On every
     reconnect: `GET /jobs?limit=500&updated_since=<last load start - 5 min>`

@@ -4,10 +4,21 @@ public enum InstanceRole
 {
     /// <summary>This process owns the machine-wide mutex: it runs the tray, the spool watcher and the journal.</summary>
     Run,
-    /// <summary>The running instance is in this session and was asked to show its "already running" balloon.</summary>
+    /// <summary>The running instance is in this session and was asked to show its monitor window.</summary>
     ShowRunningHere,
     /// <summary>Another Windows session owns the spool: say so and exit.</summary>
     RunningInAnotherSession,
+}
+
+/// <summary>What the running tray does when a second start in its session signals it.</summary>
+public enum ShowSignalAction
+{
+    /// <summary>Show (or raise) the monitor window.</summary>
+    ShowWindow,
+    /// <summary>Exit is waiting for a send in flight: no window, but a balloon so the second start is not met with nothing.</summary>
+    ExitPendingBalloon,
+    /// <summary>Already shutting down: nothing.</summary>
+    Ignore,
 }
 
 /// <summary>What <see cref="InstanceGuard.Acquire"/> decided, holding the mutex and signal the owner keeps for its lifetime.</summary>
@@ -34,6 +45,8 @@ public static class InstanceGuard
     /// <summary>Per session: lets a second start in the same session reach the running tray.</summary>
     public const string ShowEventName = @"Local\LANFax.Tray.ShowRunning";
     public const string OtherSessionText = "LANFax is already running in another session";
+    /// <summary>The balloon a second start gets while the tray waits for a send in flight before exiting.</summary>
+    public const string ExitPendingText = "LANFax is exiting, waiting for a fax to finish";
     /// <summary>How long a second start waits for the owner's signal to appear before blaming another session.</summary>
     public static readonly TimeSpan SignalPatience = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan SignalRetry = TimeSpan.FromMilliseconds(100);
@@ -44,6 +57,13 @@ public static class InstanceGuard
         ownsMutex ? InstanceRole.Run
         : signalledLocal ? InstanceRole.ShowRunningHere
         : InstanceRole.RunningInAnotherSession;
+
+    /// <param name="exiting">The tray is stopping (past any wait).</param>
+    /// <param name="exitPending">Exit is waiting for a send in flight (up to 30 s).</param>
+    public static ShowSignalAction OnShowSignal(bool exiting, bool exitPending) =>
+        exiting ? ShowSignalAction.Ignore
+        : exitPending ? ShowSignalAction.ExitPendingBalloon
+        : ShowSignalAction.ShowWindow;
 
     /// <summary>
     /// Takes the machine-wide mutex and, the moment it is owned, creates the per-session show signal, so a second start

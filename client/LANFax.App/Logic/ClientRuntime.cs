@@ -49,6 +49,12 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
     private readonly object _sseGate = new();
     private CancellationToken _sseLive; // the token of the run currently allowed to raise events (guarded by _sseGate)
     private CancellationTokenSource? _sseCts;
+    /// <summary>
+    /// Bumped by every <see cref="RestartStream"/>, run or not (owner thread): a poll answer counts as live only if no
+    /// restart came between its question and its answer. A stream token would not do: a restart that starts no run
+    /// leaves the cancelled one in place, and every later poll would look stale.
+    /// </summary>
+    private int _streamGeneration;
     private Task? _sseTask;
     private InboundAnnouncer? _inbound;
     private InboundCatchUp? _catchUp;
@@ -375,6 +381,7 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
         var oldCts = _sseCts;
         var oldTask = _sseTask;
         oldCts?.Cancel();
+        Interlocked.Increment(ref _streamGeneration);
         SetConnected(false);
         ResetStatus();
         // Nothing to authenticate with, a token that cannot be sent, or nowhere to connect: do not run.
@@ -421,14 +428,16 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
 
     /// <summary>
     /// A job update from the stream, the poll or a send just accepted: raised through <see cref="JobChanged"/>, then
-    /// a terminal one goes to the tracker. The tracker is updated even after <see cref="StopAsync"/> (a send that
-    /// finishes while exiting must be recorded); only the events are not raised.
+    /// a terminal one goes to the tracker. A direct call after <see cref="StopAsync"/> still updates the tracker (a
+    /// send that finishes while exiting must be recorded); only the events are not raised. Stream events never get
+    /// here after the stop: Post drops them, so a send that finishes while exiting is recorded only through a direct
+    /// call or a poll answer already in flight.
     /// </summary>
     public void ApplyJobUpdate(Job j) => ApplyJobUpdate(j, live: true);
 
     /// <summary>
-    /// As <see cref="ApplyJobUpdate(Job)"/>; an update that is not <paramref name="live"/> (from a stream run, or a
-    /// poll asked under one, that a restart cancelled since) skips <see cref="JobChanged"/> but still reaches the
+    /// As <see cref="ApplyJobUpdate(Job)"/>; an update that is not <paramref name="live"/> (from a stream run that a
+    /// restart cancelled since, or a poll answer to a question asked before a restart) skips <see cref="JobChanged"/> but still reaches the
     /// tracker.
     /// </summary>
     private void ApplyJobUpdate(Job j, bool live)
@@ -455,10 +464,10 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
         {
             foreach (var id in ids)
             {
-                // The run live when asking: a restart (a settings save, maybe to another server) before the answer
-                // makes it an old server's row, kept from the grids.
-                var ct = LiveStreamToken;
-                try { var j = await Api.GetJobAsync(id); ApplyJobUpdate(j, live: !ct.IsCancellationRequested); }
+                // A restart (a settings save, maybe to another server) between question and answer makes it an old
+                // server's row, kept from the grids. A restart before the question does not, run or no run.
+                int gen = Volatile.Read(ref _streamGeneration);
+                try { var j = await Api.GetJobAsync(id); ApplyJobUpdate(j, live: gen == Volatile.Read(ref _streamGeneration)); }
                 catch (FaxApiConfigException e)
                 {
                     Info($"poll: settings unusable ({e.Message}); next tick");

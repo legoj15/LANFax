@@ -246,6 +246,29 @@ public sealed class ClientRuntimeTests : IDisposable
         Assert.DoesNotContain(changed, j => j.Id == "lf8");
     }
 
+    [Fact]
+    public async Task A_poll_made_after_a_restart_that_starts_no_run_still_reaches_the_grids()
+    {
+        var rt = Make();
+        var changed = new ConcurrentQueue<Job>();
+        rt.JobChanged += changed.Enqueue;
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => rt.Connected);
+        await Settle();
+
+        // A save the stream cannot run with (no usable endpoint): the old run is cancelled and no new one starts.
+        var server = rt.Config.Server;
+        _owner.Invoke(() => { rt.Config.Server = ""; rt.RestartStream(); });
+        await WaitFor(() => Volatile.Read(ref _activeRuns) == 0);
+        // The endpoint becomes usable again without a restart (the poll reads the config at each request).
+        _owner.Invoke(() => rt.Config.Server = server);
+
+        _owner.Invoke(() => rt.TrackSubmitted("lf9"));
+        await _owner.InvokeAsync(rt.PollTrackedAsync); // asked after the restart: a live answer
+        _owner.Drain();
+        Assert.Contains(changed, j => j.Id == "lf9" && j.State == "sent");
+    }
+
     // ---- (b) connect and resync trigger the inbound catch-up and the tracked-job poll ----
 
     [Fact]
@@ -356,8 +379,8 @@ public sealed class ClientRuntimeTests : IDisposable
         rt.Notice += _ => After();
         rt.Unauthorized += After;
         _owner.Invoke(() => rt.TrackSubmitted("lf1"));
+        TrackPlan(rt, "lf2"); // a send still going when the app exits (tracked first: the connect's poll cannot finish it)
         _owner.Invoke(() => rt.Start());
-        TrackPlan(rt, "lf2"); // a send still going when the app exits
         await WaitFor(() => rt.Connected);
         await WaitFor(() => Polls() >= 3 && _keys.Reads >= 3); // both timers tick
 

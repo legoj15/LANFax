@@ -308,6 +308,14 @@ public class InstanceGuardTests
     public void Decides_what_a_starting_instance_does(bool ownsMutex, bool signalledLocal, InstanceRole expected) =>
         Assert.Equal(expected, InstanceGuard.Decide(ownsMutex, signalledLocal));
 
+    [Theory]
+    [InlineData(false, false, ShowSignalAction.ShowWindow)]
+    [InlineData(false, true, ShowSignalAction.ExitPendingBalloon)] // waiting for a send before exiting: say so
+    [InlineData(true, false, ShowSignalAction.Ignore)]
+    [InlineData(true, true, ShowSignalAction.Ignore)]
+    public void Decides_what_the_running_tray_does_with_a_show_signal(bool exiting, bool exitPending, ShowSignalAction expected) =>
+        Assert.Equal(expected, InstanceGuard.OnShowSignal(exiting, exitPending));
+
     static (string Mutex, string Event) Names()
     {
         var id = Guid.NewGuid().ToString("N");

@@ -90,7 +90,7 @@ internal sealed class TrayContext : ApplicationContext
 
         _showEvent = showSignal;
         _showWait = ThreadPool.RegisterWaitForSingleObject(_showEvent,
-            (_, _) => OnUi(ShowMonitor), null, Timeout.Infinite, false); // started again: show the window
+            (_, _) => OnUi(OnShowSignal), null, Timeout.Infinite, false); // started again: show the window
 
         // Stop runs on the UI thread inside WM_ENDSESSION: nothing it raises while stopping needs the UI thread.
         _shutdown = new ShutdownBlocker(() => _runtime.IsReceiving, _runtime.StopListener, m => FileLog.Info("shutdown: " + m));
@@ -160,6 +160,16 @@ internal sealed class TrayContext : ApplicationContext
             _monitor.Activate();
         }
         catch (Exception e) { FileLog.Error("opening the monitor window failed", e); }
+    }
+
+    /// <summary>A second start in this session: the window, or while exit waits for a send, a balloon saying so.</summary>
+    private void OnShowSignal()
+    {
+        switch (InstanceGuard.OnShowSignal(_exiting, _exitPending))
+        {
+            case ShowSignalAction.ShowWindow: ShowMonitor(); break;
+            case ShowSignalAction.ExitPendingBalloon: Balloon(InstanceGuard.ExitPendingText); break;
+        }
     }
 
     private void CheckArmExpiry()

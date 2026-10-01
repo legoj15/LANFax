@@ -12,7 +12,8 @@ internal static class Program
         using var claim = InstanceGuard.Acquire(InstanceGuard.MutexName, InstanceGuard.ShowEventName, InstanceGuard.SignalPatience);
         if (claim.Role != InstanceRole.Run)
         {
-            // Same session: the running tray was asked to show its "already running" balloon. Otherwise another
+            // Same session: the running tray was asked to show its monitor window (or, while it is
+            // waiting to exit, a balloon saying so). Otherwise another
             // session owns the machine-wide spool: say so here and leave.
             if (claim.Role == InstanceRole.RunningInAnotherSession)
             {
