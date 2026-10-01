@@ -26,6 +26,11 @@ public sealed class ClientRuntimeTests : IDisposable
 
     /// <summary>Per /events connection (0, 1, ...): what the fake server does with it.</summary>
     private Func<int, HttpListenerContext, RecordedRequest, Task> _events;
+    /// <summary>Per full monitor load (0, 1, ...): the answer to <c>GET /jobs?direction=out</c>.</summary>
+    private Func<int, HttpListenerContext, Task> _fullJobs = (_, ctx) => FakeServer.Json(ctx, List(JobJson("lf1", "queued")));
+    /// <summary>The answer to <c>GET /inbox</c>.</summary>
+    private Func<HttpListenerContext, Task> _inbox = ctx => FakeServer.Json(ctx, List(InJson("in1")));
+    private int _fullJobsCalls;
 
     public ClientRuntimeTests()
     {
@@ -39,6 +44,8 @@ public sealed class ClientRuntimeTests : IDisposable
                 int n = Interlocked.Increment(ref _eventsConnections) - 1;
                 await _events(n, ctx, rec);
             }
+            else if (path.StartsWith("/jobs?direction=out")) await _fullJobs(Interlocked.Increment(ref _fullJobsCalls) - 1, ctx);
+            else if (path.StartsWith("/inbox")) await _inbox(ctx);
             else if (path.StartsWith("/jobs?")) await FakeServer.Json(ctx, """{"jobs":[]}""");
             else if (path.StartsWith("/jobs/")) await FakeServer.Json(ctx, JobJson(path["/jobs/".Length..], "sent"));
             else { ctx.Response.StatusCode = 404; ctx.Response.Close(); }
@@ -205,6 +212,8 @@ public sealed class ClientRuntimeTests : IDisposable
         _owner.Drain();
         Assert.DoesNotContain(changed, j => j.Id == "lf7" && j.State == "sent");
         Assert.DoesNotContain(inbox, j => j.Id == "in7");
+        Assert.DoesNotContain(_owner.Invoke(() => rt.Monitor.Jobs), r => r.Id == "lf7");
+        Assert.DoesNotContain(_owner.Invoke(() => rt.Monitor.Inbox), r => r.Id == "in7");
         var (job, tracked) = Assert.Single(finished);
         Assert.Equal("lf7", job.Id);
         Assert.NotNull(tracked); // the tracker recorded the outcome
@@ -244,6 +253,7 @@ public sealed class ClientRuntimeTests : IDisposable
         await WaitFor(() => finished.Any(j => j.Id == "lf8"));
         _owner.Drain();
         Assert.DoesNotContain(changed, j => j.Id == "lf8");
+        Assert.DoesNotContain(_owner.Invoke(() => rt.Monitor.Jobs), r => r.Id == "lf8");
     }
 
     [Fact]
@@ -267,6 +277,7 @@ public sealed class ClientRuntimeTests : IDisposable
         await _owner.InvokeAsync(rt.PollTrackedAsync); // asked after the restart: a live answer
         _owner.Drain();
         Assert.Contains(changed, j => j.Id == "lf9" && j.State == "sent");
+        Assert.Contains(_owner.Invoke(() => rt.Monitor.Jobs), r => r.Id == "lf9");
     }
 
     // ---- (b) connect and resync trigger the inbound catch-up and the tracked-job poll ----
@@ -785,6 +796,195 @@ public sealed class ClientRuntimeTests : IDisposable
         Assert.False(_listener.IsRunning);
     }
 
+    // ---- (l) the monitor's model, loads and arm snapshot ----
+
+    [Fact]
+    public async Task NoteArm_raises_StatusChanged_and_ArmChanged_only_when_the_arm_state_differs()
+    {
+        var rt = Make();
+        var statuses = new ConcurrentQueue<ServerStatus>();
+        var arms = new ConcurrentQueue<ArmState>();
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => rt.Connected);
+        await Settle();
+        _owner.Invoke(() => { rt.StatusChanged += statuses.Enqueue; rt.ArmChanged += arms.Enqueue; });
+
+        var armed = new ArmState(true, null, 60, "300");
+        _owner.Invoke(() => rt.NoteArm(armed)); // an arm button's HTTP answer
+        Assert.Equal(armed, _owner.Invoke(() => rt.Arm));
+        Assert.Equal(armed, Assert.Single(arms));
+        Assert.Equal(armed, Assert.Single(statuses).Arm);
+
+        _owner.Invoke(() => rt.NoteArm(armed with { })); // the stream already said so, or a second click: nothing
+        Assert.Single(arms);
+        Assert.Single(statuses);
+
+        await _owner.InvokeAsync(rt.StopAsync);
+        _owner.Invoke(() => rt.NoteArm(new ArmState(false, null, 0, "300")));
+        Assert.Single(arms);
+        Assert.Equal(armed, _owner.Invoke(() => rt.Arm)); // stopped: not noted
+    }
+
+    [Fact]
+    public async Task The_first_connect_loads_the_monitor_once_in_full_and_raises_MonitorChanged()
+    {
+        var rt = Make();
+        int changes = 0;
+        _owner.Invoke(() => { rt.Start(); rt.MonitorChanged += () => changes++; });
+        await WaitFor(() => LastLoad(rt) != null);
+        await Settle();
+        Assert.Equal(1, FullLoads());
+        Assert.Single(_srv.Requests, r => r.PathAndQuery.StartsWith("/inbox?limit=50"));
+        Assert.Empty(SinceLoads());
+        var (jobs, inbox, error) = _owner.Invoke(() => (rt.Monitor.Jobs, rt.Monitor.Inbox, rt.MonitorLoadError));
+        Assert.Equal("lf1", Assert.Single(jobs).Id);
+        Assert.Equal("in1", Assert.Single(inbox).Id);
+        Assert.Null(error);
+        Assert.Equal(1, _owner.Invoke(() => changes));
+    }
+
+    [Fact]
+    public async Task A_reconnect_reloads_the_monitor_from_the_last_load_less_the_skew_margin()
+    {
+        var drop = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _events = async (n, ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, ": hello\n\n");
+            if (n == 0) { await drop.Task; ctx.Response.Abort(); return; }
+            await Hold(ctx);
+        };
+        var rt = Make();
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => LastLoad(rt) != null);
+        var last = LastLoad(rt)!.Value;
+        drop.SetResult(); // the connection breaks; the stream reconnects
+        await WaitFor(() => SinceLoads().Length == 1);
+        Assert.Equal(1, FullLoads());
+        Assert.Contains("updated_since=" + MonitorModel.FormatSince(last - MonitorModel.SkewMargin), SinceLoads()[0]);
+    }
+
+    [Fact]
+    public async Task A_resync_reloads_the_monitor_from_its_since()
+    {
+        var sendResync = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _events = async (n, ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, ": hello\n\n");
+            await sendResync.Task;
+            await Write(ctx, "event: resync\ndata: {\"since\":\"2026-09-30T10:00:00+00:00\"}\n\n");
+            await Hold(ctx);
+        };
+        var rt = Make();
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => LastLoad(rt) != null);
+        sendResync.SetResult();
+        await WaitFor(() => SinceLoads().Length == 1);
+        Assert.Contains("updated_since=2026-09-30T10:00:00Z", SinceLoads()[0]);
+        Assert.Equal(1, FullLoads());
+        Assert.Equal(1, _eventsConnections);
+    }
+
+    [Fact]
+    public async Task A_settings_save_clears_the_monitor_and_a_load_straddling_it_lands_nowhere()
+    {
+        var asked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _fullJobs = async (n, ctx) =>
+        {
+            if (n == 0)
+            {
+                asked.TrySetResult();
+                await release.Task;
+                await FakeServer.Json(ctx, List(JobJson("old1", "queued")));
+            }
+            else await FakeServer.Json(ctx, List(JobJson("lf1", "queued")));
+        };
+        var rt = Make();
+        int changes = 0;
+        _owner.Invoke(() => { rt.Start(); rt.MonitorChanged += () => changes++; });
+        await asked.Task.WaitAsync(TimeSpan.FromSeconds(8)); // the old server's full load is in flight
+        _owner.Invoke(() => rt.ApplyJobUpdate(Job("lf2", "queued"))); // a live row, so the clear shows
+        Assert.Single(_owner.Invoke(() => rt.Monitor.Jobs));
+
+        int before = _owner.Invoke(() => changes);
+        _owner.Invoke(rt.SettingsSaved);
+        Assert.Empty(_owner.Invoke(() => rt.Monitor.Jobs));
+        Assert.True(_owner.Invoke(() => changes) > before); // the window redraws empty at once
+        await WaitFor(() => rt.Connected); // the new run's connect queues its load behind the held one
+
+        release.SetResult();
+        await WaitFor(() => LastLoad(rt) != null);
+        _owner.Drain();
+        Assert.Equal(2, FullLoads());
+        Assert.Equal("lf1", Assert.Single(_owner.Invoke(() => rt.Monitor.Jobs)).Id); // never old1
+    }
+
+    [Fact]
+    public async Task Stream_job_and_received_events_reach_the_monitor_and_raise_MonitorChanged()
+    {
+        _srv.Handler = WithJobState("sending", _srv.Handler);
+        var go = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _events = async (_, ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, ": hello\n\n");
+            await go.Task;
+            await Write(ctx, "event: job\ndata: " + JobJson("lf5", "sent") + "\n\n");
+            await Write(ctx, "event: received\ndata: " + InJson("in7") + "\n\n");
+            await Hold(ctx);
+        };
+        var rt = Make();
+        int changes = 0;
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => LastLoad(rt) != null);
+        await Settle();
+        _owner.Invoke(() => rt.MonitorChanged += () => changes++);
+        go.SetResult();
+        await WaitFor(() => _owner.Invoke(() => rt.Monitor.Inbox.Any(r => r.Id == "in7")));
+        _owner.Drain();
+        Assert.Contains(_owner.Invoke(() => rt.Monitor.Jobs), r => r.Id == "lf5" && r.Badge == "Sent");
+        Assert.Equal(2, _owner.Invoke(() => changes));
+    }
+
+    [Fact]
+    public async Task A_failed_load_is_surfaced_once_and_cleared_by_the_next_good_one()
+    {
+        int inboxCalls = 0;
+        _inbox = ctx =>
+        {
+            if (Interlocked.Increment(ref inboxCalls) > 1) return FakeServer.Json(ctx, List(InJson("in1")));
+            ctx.Response.StatusCode = 500;
+            ctx.Response.Close();
+            return Task.CompletedTask;
+        };
+        var drop = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _events = async (n, ctx, _) =>
+        {
+            Open(ctx);
+            await Write(ctx, ": hello\n\n");
+            if (n == 0) { await drop.Task; ctx.Response.Abort(); return; }
+            await Hold(ctx);
+        };
+        var rt = Make();
+        var failures = new ConcurrentQueue<Exception>();
+        rt.MonitorLoadFailed += failures.Enqueue;
+        _owner.Invoke(() => rt.Start());
+        await WaitFor(() => !failures.IsEmpty);
+        await Settle();
+        Assert.Equal(500, Assert.IsType<FaxApiException>(Assert.Single(failures)).StatusCode);
+        Assert.NotNull(_owner.Invoke(() => rt.MonitorLoadError)); // for a window opened later
+        lock (_log) Assert.Contains(_log, l => l.StartsWith("ERROR monitor"));
+
+        drop.SetResult(); // the reconnect loads again, in full: nothing was loaded
+        await WaitFor(() => LastLoad(rt) != null);
+        _owner.Drain();
+        Assert.Single(failures);
+        Assert.Null(_owner.Invoke(() => rt.MonitorLoadError));
+        Assert.Equal(2, FullLoads());
+    }
+
     // ---- helpers ----
 
     /// <summary>Tracks a send the server knows as <paramref name="serverId"/>, as the send executor does once it is accepted.</summary>
@@ -802,6 +1002,17 @@ public sealed class ClientRuntimeTests : IDisposable
 
     private string[] CatchUps() => _srv.Requests.Select(r => r.PathAndQuery)
         .Where(p => p.StartsWith("/jobs?direction=in")).ToArray();
+
+    /// <summary>The monitor's full loads (the outbound half; the inbox half follows each one that answered).</summary>
+    private int FullLoads() => _srv.Requests.Count(r => r.PathAndQuery.StartsWith("/jobs?direction=out"));
+
+    /// <summary>The monitor's since-loads: both directions, so no direction parameter.</summary>
+    private string[] SinceLoads() => _srv.Requests.Select(r => Uri.UnescapeDataString(r.PathAndQuery))
+        .Where(p => p.StartsWith("/jobs?limit=")).ToArray();
+
+    private DateTimeOffset? LastLoad(ClientRuntime rt) => _owner.Invoke(() => rt.Monitor.LastLoad);
+
+    private static string List(params string[] jobs) => "{\"jobs\":[" + string.Join(",", jobs) + "]}";
 
     private int Polls() => _srv.Requests.Count(r => r.PathAndQuery == "/jobs/lf1");
 

@@ -10,8 +10,10 @@ public sealed record RuntimeStart(IReadOnlyList<SendRequest> Unsent, PrinterStat
 /// <summary>
 /// Everything the client does that is not UI, owned once per process and shared by the tray and any window: the
 /// API clients, the one event stream for the app's lifetime (and its restart on a settings save), the connection and
-/// server-status snapshot, the job tracker and its poll, the inbound catch-up, the print listener with its watch and
-/// stop, and the printer and stuck-print-job checks.
+/// server-status snapshot (arm state included: the stream's and an arm call's answer, <see cref="NoteArm"/>), the
+/// monitor's rows and their loads (<see cref="Monitor"/>, kept whether or not a window shows them), the job tracker and
+/// its poll, the inbound catch-up, the print listener with its watch and stop, and the printer and stuck-print-job
+/// checks.
 /// <para>
 /// Threading: one owner thread, named by the one <see cref="SynchronizationContext"/> the runtime is given. Its Post
 /// must run each callback on that thread, in order (the WinForms UI thread's context does). Stream, listener and timer
@@ -56,6 +58,7 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
     /// </summary>
     private int _streamGeneration;
     private Task? _sseTask;
+    private readonly MonitorLoader _loader;
     private InboundAnnouncer? _inbound;
     private InboundCatchUp? _catchUp;
     private IPrintListener? _listener;
@@ -80,6 +83,8 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
         _owner = owner;
         Api = new FaxApi(cfg, _http) { Log = m => Info("api: " + m) };
         Tracker = new JobTracker(cfg.SpoolDir, m => Info("tracker: " + m));
+        Monitor = new MonitorModel(TimeZoneInfo.Local);
+        _loader = new MonitorLoader(Monitor, () => Api, OnMonitorLoaded, OnMonitorLoadFailed);
         _events = CreateEventStream();
     }
 
@@ -112,6 +117,19 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
     public IMonitorApi MonitorApi => Api;
     /// <summary>Owner thread only (the send dialog records its sends here).</summary>
     public JobTracker Tracker { get; }
+    /// <summary>
+    /// The monitor's rows and pill/countdown texts, owner thread only. Loaded in full at the first connect (and the
+    /// first after a restart), from the last load at every reconnect, from the server's <c>since</c> at a resync; fed
+    /// every live job and received update in between. <see cref="MonitorChanged"/> says when to redraw.
+    /// </summary>
+    public MonitorModel Monitor { get; }
+    /// <summary>The last monitor load's failure, until a load succeeds or a restart (for a window opened after it).</summary>
+    public Exception? MonitorLoadError { get; private set; }
+    /// <summary>
+    /// Bumped by every <see cref="RestartStream"/> (a settings save may name another server): an arm call asked before
+    /// a bump answers for the old server, so its answer is not given to <see cref="NoteArm"/>.
+    /// </summary>
+    public int ServerGeneration => Volatile.Read(ref _streamGeneration);
 
     // ---- snapshot (for a window that opens later) ----
 
@@ -162,19 +180,28 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
     public event Action<string>? Notice;
     /// <summary>
     /// Every outbound job update, terminal or not: stream events, poll results and a send just accepted. Raised before
-    /// the tracker sees it (so before <see cref="JobFinished"/>); for the jobs grid.
+    /// the tracker sees it (so before <see cref="JobFinished"/>), after <see cref="Monitor"/> took it.
     /// </summary>
     public event Action<Job>? JobChanged;
     /// <summary>
-    /// Every received-fax event from the stream, announced before or not; raised before <see cref="FaxReceived"/>.
-    /// For the inbox grid (the catch-up's list is raised only through <see cref="FaxesCaughtUp"/>).
+    /// Every received-fax event from the stream, announced before or not; raised before <see cref="FaxReceived"/>,
+    /// after <see cref="Monitor"/> took it (the catch-up's list is raised only through <see cref="FaxesCaughtUp"/>).
     /// </summary>
     public event Action<Job>? InboxChanged;
     /// <summary>
-    /// A <c>resync</c> event (the server's replay gap was too large), with its <c>since</c>; raised after the poll and
-    /// the inbound catch-up started. The monitor's grids reload from it.
+    /// A <c>resync</c> event (the server's replay gap was too large), with its <c>since</c>; raised after the poll, the
+    /// inbound catch-up and the monitor's reload started.
     /// </summary>
     public event Action<DateTimeOffset?>? Resynced;
+    /// <summary>
+    /// <see cref="Monitor"/>'s rows may have changed: a live update moved one, a load landed, or a restart cleared them.
+    /// </summary>
+    public event Action? MonitorChanged;
+    /// <summary>
+    /// A monitor load failed for the current server (at most once per load request, however many of its passes fail);
+    /// also kept in <see cref="MonitorLoadError"/>.
+    /// </summary>
+    public event Action<Exception>? MonitorLoadFailed;
 
     // ---- lifecycle ----
 
@@ -261,6 +288,7 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
         if (_stopped) return;
         _stopped = true;
         StopTimers();
+        _loader.Stop();
         _sseCts?.Cancel();
         _listenerWatch.StoppedOnPurpose();
         if (_listener is { } l) await Task.Run(l.Stop);
@@ -285,6 +313,7 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
         {
             _stopped = true;
             StopTimers();
+            _loader.Stop();
             _sseCts?.Cancel();
             _listenerWatch.StoppedOnPurpose();
             try { _listener?.Stop(); }
@@ -310,8 +339,8 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
     /// Handlers capture the live run's token when the event is raised (on the stream's thread), so what a cancelled
     /// run raises is dropped even if it reaches the owner thread after the next run started. Job and received events
     /// still reach the tracker and the announcer: the stream already counted them in LastEventId, so they would not be
-    /// replayed. Only their pass-through to the grids (<see cref="JobChanged"/>, <see cref="InboxChanged"/>) is
-    /// dropped: the save may have switched servers, and the monitor has just cleared its grids for the new one.
+    /// replayed. Only their way into <see cref="Monitor"/> (and <see cref="JobChanged"/>, <see cref="InboxChanged"/>) is
+    /// dropped: the save may have switched servers, and the restart has just cleared the monitor for the new one.
     /// </summary>
     private EventStream CreateEventStream()
     {
@@ -322,6 +351,7 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
             SetConnected(true);
             _ = PollTrackedAsync(); // catch up on anything that finished while disconnected
             _ = CatchUpInboundAsync(null); // and on faxes received meanwhile (or while the app was not running)
+            _ = ReloadMonitorAsync(null); // full the first time (nothing loaded yet), else since the last load
         });
         es.Disconnected += e => PostLive(() =>
         {
@@ -337,22 +367,18 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
             Info($"event stream: resync requested (since {since?.ToString("o") ?? "unknown"}); reloading jobs and inbox");
             _ = PollTrackedAsync();
             _ = CatchUpInboundAsync(since);
+            _ = ReloadMonitorAsync(since);
             Raise(Resynced, since);
         });
         es.StatusChanged += el => PostLive(() =>
         {
             var arm = Status.Arm;
             Status = Status.Merge(el);
+            Monitor.NoteStatus(Status, DateTimeOffset.UtcNow); // the receiving flag's TTL clock
             Raise(StatusChanged, Status);
             if (Status.Arm != arm) Raise(ArmChanged, Status.Arm);
         });
-        es.ArmChanged += a => PostLive(() =>
-        {
-            if (a == Status.Arm) return;
-            Status = Status with { Arm = a };
-            Raise(StatusChanged, Status);
-            Raise(ArmChanged, a);
-        });
+        es.ArmChanged += a => PostLive(() => NoteArm(a));
         es.JobChanged += j =>
         {
             var ct = LiveStreamToken; // read on the stream's thread, at raise time
@@ -363,7 +389,11 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
             var ct = LiveStreamToken;
             Post(() =>
             {
-                if (!ct.IsCancellationRequested) Raise(InboxChanged, j);
+                if (!ct.IsCancellationRequested)
+                {
+                    ApplyToMonitor(j);
+                    Raise(InboxChanged, j);
+                }
                 if (_inbound?.TryAnnounce(j) == true) Raise(FaxReceived, j);
             });
         };
@@ -372,8 +402,9 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
 
     /// <summary>
     /// (Re)starts the one <see cref="EventStream"/>: cancels the current run, waits for it to end (one run at a time,
-    /// so LastEventId has a single writer), then runs again with a new token if a token is configured. The snapshot is
-    /// reset: the settings may name another server, and the new run's connect brings the full status again.
+    /// so LastEventId has a single writer), then runs again with a new token if a token is configured. The snapshot and
+    /// <see cref="Monitor"/> are reset (a load in flight lands nowhere): the settings may name another server, and the
+    /// new run's connect brings the full status and a full load again.
     /// </summary>
     public void RestartStream()
     {
@@ -384,6 +415,9 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
         Interlocked.Increment(ref _streamGeneration);
         SetConnected(false);
         ResetStatus();
+        _loader.ServerChanged();
+        MonitorLoadError = null;
+        Raise(MonitorChanged);
         // Nothing to authenticate with, a token that cannot be sent, or nowhere to connect: do not run.
         bool run = !string.IsNullOrEmpty(Config.Token) && ClientConfig.TokenError(Config.Token) == null && Config.EndpointError() == null;
         var cts = run ? new CancellationTokenSource() : null;
@@ -415,6 +449,20 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
         if (Status.Arm != arm) Raise(ArmChanged, Status.Arm);
     }
 
+    /// <summary>
+    /// An arm state the server just gave: an arm, test-window or disarm call's answer (shown at once, before the
+    /// stream's arm event confirms it), or that arm event itself. Raises <see cref="StatusChanged"/> and
+    /// <see cref="ArmChanged"/> when it differs from <see cref="Arm"/>; nothing when equal or stopped. The caller drops
+    /// an answer asked before a restart (<see cref="ServerGeneration"/>): it is the old server's.
+    /// </summary>
+    public void NoteArm(ArmState answer)
+    {
+        if (_stopped || answer == Status.Arm) return;
+        Status = Status with { Arm = answer };
+        Raise(StatusChanged, Status);
+        Raise(ArmChanged, answer);
+    }
+
     private void SetConnected(bool connected)
     {
         Connected = connected;
@@ -437,12 +485,16 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
 
     /// <summary>
     /// As <see cref="ApplyJobUpdate(Job)"/>; an update that is not <paramref name="live"/> (from a stream run that a
-    /// restart cancelled since, or a poll answer to a question asked before a restart) skips <see cref="JobChanged"/> but still reaches the
-    /// tracker.
+    /// restart cancelled since, or a poll answer to a question asked before a restart) skips <see cref="Monitor"/> and
+    /// <see cref="JobChanged"/> but still reaches the tracker.
     /// </summary>
     private void ApplyJobUpdate(Job j, bool live)
     {
-        if (live) Raise(JobChanged, j);
+        if (live)
+        {
+            ApplyToMonitor(j);
+            Raise(JobChanged, j);
+        }
         if (!j.IsTerminal) return;
         if (Tracker.OnJobUpdate(j) is { } r)
         {
@@ -495,6 +547,39 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
     /// </summary>
     public Task CatchUpInboundAsync(DateTimeOffset? since) =>
         _stopped || _catchUp == null || string.IsNullOrEmpty(Config.Token) ? Task.CompletedTask : _catchUp.RunAsync(since);
+
+    // ---- monitor ----
+
+    /// <summary>A live update into <see cref="Monitor"/>; <see cref="MonitorChanged"/> when a row moved. Not after the stop.</summary>
+    private void ApplyToMonitor(Job j)
+    {
+        if (!_stopped && Monitor.Apply(j)) Raise(MonitorChanged);
+    }
+
+    /// <summary>
+    /// One load request (<see cref="MonitorLoader"/> coalesces those that arrive while one runs). The loader handles
+    /// the API's own failures; anything else is logged here rather than left on a task nobody awaits.
+    /// </summary>
+    private async Task ReloadMonitorAsync(DateTimeOffset? since)
+    {
+        try { await _loader.ReloadAsync(since); }
+        catch (Exception e) { if (!_stopped) Error("monitor: load failed unexpectedly", e); }
+    }
+
+    private void OnMonitorLoaded()
+    {
+        MonitorLoadError = null;
+        Raise(MonitorChanged);
+    }
+
+    private void OnMonitorLoadFailed(Exception e)
+    {
+        MonitorLoadError = e;
+        // A refused token is the stream's Unauthorized notice too (logged there); the window shows its token line.
+        if (e is FaxApiUnauthorizedException) Info("monitor: loading the job lists refused (401)");
+        else Error("monitor: loading the job lists failed", e);
+        Raise(MonitorLoadFailed, e);
+    }
 
     /// <summary>The server has no such job (its database was reset): stop polling and give the document back.</summary>
     private void OnJobUnknown(string serverId)

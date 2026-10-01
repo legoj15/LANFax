@@ -75,6 +75,23 @@ public sealed class MonitorLoaderTests
     }
 
     [Fact]
+    public async Task Two_failed_passes_in_one_reload_report_the_failure_once()
+    {
+        var full = _api.HoldNextFullLoad();
+        var loader = Make();
+        var first = loader.ReloadAsync(null);
+        await loader.ReloadAsync(T0); // queued behind the failing load
+        _api.FullAnswer = () => Task.FromException<IReadOnlyList<Job>>(new FaxApiException(0, "still unreachable"));
+        full.SetException(new FaxApiException(0, "cannot reach faxd"));
+        await first;
+        Assert.Equal(2, _api.FullLoads); // both passes ran and both failed
+        Assert.Equal("cannot reach faxd", Assert.Single(_failures).Message); // one message for one reload, the first
+
+        await loader.ReloadAsync(null); // a later reload is a new call: its failure is reported again
+        Assert.Equal(2, _failures.Count);
+    }
+
+    [Fact]
     public async Task A_stale_load_that_fails_after_ServerChanged_still_runs_the_load_queued_for_the_new_server()
     {
         var full = _api.HoldNextFullLoad();

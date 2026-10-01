@@ -359,9 +359,11 @@ internal sealed class TrayContext : ApplicationContext
             "The fax line will answer incoming calls for the next 20 minutes so you can test receiving a fax. Continue?",
             "Receive a test", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
         if (r != DialogResult.OK) return;
+        int gen = _runtime.ServerGeneration;
         try
         {
             var arm = await _runtime.Api.ReceiveTestAsync(20);
+            if (gen == _runtime.ServerGeneration) _runtime.NoteArm(arm); // the window's card and the expiry check, at once
             var until = arm.Until ?? DateTimeOffset.Now.AddMinutes(20);
             Balloon(NotificationText.ReceiveArmed(until));
         }
@@ -399,8 +401,7 @@ internal sealed class TrayContext : ApplicationContext
             if (dlg.ShowDialog() == DialogResult.OK)
             {
                 FileLog.Info($"settings saved: {_cfg.Server}:{_cfg.Port}, token set={!string.IsNullOrEmpty(_cfg.Token)}");
-                _monitor?.ServerChanged(); // maybe another server: its rows load on the next connect
-                _runtime.SettingsSaved();
+                _runtime.SettingsSaved(); // maybe another server: rows and arm state reset, the next connect loads afresh
             }
         }
         finally { _settingsOpen = false; }

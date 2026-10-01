@@ -6,10 +6,10 @@ using LANFax.Core;
 namespace LANFax.App;
 
 /// <summary>
-/// The monitor window, a thin view over <see cref="IMonitorSource"/> (the runtime) and <see cref="MonitorModel"/>:
-/// status pill, arm card with countdown and buttons, jobs grid, inbox grid; double-click opens a fax's PDF. One
-/// instance, owned by the tray: the user's close hides it, the app lives in the tray. UI thread only (the runtime's
-/// owner thread); public only so the smoke test can build it.
+/// The monitor window, a pure view over <see cref="IMonitorSource"/> (the runtime, which owns the rows, their loads and
+/// the arm state): status pill, arm card with countdown and buttons, jobs grid, inbox grid; double-click opens a fax's
+/// PDF. One instance, owned by the tray: the user's close hides it, the app lives in the tray. UI thread only (the
+/// runtime's owner thread); public only so the smoke test can build it.
 /// </summary>
 public sealed class MainForm : Form
 {
@@ -18,7 +18,6 @@ public sealed class MainForm : Form
     private const string Hint = "Double-click a fax to open its PDF.";
 
     private readonly IMonitorSource _src;
-    private readonly MonitorModel _model = new(TimeZoneInfo.Local);
     private readonly Action? _openSettings;
     private readonly Icon _icon = IconFactory.Create(true);
     private readonly Label _pill = new() { AutoSize = true, Padding = new Padding(8, 3, 8, 3), Anchor = AnchorStyles.Right, Font = new Font(SystemFonts.MessageBoxFont!, FontStyle.Bold) };
@@ -29,11 +28,9 @@ public sealed class MainForm : Form
     private readonly DataGridView _jobsGrid = MakeGrid(("Time", 22), ("To", 22), ("State", 16), ("Pages", 10), ("Error", 40));
     private readonly DataGridView _inboxGrid = MakeGrid(("Time", 30), ("From", 50), ("Pages", 20));
     private readonly System.Windows.Forms.Timer _tick = new() { Interval = 1000 };
-    private readonly MonitorLoader _loader;
     private readonly PdfOpener _pdf;
-    private ArmState _arm;
-    /// <summary>Bumped by <see cref="ServerChanged"/>: an arm call asked before it answers for the old server.</summary>
-    private int _serverGeneration;
+    /// <summary>The message line shows a load failure (cleared once a load succeeds, unless something else was said since).</summary>
+    private bool _showingLoadError;
 
     /// <param name="src">The runtime (its events arrive on this thread).</param>
     /// <param name="cacheDir">Where opened PDFs are downloaded; <see cref="MonitorModel.DefaultCacheDir"/> by default.</param>
@@ -43,9 +40,7 @@ public sealed class MainForm : Form
     {
         _src = src;
         _openSettings = openSettings;
-        _arm = src.Status.Arm;
-        _loader = new MonitorLoader(_model, () => _src.MonitorApi, OnLoaded, OnLoadFailed);
-        _pdf = new PdfOpener(() => _src.MonitorApi, cacheDir ?? MonitorModel.DefaultCacheDir, openFile ?? ShellOpen);
+        _pdf =new PdfOpener(() => _src.MonitorApi, cacheDir ?? MonitorModel.DefaultCacheDir, openFile ?? ShellOpen);
 
         Text = "LANFax";
         Icon = _icon;
@@ -93,13 +88,14 @@ public sealed class MainForm : Form
 
         _src.ConnectionChanged += OnConnectionChanged;
         _src.StatusChanged += OnStatusChanged;
-        _src.JobChanged += OnJob;
-        _src.InboxChanged += OnJob;
-        _src.Resynced += OnResynced;
-        _model.NoteStatus(src.Status, DateTimeOffset.UtcNow);
-        _message.Text = Hint;
+        _src.MonitorChanged += OnMonitorChanged;
+        _src.MonitorLoadFailed += OnLoadFailed;
+        // Opened after the runtime has been running: show what it has, including a load that already failed.
+        if (src.MonitorLoadError is { } failed) OnLoadFailed(failed);
+        else _message.Text = Hint;
         RenderPill();
         RenderArm();
+        RenderGrids();
     }
 
     /// <summary>Rows in the jobs grid (the smoke test reads it).</summary>
@@ -110,29 +106,11 @@ public sealed class MainForm : Form
     internal DataGridView JobsGrid => _jobsGrid;
     /// <summary>The arm card's title, for the smoke test.</summary>
     internal string ArmTitleText => _armState.Text;
+    /// <summary>The message line, for the smoke test.</summary>
+    internal string MessageText => _message.Text;
     /// <summary>Set by the tray at exit: a close then really closes instead of hiding.</summary>
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     public bool AllowClose { get; set; }
-
-    /// <summary>
-    /// The settings may name another server: drop the rows and the arm card (an arm call's answer is not in the
-    /// runtime's status, so the runtime's reset may raise nothing); the stream's next connect loads afresh.
-    /// </summary>
-    public void ServerChanged()
-    {
-        _serverGeneration++;
-        _loader.ServerChanged();
-        _arm = ServerStatus.Empty.Arm;
-        RenderGrids();
-        RenderArm();
-        RenderPill();
-    }
-
-    protected override void OnLoad(EventArgs e)
-    {
-        base.OnLoad(e);
-        _ = _loader.ReloadAsync(null); // the first load is a full one
-    }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
@@ -151,10 +129,8 @@ public sealed class MainForm : Form
         {
             _src.ConnectionChanged -= OnConnectionChanged;
             _src.StatusChanged -= OnStatusChanged;
-            _src.JobChanged -= OnJob;
-            _src.InboxChanged -= OnJob;
-            _src.Resynced -= OnResynced;
-            _loader.Stop();
+            _src.MonitorChanged -= OnMonitorChanged;
+            _src.MonitorLoadFailed -= OnLoadFailed;
             _tick.Dispose();
             _icon.Dispose();
         }
@@ -163,44 +139,26 @@ public sealed class MainForm : Form
 
     // ---- runtime events (UI thread) ----
 
-    private void OnConnectionChanged(bool connected)
-    {
-        RenderPill();
-        if (connected && IsHandleCreated) _ = _loader.ReloadAsync(null); // whatever changed while disconnected
-    }
+    private void OnConnectionChanged(bool connected) => RenderPill();
 
     private void OnStatusChanged(ServerStatus s)
     {
-        _model.NoteStatus(s, DateTimeOffset.UtcNow);
-        _arm = s.Arm;
         RenderPill();
         RenderArm();
     }
 
-    private void OnJob(Job j)
-    {
-        if (_model.Apply(j)) RenderGrids();
-    }
-
-    private void OnResynced(DateTimeOffset? since)
-    {
-        if (IsHandleCreated) _ = _loader.ReloadAsync(since);
-    }
-
-    // ---- loading (MonitorLoader) ----
-
-    private void OnLoaded()
+    private void OnMonitorChanged()
     {
         if (IsDisposed) return;
         RenderGrids();
-        _message.Text = Hint;
+        if (_showingLoadError && _src.MonitorLoadError == null) Say(Hint); // a load succeeded since
     }
 
+    /// <summary>The runtime logged it; the window says it.</summary>
     private void OnLoadFailed(Exception e)
     {
-        if (e is FaxApiUnauthorizedException) { Say(NotificationText.WindowUnauthorized); return; }
-        FileLog.Error("monitor: loading the job lists failed", e);
-        Say("Could not load the job lists: " + e.Message);
+        Say(e is FaxApiUnauthorizedException ? NotificationText.WindowUnauthorized : "Could not load the job lists: " + e.Message);
+        _showingLoadError = true;
     }
 
     // ---- actions ----
@@ -214,31 +172,31 @@ public sealed class MainForm : Form
     }
 
     /// <summary>
-    /// Arm, test window or disarm: the answer shows at once; the stream's arm event confirms it. An answer (or error)
-    /// that lands after <see cref="ServerChanged"/> is the old server's and is not shown.
+    /// Arm, test window or disarm: the answer goes into the runtime's status at once (<see cref="IMonitorSource.NoteArm"/>,
+    /// which redraws the card); the stream's arm event confirms it. An answer (or error) that lands after a settings
+    /// save (<see cref="IMonitorSource.ServerGeneration"/> moved) is the old server's and is not noted or shown.
     /// </summary>
     private async Task ArmCallAsync(Func<Task<ArmState>> call, string what)
     {
         foreach (var b in _armButtons) b.Enabled = false;
-        int gen = _serverGeneration;
+        int gen = _src.ServerGeneration;
         try
         {
             var answer = await call();
-            if (IsDisposed || gen != _serverGeneration) return; // saved meanwhile: the old server's answer
-            _arm = answer;
-            _message.Text = Hint;
-            RenderArm();
+            if (IsDisposed || gen != _src.ServerGeneration) return; // saved meanwhile: the old server's answer
+            _src.NoteArm(answer);
+            Say(Hint);
         }
         catch (FaxApiUnauthorizedException)
         {
-            if (gen != _serverGeneration) return; // the old server refused the old token: the save already answered it
+            if (gen != _src.ServerGeneration) return; // the old server refused the old token: the save already answered it
             Say(NotificationText.WindowUnauthorized);
             _openSettings?.Invoke();
         }
         catch (Exception e) when (e is FaxApiException or JsonException)
         {
             FileLog.Error($"monitor: {what} failed", e);
-            if (gen == _serverGeneration) Say($"{what} failed: {e.Message}");
+            if (gen == _src.ServerGeneration) Say($"{what} failed: {e.Message}");
         }
         finally
         {
@@ -258,7 +216,7 @@ public sealed class MainForm : Form
         Say("Downloading the PDF...");
         var r = await _pdf.OpenAsync(id);
         if (r == null || IsDisposed) return;
-        _message.Text = r.Message ?? Hint;
+        Say(r.Message ?? Hint);
     }
 
     private static void ShellOpen(string path)
@@ -270,13 +228,15 @@ public sealed class MainForm : Form
 
     private void Say(string text)
     {
-        if (!IsDisposed) _message.Text = text;
+        if (IsDisposed) return;
+        _message.Text = text;
+        _showingLoadError = false;
     }
 
     private void RenderPill()
     {
         var now = DateTimeOffset.UtcNow;
-        var p = MonitorModel.PillFor(_src.Connected, _src.EverConnected, _src.Status, _model.IsReceiving(_src.Status, now));
+        var p = MonitorModel.PillFor(_src.Connected, _src.EverConnected, _src.Status, _src.Monitor.IsReceiving(_src.Status, now));
         _pill.Text = p.Text;
         (_pill.BackColor, _pill.ForeColor) = p.Tone switch
         {
@@ -288,15 +248,16 @@ public sealed class MainForm : Form
 
     private void RenderArm()
     {
-        _armState.Text = MonitorModel.ArmTitle(_arm);
-        _armState.ForeColor = _arm.Armed ? Color.FromArgb(20, 120, 50) : SystemColors.ControlText;
-        _armDetail.Text = _model.ArmDetail(_arm, DateTimeOffset.UtcNow);
+        var arm = _src.Status.Arm;
+        _armState.Text = MonitorModel.ArmTitle(arm);
+        _armState.ForeColor = arm.Armed ? Color.FromArgb(20, 120, 50) : SystemColors.ControlText;
+        _armDetail.Text = _src.Monitor.ArmDetail(arm, DateTimeOffset.UtcNow);
     }
 
     private void RenderGrids()
     {
-        Fill(_jobsGrid, _model.Jobs, r => [r.Time, r.Party, r.Badge, r.Pages, r.Error], badgeColumn: 2);
-        Fill(_inboxGrid, _model.Inbox, r => [r.Time, r.Party, r.Pages], badgeColumn: -1);
+        Fill(_jobsGrid, _src.Monitor.Jobs, r => [r.Time, r.Party, r.Badge, r.Pages, r.Error], badgeColumn: 2);
+        Fill(_inboxGrid, _src.Monitor.Inbox, r => [r.Time, r.Party, r.Pages], badgeColumn: -1);
     }
 
     /// <summary>Rebuilds a grid (at most <see cref="MonitorModel.Capacity"/> rows), keeping the selected fax selected and, when scrolled down, the top visible fax on top.</summary>

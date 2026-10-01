@@ -544,12 +544,13 @@ client/
 
 ## Monitor (phase 3)
 
-Built 2026-10-01: `MainForm` (thin WinForms view), `Logic/MonitorModel.cs`
-(view-model, no UI, tested), `Logic/MonitorLoader.cs` (the loads, tested in
-`MonitorLoaderTests`), `Logic/PdfOpener.cs` (double-click to PDF, tested in
-`PdfOpenerTests` against FakeServer and the real `FaxApi`) and
-`Logic/IMonitorSource.cs` (what the form needs from `ClientRuntime`; the
-smoke test fakes it).
+Built 2026-10-01: `MainForm` (pure WinForms view, no state of its own),
+`Logic/MonitorModel.cs` (view-model, no UI, tested), `Logic/MonitorLoader.cs`
+(the loads, owned by `ClientRuntime`, tested in `MonitorLoaderTests` and
+through the runtime in `ClientRuntimeTests`), `Logic/PdfOpener.cs`
+(double-click to PDF, tested in `PdfOpenerTests` against FakeServer and the
+real `FaxApi`) and `Logic/IMonitorSource.cs` (what the form needs from
+`ClientRuntime`; the smoke test fakes it).
 
 - **Runtime underneath.** `ClientRuntime` owns the non-UI state the tray and
   the form share. It merges `status` and `arm` events into a `Status` / `Arm`
@@ -558,17 +559,29 @@ smoke test fakes it).
   window opened later reads the snapshot. No `GET /status` at connect: faxd's
   stream opens with a full `status` and an `arm` event. While disconnected the
   snapshot is the last one known; `RestartStream` (settings save) resets it to
-  `ServerStatus.Empty`. For the grids: `JobChanged` passes every job update
-  through (stream, poll, a send just accepted; before the tracker, so before
-  `JobFinished`), `InboxChanged` every `received` event (before
-  `FaxReceived`), and `Resynced(since)` every `resync` event (after the
-  tracked-job poll and the inbound catch-up started). Not passed through: a
-  job or received event from a run a restart cancelled, or a poll answer to
-  a request made before a restart (the save may have switched servers, and
-  the window just cleared its grids); those still reach the tracker,
-  `JobFinished` and the announcer. A poll asked after a restart is live even
-  when the restart started no run (unusable settings): poll liveness is a
-  restart counter, not the stream run's token.
+  `ServerStatus.Empty`. The arm state lives only in `Status.Arm`: an arm,
+  test-window or disarm call's HTTP answer (window buttons, the tray's
+  "Receive a test") goes in through `ClientRuntime.NoteArm(answer)`, which
+  raises `StatusChanged` and `ArmChanged` when it differs, as the stream's
+  `arm` event does; a caller drops an answer asked before a restart
+  (`ServerGeneration`, bumped by every `RestartStream`).
+  The runtime also owns the monitor's rows (`Monitor`, a `MonitorModel`, kept
+  whether or not a window is open) and their `MonitorLoader`: it loads on
+  every connect and resync (see Loads), feeds every live job update (stream,
+  poll, a send just accepted) and `received` event into it, and raises
+  `MonitorChanged` whenever rows may have changed (a row moved, a load
+  landed, a restart cleared them) and `MonitorLoadFailed(e)` for a failed
+  load (kept in `MonitorLoadError` until a load succeeds, for a window opened
+  later; logged by the runtime, a 401 only as info). `JobChanged` (before the
+  tracker, so before `JobFinished`), `InboxChanged` (before `FaxReceived`)
+  and `Resynced(since)` stay as runtime events for the tray and tests; the
+  window does not use them. Not applied to `Monitor` (nor raised as
+  `JobChanged`/`InboxChanged`): a job or received event from a run a restart
+  cancelled, or a poll answer to a request made before a restart (the save
+  may have switched servers, and the restart just cleared the rows); those
+  still reach the tracker, `JobFinished` and the announcer. A poll asked
+  after a restart is live even when the restart started no run (unusable
+  settings): poll liveness is a restart counter, not the stream run's token.
 - **Threading.** The runtime takes the owner (UI) thread's
   `SynchronizationContext` (callbacks are posted through it; `Start` throws
   unless it runs under it) and exposes it as `Owner`; the tray posts through
@@ -582,10 +595,16 @@ smoke test fakes it).
   it is open. "Open web page" keeps the browser route. The user's close
   (`CloseReason.UserClosing`) hides it; sign-out and shutdown close it for
   real (so it never refuses `WM_QUERYENDSESSION`), and the tray's Exit hides
-  then disposes it. Saving Settings calls `MainForm.ServerChanged` (rows
-  dropped, the next load is full, the arm card back to Disarmed; an arm
-  call's answer or error landing after it is the old server's and is not
-  shown) before `SettingsSaved`.
+  then disposes it. Saving Settings calls `SettingsSaved`, whose
+  `RestartStream` resets the status (the arm card back to Disarmed, even
+  after a noted arm answer), clears the rows (`MonitorChanged`; the next
+  load is full, a load in flight lands nowhere) and bumps
+  `ServerGeneration` (an arm call's answer or error landing after it is the
+  old server's and is neither noted nor shown). The window opens on the
+  runtime's current rows, status and last load failure, and renders on
+  `ConnectionChanged`, `StatusChanged`, `MonitorChanged` and
+  `MonitorLoadFailed`; a load failure on the message line is replaced by the
+  hint once a load succeeds.
 - **Layout, mirroring the web page.** Header pill; "Receive faxes" card with
   ARMED/Disarmed, the countdown line and Arm 1 h / 4 h / 8 h, Test window
   (20 min, `POST /test/receive`), Disarm (no confirm, as on the page); "Sent
@@ -624,8 +643,8 @@ smoke test fakes it).
   - Countdown: "Receiving until HH:mm (mm:ss left)", `h:mm:ss` from an hour,
     "(ending)" once past; "Receiving on ext N" without an end; "Send-only.
     Inbound calls go to the phones." when disarmed. A 1 s timer ticks it only
-    while the window is visible. An arm button shows its answer at once; the
-    stream's arm event follows.
+    while the window is visible. An arm button shows its answer at once
+    (`NoteArm`); the stream's arm event follows and changes nothing more.
   - Rows merge by id into the grid their direction names, newest first by
     `created_at`, capped at 200; an update older (`updated_at`) than the row
     is ignored, so a slow reload never undoes a newer event; at an equal
@@ -635,7 +654,8 @@ smoke test fakes it).
     state; an equal state still applies (faxd's annotate event adds pages and
     detail, and `received` adds `finished_at`, with no state change), and an
     update identical to the row is a no-op. Rows an answer omits stay.
-  - Loads: the first (and after `ServerChanged`) is full: `GET
+  - Loads (started by the runtime, never the window): the first connect's
+    (and the first after a restart) is full: `GET
     /jobs?direction=out&limit=50` + `GET /inbox?limit=50`. On every
     reconnect: `GET /jobs?limit=500&updated_since=<last load start - 5 min>`
     (both directions; the 5 min `SkewMargin` absorbs a client clock ahead of
@@ -648,8 +668,15 @@ smoke test fakes it).
     flight across `ServerChanged` lands nowhere. A failed load still runs
     the pass queued behind it, once, from the queued `since` (the reconnect,
     resync or new server's connect that queued it will not come again; a
-    failure of a load already dropped by `ServerChanged` is not shown); a
-    401 shows the token line.
+    failure of a load already dropped by `ServerChanged` is not shown). A
+    failure is reported once per load request, however many of its passes
+    fail. A 401 shows the token line. A `resync` still fetches twice: this
+    since-load and the inbound catch-up (`GET
+    /jobs?direction=in&state=received`, 100 then 1000); they are kept apart
+    on purpose (the catch-up's baseline is decided before its request, it is
+    paged to faxd's cap and must run even when the monitor has nothing
+    loaded, which makes the monitor's load a full one that does not cover the
+    gap).
   - Grids are rebuilt on every change; the selected fax stays selected. A
     view scrolled down keeps its top visible fax on top (by id), so a new
     fax arriving does not shift it; a view at the top stays at the top, so
@@ -663,12 +690,12 @@ smoke test fakes it).
 - "Send a test page..." in the tray opens `SendDialog` in test-page mode:
   number prompt -> `POST /test/send`.
 - "Receive a test" in the tray: confirm -> `POST /test/receive
-  {"minutes": 20}` -> balloon with the end time; the window's arm card shows
-  the countdown once the stream's arm event arrives.
+  {"minutes": 20}` -> balloon with the end time; the answer is noted
+  (`NoteArm`), so the window's arm card shows the countdown at once.
 - One `EventStream` for the app's lifetime; a Settings save cancels the run,
   waits for it and starts again so `LastEventId` survives; a cancelled run's
   connected/disconnected/resync/status/arm events are dropped (job and
-  received still reach the tracker and the announcer, not the grids). Stall: no line for 45 s aborts and reconnects with
+  received still reach the tracker and the announcer, not the monitor's rows). Stall: no line for 45 s aborts and reconnects with
   `Last-Event-ID`.
 - `FaxApi`, `EventStream` and `PrintPipeListener` each take an optional
   `Log`; none ever passes the token to it.

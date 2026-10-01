@@ -4,14 +4,17 @@ using LANFax.Core;
 namespace LANFax.App.Logic;
 
 /// <summary>
-/// The monitor window's job-list loads, no UI: a full load the first time (and after <see cref="ServerChanged"/>),
-/// else <c>GET /jobs?updated_since=</c> from <see cref="MonitorModel.ReloadSince"/>, merged into the model by id.
-/// One load at a time: requests meanwhile coalesce into one more pass after it, from the earliest resync cursor.
-/// A load that straddles <see cref="ServerChanged"/> is dropped (the old server's rows). A failed load still runs the
-/// pass queued behind it (once; nothing retries on its own). Owner (UI) thread only.
+/// The monitor's job-list loads, no UI (<see cref="ClientRuntime"/> owns one): a full load the first time (and after
+/// <see cref="ServerChanged"/>), else <c>GET /jobs?updated_since=</c> from <see cref="MonitorModel.ReloadSince"/>,
+/// merged into the model by id. One load at a time: requests meanwhile coalesce into one more pass after it, from the
+/// earliest resync cursor. A load that straddles <see cref="ServerChanged"/> is dropped (the old server's rows). A
+/// failed load still runs the pass queued behind it (once; nothing retries on its own). Owner thread only.
 /// </summary>
 /// <param name="loaded">After every pass that reached the model: the rows may have changed.</param>
-/// <param name="failed">A load failed (<see cref="FaxApiException"/> or <see cref="JsonException"/>) for the current server.</param>
+/// <param name="failed">
+/// A load failed (<see cref="FaxApiException"/> or <see cref="JsonException"/>) for the current server; at most once
+/// per <see cref="ReloadAsync"/> call, however many of its passes fail.
+/// </param>
 public sealed class MonitorLoader(MonitorModel model, Func<IMonitorApi> api, Action loaded, Action<Exception> failed)
 {
     private bool _loading;
@@ -27,7 +30,7 @@ public sealed class MonitorLoader(MonitorModel model, Func<IMonitorApi> api, Act
         model.Clear();
     }
 
-    /// <summary>The window is gone: a load in flight touches nothing when it lands.</summary>
+    /// <summary>The runtime stopped: a load in flight touches nothing when it lands.</summary>
     public void Stop() => _stopped = true;
 
     /// <param name="resyncSince">The server's own cursor from a resync; null for a reconnect or the first load.</param>
@@ -41,6 +44,8 @@ public sealed class MonitorLoader(MonitorModel model, Func<IMonitorApi> api, Act
             return;
         }
         _loading = true;
+        // One failure message per call: a queued pass that fails the same way says nothing new.
+        bool reported = false;
         try
         {
             while (true)
@@ -68,7 +73,11 @@ public sealed class MonitorLoader(MonitorModel model, Func<IMonitorApi> api, Act
                 catch (Exception e) when (e is FaxApiException or JsonException)
                 {
                     if (_stopped) return;
-                    if (generation == _generation) failed(e);
+                    if (generation == _generation && !reported)
+                    {
+                        reported = true;
+                        failed(e);
+                    }
                 }
                 // A request that arrived meanwhile (a reconnect, a resync, the new server's first connect) still
                 // runs, even after a failure: the trigger that queued it will not come again.

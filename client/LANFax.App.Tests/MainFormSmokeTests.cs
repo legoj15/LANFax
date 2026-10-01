@@ -16,35 +16,33 @@ public sealed class MainFormSmokeTests
         new(id, dir, state, null, dir == "out" ? "5551234" : null, dir == "in" ? "5559876" : null, null, null, 1, null, T0, T0, null);
 
     [InteractiveFact]
-    public void MainForm_loads_takes_events_hides_on_close_and_disposes_cleanly()
+    public void MainForm_shows_the_runtimes_rows_takes_events_hides_on_close_and_disposes_cleanly()
     {
         var src = new FakeSource();
+        src.FailLoad(new FaxApiException(0, "cannot reach faxd")); // before the window existed
         int settingsOpened = 0;
         Exception? failure = null;
         var t = new Thread(() =>
         {
             try
             {
-                var beforeLoad = DateTimeOffset.UtcNow;
                 using var form = new MainForm(src, cacheDir: Path.GetTempPath(), openFile: _ => { }, openSettings: () => settingsOpened++);
                 form.Show();
+                Assert.StartsWith("Could not load the job lists", form.MessageText); // a window opened later still says so
+                src.Load(J("lf1", "out", "queued"), J("in1", "in", "received")); // the runtime's next load
                 Pump(() => form.JobRowCount == 1 && form.InboxRowCount == 1);
-                var afterLoad = DateTimeOffset.UtcNow;
-                Assert.Equal(1, src.Api.FullLoads);
+                Assert.DoesNotContain("Could not load", form.MessageText);
 
                 src.RaiseJob(J("lf2", "out", "sending"));
-                src.RaiseInbox(J("in1", "in", "received")); // already there: updated, not duplicated
+                src.RaiseJob(J("in1", "in", "received")); // already there: not duplicated
                 src.RaiseStatus(ServerStatus.Empty with { AmiConnected = true, Arm = new ArmState(true, DateTimeOffset.UtcNow.AddMinutes(20), 20, "300") });
+                Assert.Equal("ARMED", form.ArmTitleText);
                 src.RaiseConnection(false);
-                src.RaiseConnection(true); // a reconnect reloads with updated_since
-                Pump(() => src.Api.SinceLoads == 1);
-                // A plain reconnect asks from the first load's start less the skew margin.
-                Assert.InRange(src.Api.LastSince!.Value, beforeLoad - MonitorModel.SkewMargin, afterLoad - MonitorModel.SkewMargin);
-                src.RaiseResynced(T0);
-                Pump(() => src.Api.SinceLoads == 2);
+                src.RaiseConnection(true);
+                src.Load(J("lf1", "out", "sent") with { UpdatedAt = T0.AddMinutes(1) });
                 Assert.Equal(2, form.JobRowCount);
                 Assert.Equal(1, form.InboxRowCount);
-                Assert.Equal(T0, src.Api.LastSince);
+                Assert.Equal("Sent", form.JobsGrid.Rows.Cast<DataGridViewRow>().Single(r => (string?)r.Tag == "lf1").Cells[2].Value);
 
                 // A refused token on an arm call opens Settings.
                 src.Api.ArmError = new FaxApiUnauthorizedException();
@@ -91,6 +89,7 @@ public sealed class MainFormSmokeTests
     public void A_server_change_drops_the_old_servers_arm_answer_even_one_still_in_flight()
     {
         var src = new FakeSource();
+        src.Load(J("lf1", "out", "queued"));
         Exception? failure = null;
         var t = new Thread(() =>
         {
@@ -101,22 +100,25 @@ public sealed class MainFormSmokeTests
                 Pump(() => form.JobRowCount == 1);
                 Assert.Equal("Disarmed", form.ArmTitleText);
 
-                // The HTTP answer arms the card while the stream has brought no status (the runtime's stays Empty).
+                // The HTTP answer goes into the runtime's status before the stream brings any.
                 Find<Button>(form, b => b.Text == "Arm 1 h").PerformClick();
                 Pump(() => form.ArmTitleText == "ARMED");
-                // Settings saved to another server: the runtime raises nothing (its status is already Empty).
-                form.ServerChanged();
+                Assert.Equal(1, src.NoteArmCalls);
+                // Settings saved to another server: the runtime's reset clears the noted arm state and the rows.
+                src.ServerChanged();
                 Assert.Equal("Disarmed", form.ArmTitleText);
+                Assert.Equal(0, form.JobRowCount);
 
-                // An arm call still in flight across the save: the old server's answer is not shown.
+                // An arm call still in flight across the save: the old server's answer is not noted.
                 var gate = new TaskCompletionSource<ArmState>();
                 src.Api.ArmGate = gate;
                 var arm = Find<Button>(form, b => b.Text == "Arm 1 h");
                 arm.PerformClick();
-                form.ServerChanged();
+                src.ServerChanged();
                 gate.SetResult(new ArmState(true, null, 60, "300"));
                 Pump(() => arm.Enabled);
                 Assert.Equal("Disarmed", form.ArmTitleText);
+                Assert.Equal(1, src.NoteArmCalls);
             }
             catch (Exception e) { failure = e; }
         });
@@ -149,24 +151,17 @@ public sealed class MainFormSmokeTests
         }
     }
 
+    /// <summary>The window loads nothing itself (the runtime does): only its arm buttons and PDF opening call this.</summary>
     private sealed class FakeApi : IMonitorApi
     {
-        public int FullLoads, SinceLoads;
-        public DateTimeOffset? LastSince;
         public Exception? ArmError;
         public TaskCompletionSource<ArmState>? ArmGate;
 
         public Task<IReadOnlyList<Job>> GetJobsAsync(string? direction = null, IEnumerable<string>? states = null, int limit = 100,
-            DateTimeOffset? updatedSince = null, CancellationToken ct = default)
-        {
-            if (updatedSince == null) { FullLoads++; return Task.FromResult<IReadOnlyList<Job>>([J("lf1", "out", "queued")]); }
-            SinceLoads++;
-            LastSince = updatedSince;
-            return Task.FromResult<IReadOnlyList<Job>>([J("lf1", "out", "sent") with { UpdatedAt = T0.AddMinutes(1) }]);
-        }
+            DateTimeOffset? updatedSince = null, CancellationToken ct = default) => throw new NotSupportedException("the window must not load");
 
         public Task<IReadOnlyList<Job>> GetInboxAsync(int limit = 50, CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<Job>>([J("in1", "in", "received")]);
+            throw new NotSupportedException("the window must not load");
 
         public Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default) => Task.CompletedTask;
         public Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default) =>
@@ -177,6 +172,7 @@ public sealed class MainFormSmokeTests
         public Task<ArmState> ReceiveTestAsync(int minutes = 20, CancellationToken ct = default) => ArmAsync(minutes, ct);
     }
 
+    /// <summary>The runtime as the window sees it: the test plays its loads, live updates, arm notes and restarts.</summary>
     private sealed class FakeSource : IMonitorSource
     {
         public readonly FakeApi Api = new();
@@ -184,22 +180,48 @@ public sealed class MainFormSmokeTests
         public bool Connected { get; private set; } = true;
         public bool EverConnected => true;
         public ServerStatus Status { get; private set; } = ServerStatus.Empty;
+        public MonitorModel Monitor { get; } = new(TimeZoneInfo.Local);
+        public Exception? MonitorLoadError { get; private set; }
+        public int ServerGeneration { get; private set; }
+        public int NoteArmCalls;
         public event Action<bool>? ConnectionChanged;
         public event Action<ServerStatus>? StatusChanged;
-        public event Action<Job>? JobChanged;
-        public event Action<Job>? InboxChanged;
-        public event Action<DateTimeOffset?>? Resynced;
+        public event Action? MonitorChanged;
+        public event Action<Exception>? MonitorLoadFailed;
 
         public int Subscribers =>
             (ConnectionChanged?.GetInvocationList().Length ?? 0) + (StatusChanged?.GetInvocationList().Length ?? 0) +
-            (JobChanged?.GetInvocationList().Length ?? 0) + (InboxChanged?.GetInvocationList().Length ?? 0) +
-            (Resynced?.GetInvocationList().Length ?? 0);
+            (MonitorChanged?.GetInvocationList().Length ?? 0) + (MonitorLoadFailed?.GetInvocationList().Length ?? 0);
 
+        public void NoteArm(ArmState answer)
+        {
+            NoteArmCalls++;
+            if (answer == Status.Arm) return;
+            Status = Status with { Arm = answer };
+            StatusChanged?.Invoke(Status);
+        }
+
+        public void Load(params Job[] jobs)
+        {
+            Monitor.ApplyLoad(jobs, DateTimeOffset.UtcNow);
+            MonitorLoadError = null;
+            MonitorChanged?.Invoke();
+        }
+
+        public void FailLoad(Exception e) { MonitorLoadError = e; MonitorLoadFailed?.Invoke(e); }
         public void RaiseConnection(bool c) { Connected = c; ConnectionChanged?.Invoke(c); }
         public void RaiseStatus(ServerStatus s) { Status = s; StatusChanged?.Invoke(s); }
-        public void RaiseJob(Job j) => JobChanged?.Invoke(j);
-        public void RaiseInbox(Job j) => InboxChanged?.Invoke(j);
-        public void RaiseResynced(DateTimeOffset? since) => Resynced?.Invoke(since);
+        public void RaiseJob(Job j) { if (Monitor.Apply(j)) MonitorChanged?.Invoke(); }
+
+        /// <summary>As <see cref="ClientRuntime.RestartStream"/>: generation bumped, status reset, rows cleared.</summary>
+        public void ServerChanged()
+        {
+            ServerGeneration++;
+            if (!ReferenceEquals(Status, ServerStatus.Empty)) RaiseStatus(ServerStatus.Empty);
+            Monitor.Clear();
+            MonitorLoadError = null;
+            MonitorChanged?.Invoke();
+        }
     }
 }
 
