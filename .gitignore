@@ -9,3 +9,4 @@ obj/
 *.user
 .claude/
 client/dist/
+docs/handoff.md
