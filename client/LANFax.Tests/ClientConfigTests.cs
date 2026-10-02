@@ -73,7 +73,7 @@ public class ClientConfigTests
     {
         var c = Load(WriteTmp(content));
         Assert.Equal(8080, c.Port);
-        Assert.Equal("192.0.2.10", c.Server);
+        Assert.Equal(ClientConfig.DefaultServer, c.Server);
         Assert.Null(c.Token);
         Assert.False(string.IsNullOrWhiteSpace(c.LoadError));
     }

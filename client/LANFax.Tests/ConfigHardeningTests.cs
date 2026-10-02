@@ -41,7 +41,7 @@ public class ConfigHardeningTests : IDisposable
     public void An_unusable_server_gives_the_default_and_a_load_error(string server)
     {
         var c = ClientConfig.Load(Write(JsonSerializer.Serialize(new { server, port = 9090 })), Tok);
-        Assert.Equal("192.0.2.10", c.Server);
+        Assert.Equal(ClientConfig.DefaultServer, c.Server);
         Assert.Equal(9090, c.Port);
         Assert.Contains("server", c.LoadError, StringComparison.OrdinalIgnoreCase);
         Assert.Null(c.Validate());

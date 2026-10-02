@@ -709,7 +709,7 @@ real `FaxApi`) and `Logic/IMonitorSource.cs` (what the form needs from
 
 `%ProgramData%\LANFax\config.json` (shared by every Windows user, no secret):
 ```json
-{ "server": "192.0.2.10", "port": 8080, "token": null, "keepLocalCopies": false, "printerName": "LAN Fax", "spoolDir": "..." }
+{ "server": "192.168.168.168", "port": 8080, "token": null, "keepLocalCopies": false, "printerName": "LAN Fax", "spoolDir": "..." }
 ```
 The token is per Windows user: `%LocalAppData%\LANFax\token.bin`, the raw
 DPAPI blob protected with `DpapiScope.CurrentUser`, so a standard user on a
