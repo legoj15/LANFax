@@ -1,16 +1,13 @@
-# LANFax
+# LANFax Client
 
-Send and receive faxes from any Windows PC on the network, through the
-office fax server, without a modem in the PC.
+Send and receive faxes from any Windows PC on the network, through an Asterisk fax server, without any modems (all SIP/VoIP).
 
 What you get:
 
 - A "LAN Fax" printer. Print from any program, type the phone number, done.
 - A status page you can open in a browser, including from your phone over
   the VPN: see what is sending, what arrived, arm the line to receive, and
-  send a test page to a customer's fax number with one button.
-- The old way still works: drop a PDF named with the phone number into the
-  shared `fax\outbox` folder.
+  send a test page to a fax number with one button.
 
 ## Parts
 
