@@ -31,4 +31,3 @@ Deployment prints the address of the status page and its access token.
 ## More
 
 - `docs/design.md` explains why it is built this way.
-- `docs/handoff.md` tracks what is done and what is next.

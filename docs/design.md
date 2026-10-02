@@ -1,6 +1,6 @@
 # LANFax design assessment (2026-09-29)
 
-Status: phase 1 (faxd) is deployed; progress is in `handoff.md`. Written after surveying the live server.
+Status: phase 1 (faxd) is deployed. Written after surveying the live server.
 
 ## What exists today (server `faxserver`, 192.0.2.10)
 
