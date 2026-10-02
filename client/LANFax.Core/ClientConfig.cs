@@ -11,7 +11,7 @@ namespace LANFax.Core;
 /// </summary>
 public sealed class ClientConfig
 {
-    public const string DefaultServer = "192.0.2.10";
+    public const string DefaultServer = "192.168.168.168";
     public const int DefaultPort = 8080;
 
     public string Server { get; set; } = DefaultServer;
