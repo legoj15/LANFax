@@ -5,9 +5,14 @@ Send and receive faxes from any Windows PC on the network, through an Asterisk f
 What you get:
 
 - A "LAN Fax" printer. Print from any program, type the phone number, done.
+- LANFax checks for a newer version when it starts and offers to install it (or use "Check for updates" in Settings).
 - A status page you can open in a browser, including from your phone over
   the VPN: see what is sending, what arrived, arm the line to receive, and
   send a test page to a fax number with one button.
+
+## Download
+
+Get `LANFax-Setup.exe` from the [Releases page](https://github.com/legoj15/LANFax/releases/latest) and run it.
 
 ## Parts
 

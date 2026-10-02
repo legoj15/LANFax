@@ -17,15 +17,21 @@ internal sealed class SettingsDialog : Form
     private readonly Label _tokenHint = new() { AutoSize = true, ForeColor = SystemColors.GrayText };
     private readonly Icon _icon = IconFactory.Create(true);
     private readonly Func<bool> _sendInFlight;
+    private readonly UpdateService? _updates;
+    private readonly CheckBox _checkUpdates = new() { Text = "Check for updates when LANFax starts", AutoSize = true };
+    private readonly Button _checkNow = new() { Text = "Check for updates", AutoSize = true };
+    private readonly Button _installUpdate = new() { Text = "Download and install", AutoSize = true, Visible = false };
+    private readonly Label _updateResult = new() { AutoSize = true, MaximumSize = new Size(420, 0) };
     private bool _tokenCleared;
 
     public const string WaitForSendText = "Wait for the current fax to finish before saving settings.";
     public const string TokenRuleText = ClientConfig.TokenRule + " (paste it exactly as the server printed it).";
 
     /// <param name="sendInFlight">True while a fax is on the wire: saving then could move its retries to another server.</param>
-    public SettingsDialog(ClientConfig cfg, ConfigLocation loc, Func<bool> sendInFlight)
+    /// <param name="updates">Null hides the update controls.</param>
+    public SettingsDialog(ClientConfig cfg, ConfigLocation loc, Func<bool> sendInFlight, UpdateService? updates = null)
     {
-        _cfg = cfg; _loc = loc; _sendInFlight = sendInFlight;
+        _cfg = cfg; _loc = loc; _sendInFlight = sendInFlight; _updates = updates;
         Text = "LANFax settings";
         AutoScaleMode = AutoScaleMode.Dpi;
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -38,6 +44,7 @@ internal sealed class SettingsDialog : Form
         _host.Text = cfg.Server;
         _port.Value = Math.Clamp(cfg.Port, 1, 65535);
         _keep.Checked = cfg.KeepLocalCopies;
+        _checkUpdates.Checked = cfg.CheckForUpdates;
 
         var t = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Fill };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -59,6 +66,18 @@ internal sealed class SettingsDialog : Form
         t.Controls.Add(_keep, 0, 4); t.SetColumnSpan(_keep, 2);
         t.Controls.Add(_test, 0, 5); t.SetColumnSpan(_test, 2);
         t.Controls.Add(_result, 0, 6); t.SetColumnSpan(_result, 2);
+        int next = 7;
+        if (updates != null)
+        {
+            t.Controls.Add(_checkUpdates, 0, next++); t.SetColumnSpan(_checkUpdates, 2);
+            var updateRow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, Margin = Padding.Empty };
+            updateRow.Controls.Add(_checkNow);
+            updateRow.Controls.Add(_installUpdate);
+            t.Controls.Add(updateRow, 0, next++); t.SetColumnSpan(updateRow, 2);
+            t.Controls.Add(_updateResult, 0, next++); t.SetColumnSpan(_updateResult, 2);
+            RenderUpdate();
+            updates.Changed += RenderUpdate;
+        }
         var where = new Label
         {
             AutoSize = true, ForeColor = SystemColors.GrayText, MaximumSize = new Size(420, 0),
@@ -66,17 +85,19 @@ internal sealed class SettingsDialog : Form
                 ? "\r\n(ProgramData\\LANFax is not writable for your account, so settings are stored in your profile instead.)"
                 : ""),
         };
-        t.Controls.Add(where, 0, 7); t.SetColumnSpan(where, 2);
+        t.Controls.Add(where, 0, next++); t.SetColumnSpan(where, 2);
 
         var ok = new Button { Text = "Save", DialogResult = DialogResult.OK, AutoSize = true, MinimumSize = new Size(90, 28) };
         var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true, MinimumSize = new Size(90, 28) };
         var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Dock = DockStyle.Fill };
         buttons.Controls.Add(cancel); buttons.Controls.Add(ok);
-        t.Controls.Add(buttons, 0, 8); t.SetColumnSpan(buttons, 2);
+        t.Controls.Add(buttons, 0, next); t.SetColumnSpan(buttons, 2);
         Controls.Add(t);
         AcceptButton = ok; CancelButton = cancel;
 
         _test.Click += async (_, _) => await TestAsync();
+        _checkNow.Click += async (_, _) => await CheckNowAsync();
+        _installUpdate.Click += async (_, _) => await InstallUpdateAsync();
         _clearToken.Click += (_, _) =>
         {
             _tokenCleared = true;
@@ -99,7 +120,37 @@ internal sealed class SettingsDialog : Form
         PrinterName = _cfg.PrinterName,
         SpoolDir = _cfg.SpoolDir,
         KeepLocalCopies = _keep.Checked,
+        CheckForUpdates = _checkUpdates.Checked,
     };
+
+    private async Task CheckNowAsync()
+    {
+        _updateResult.ForeColor = SystemColors.GrayText;
+        _updateResult.Text = "Checking...";
+        var r = await _updates!.CheckAsync();
+        if (IsDisposed) return;
+        _updateResult.ForeColor = r.Failed ? Color.Firebrick : SystemColors.ControlText;
+        _updateResult.Text = r.Message;
+        RenderUpdate();
+    }
+
+    private async Task InstallUpdateAsync()
+    {
+        var problem = await _updates!.InstallAsync();
+        if (problem == null || IsDisposed) return;
+        _updateResult.ForeColor = Color.Firebrick;
+        _updateResult.Text = problem;
+    }
+
+    /// <summary>The buttons follow the shared update state (the startup check may finish while this is open).</summary>
+    private void RenderUpdate()
+    {
+        if (IsDisposed || _updates == null) return;
+        _checkNow.Enabled = !_updates.Busy;
+        _installUpdate.Visible = _updates.Available != null;
+        _installUpdate.Enabled = !_updates.Busy;
+        if (_updates.Available is { } a) _installUpdate.Text = $"Download and install {a.Version}";
+    }
 
     private async Task TestAsync()
     {
@@ -164,13 +215,17 @@ internal sealed class SettingsDialog : Form
             MessageBox.Show(this, "Could not save settings: " + e.Message, "LANFax", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
-        _cfg.Server = c.Server; _cfg.Port = c.Port; _cfg.Token = c.Token; _cfg.KeepLocalCopies = c.KeepLocalCopies;
+        _cfg.Server = c.Server; _cfg.Port = c.Port; _cfg.Token = c.Token; _cfg.KeepLocalCopies = c.KeepLocalCopies; _cfg.CheckForUpdates = c.CheckForUpdates;
         return true;
     }
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) _icon.Dispose();
+        if (disposing)
+        {
+            if (_updates != null) _updates.Changed -= RenderUpdate;
+            _icon.Dispose();
+        }
         base.Dispose(disposing);
     }
 }

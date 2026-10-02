@@ -19,6 +19,11 @@ public sealed class MainForm : Form
 
     private readonly IMonitorSource _src;
     private readonly Action? _openSettings;
+    private readonly UpdateService? _updates;
+    private readonly FlowLayoutPanel _banner = new() { Dock = DockStyle.Fill, AutoSize = true, Visible = false, BackColor = Color.FromArgb(255, 244, 204), Padding = new Padding(8, 6, 8, 6), Margin = new Padding(0, 0, 0, 8) };
+    private readonly Label _bannerText = new() { AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Color.FromArgb(80, 60, 0), Margin = new Padding(0, 6, 12, 0) };
+    private readonly Button _bannerInstall = new() { Text = "Download and install", AutoSize = true, MinimumSize = new Size(80, 28) };
+    private readonly Button _bannerLater = new() { Text = "Later", AutoSize = true, MinimumSize = new Size(60, 28) };
     private readonly Icon _icon = IconFactory.Create(true);
     private readonly Label _pill = new() { AutoSize = true, Padding = new Padding(8, 3, 8, 3), Anchor = AnchorStyles.Right, Font = new Font(SystemFonts.MessageBoxFont!, FontStyle.Bold) };
     private readonly Label _armState = new() { AutoSize = true, Font = new Font(SystemFonts.MessageBoxFont!.FontFamily, 16f, FontStyle.Bold) };
@@ -36,10 +41,12 @@ public sealed class MainForm : Form
     /// <param name="cacheDir">Where opened PDFs are downloaded; <see cref="MonitorModel.DefaultCacheDir"/> by default.</param>
     /// <param name="openFile">Opens a downloaded PDF; ShellExecute by default.</param>
     /// <param name="openSettings">The tray's Settings dialog, for a refused token.</param>
-    public MainForm(IMonitorSource src, string? cacheDir = null, Action<string>? openFile = null, Action? openSettings = null)
+    /// <param name="updates">When a newer release is known (and not dismissed) a banner offers to install it.</param>
+    public MainForm(IMonitorSource src, string? cacheDir = null, Action<string>? openFile = null, Action? openSettings = null, UpdateService? updates = null)
     {
         _src = src;
         _openSettings = openSettings;
+        _updates = updates;
         _pdf =new PdfOpener(() => _src.MonitorApi, cacheDir ?? MonitorModel.DefaultCacheDir, openFile ?? ShellOpen);
 
         Text = "LANFax";
@@ -70,6 +77,11 @@ public sealed class MainForm : Form
         armBody.Controls.Add(buttons);
         arm.Controls.Add(armBody);
 
+        _banner.Controls.Add(_bannerText);
+        _banner.Controls.Add(_bannerInstall);
+        _banner.Controls.Add(_bannerLater);
+
+        root.Controls.Add(_banner);
         root.Controls.Add(header);
         root.Controls.Add(arm);
         root.Controls.Add(Heading("Sent and queued"));
@@ -77,14 +89,19 @@ public sealed class MainForm : Form
         root.Controls.Add(Heading("Inbox"));
         root.Controls.Add(_inboxGrid);
         root.Controls.Add(_message);
-        for (int i = 0; i < 7; i++)
-            root.RowStyles.Add(i == 3 ? new RowStyle(SizeType.Percent, 55) : i == 5 ? new RowStyle(SizeType.Percent, 45) : new RowStyle(SizeType.AutoSize));
+        for (int i = 0; i < 8; i++)
+            root.RowStyles.Add(i == 4 ? new RowStyle(SizeType.Percent, 55) : i == 6 ? new RowStyle(SizeType.Percent, 45) : new RowStyle(SizeType.AutoSize));
         Controls.Add(root);
 
         _jobsGrid.CellDoubleClick += (_, e) => OnRowDoubleClick(_jobsGrid, e.RowIndex);
         _inboxGrid.CellDoubleClick += (_, e) => OnRowDoubleClick(_inboxGrid, e.RowIndex);
         _tick.Tick += (_, _) => { RenderArm(); RenderPill(); };
         VisibleChanged += (_, _) => { _tick.Enabled = Visible; if (Visible) { RenderArm(); RenderPill(); } };
+
+        _bannerInstall.Click += async (_, _) => await InstallUpdateAsync();
+        _bannerLater.Click += (_, _) => _updates?.Dismiss();
+        if (_updates != null) _updates.Changed += RenderBanner;
+        RenderBanner();
 
         _src.ConnectionChanged += OnConnectionChanged;
         _src.StatusChanged += OnStatusChanged;
@@ -106,6 +123,8 @@ public sealed class MainForm : Form
     internal DataGridView JobsGrid => _jobsGrid;
     /// <summary>The arm card's title, for the smoke test.</summary>
     internal string ArmTitleText => _armState.Text;
+    /// <summary>Whether the update banner shows, for the smoke test.</summary>
+    internal bool BannerVisible => _banner.Visible;
     /// <summary>The message line, for the smoke test.</summary>
     internal string MessageText => _message.Text;
     /// <summary>Set by the tray at exit: a close then really closes instead of hiding.</summary>
@@ -131,6 +150,7 @@ public sealed class MainForm : Form
             _src.StatusChanged -= OnStatusChanged;
             _src.MonitorChanged -= OnMonitorChanged;
             _src.MonitorLoadFailed -= OnLoadFailed;
+            if (_updates != null) _updates.Changed -= RenderBanner;
             _tick.Dispose();
             _icon.Dispose();
         }
@@ -202,6 +222,24 @@ public sealed class MainForm : Form
         {
             if (!IsDisposed) foreach (var b in _armButtons) b.Enabled = true;
         }
+    }
+
+    private async Task InstallUpdateAsync()
+    {
+        if (_updates == null) return;
+        var problem = await _updates.InstallAsync();
+        if (problem != null && !IsDisposed) Say(problem);
+    }
+
+    private void RenderBanner()
+    {
+        if (IsDisposed || _updates == null) return;
+        var a = _updates.Available;
+        _banner.Visible = a != null && !_updates.Dismissed;
+        if (a == null) return;
+        _bannerText.Text = _updates.Downloading ? $"Downloading LANFax {a.Version}..." : $"LANFax {a.Version} is available (you have {_updates.Current}).";
+        _bannerInstall.Enabled = !_updates.Busy;
+        _bannerLater.Enabled = !_updates.Busy;
     }
 
     private void OnRowDoubleClick(DataGridView grid, int row)

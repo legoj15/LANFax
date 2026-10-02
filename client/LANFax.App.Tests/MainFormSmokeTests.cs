@@ -128,6 +128,44 @@ public sealed class MainFormSmokeTests
         if (failure != null) throw new Xunit.Sdk.XunitException("MainForm arm reset failed: " + failure);
     }
 
+    private sealed class ReleaseHandler(string json) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage r, CancellationToken ct) =>
+            Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK) { Content = new StringContent(json) });
+    }
+
+    [InteractiveFact]
+    public void The_update_banner_appears_when_a_newer_release_is_found_and_Later_hides_it()
+    {
+        var src = new FakeSource();
+        var sha = new string('a', 64);
+        var json = "{\"tag_name\":\"v9.0.0\",\"assets\":[{\"name\":\"LANFax-Setup.exe\",\"size\":10,\"digest\":\"sha256:" + sha
+            + "\",\"browser_download_url\":\"https://github.com/legoj15/LANFax/releases/download/v9.0.0/LANFax-Setup.exe\"}]}";
+        Exception? failure = null;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                var updates = new UpdateService(new UpdateChecker(new HttpClient(new ReleaseHandler(json))), new Version(1, 0, 0),
+                    () => false, _ => { }, () => { });
+                using var form = new MainForm(src, cacheDir: Path.GetTempPath(), openFile: _ => { }, openSettings: () => { }, updates: updates);
+                form.Show();
+                Assert.False(form.BannerVisible);
+                var check = updates.CheckAsync();
+                Pump(() => check.IsCompleted);
+                Assert.True(form.BannerVisible);
+                Find<Label>(form, l => l.Text.Contains("9.0.0"));
+                Find<Button>(form, b => b.Text == "Later").PerformClick();
+                Assert.False(form.BannerVisible);
+            }
+            catch (Exception e) { failure = e; }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        Assert.True(t.Join(TimeSpan.FromSeconds(30)), "the form thread hung");
+        if (failure != null) throw new Xunit.Sdk.XunitException("update banner failed: " + failure);
+    }
+
     [InteractiveFact]
     public void A_load_failure_after_the_window_exists_is_shown_and_the_next_good_load_brings_the_hint_back()
     {

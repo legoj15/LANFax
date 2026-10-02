@@ -18,6 +18,8 @@ public sealed class ClientConfig
     public int Port { get; set; } = DefaultPort;
     public string? Token { get; set; }
     public bool KeepLocalCopies { get; set; }
+    /// <summary>Ask GitHub once at startup whether a newer LANFax release exists. The Settings button always checks.</summary>
+    public bool CheckForUpdates { get; set; } = true;
     public string PrinterName { get; set; } = "LAN Fax";
     public string SpoolDir { get; set; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "LANFax", "spool");
@@ -46,6 +48,7 @@ public sealed class ClientConfig
         /// <summary>Only read, to migrate a machine-scope token written by an older version; always saved as null.</summary>
         public string? Token { get; set; }
         public bool? KeepLocalCopies { get; set; }
+        public bool? CheckForUpdates { get; set; }
         public string? PrinterName { get; set; }
         public string? SpoolDir { get; set; }
     }
@@ -134,6 +137,7 @@ public sealed class ClientConfig
                 else errors.Add($"port {p} is not between 1 and 65535; using {c.Port}");
             }
             if (m.KeepLocalCopies is bool k) c.KeepLocalCopies = k;
+            if (m.CheckForUpdates is bool u) c.CheckForUpdates = u;
             if (!string.IsNullOrWhiteSpace(m.PrinterName))
             {
                 if (QuoteError("printer name", m.PrinterName) is { } err) errors.Add($"{err}; using \"{c.PrinterName}\"");
@@ -222,7 +226,7 @@ public sealed class ClientConfig
         else if (File.Exists(tokenPath)) File.Delete(tokenPath);
         WriteShared(path, new FileModel
         {
-            Server = Server, Port = Port, Token = null, KeepLocalCopies = KeepLocalCopies, PrinterName = PrinterName, SpoolDir = SpoolDir,
+            Server = Server, Port = Port, Token = null, KeepLocalCopies = KeepLocalCopies, CheckForUpdates = CheckForUpdates, PrinterName = PrinterName, SpoolDir = SpoolDir,
         });
     }
 

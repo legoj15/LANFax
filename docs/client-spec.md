@@ -758,3 +758,15 @@ show.
   both copies match). Edit both together.
 - The app never stores the token in plain text, never in the shared config,
   and never logs it.
+
+## Updates and releases (1.0.0)
+
+Version: `client/Directory.Build.props` `<Version>` is the single source (assembly version, `UpdateChecker.CurrentVersion()`). `install/LANFax.iss` keeps the same number as its `#ifndef AppVersion` fallback; `build.ps1` passes `/DAppVersion=` from the props, and `UpdateTests.Project_and_installer_agree_on_the_version` fails if they drift. Bump both, run `client/release.ps1` (clean tree, tag `vX.Y.Z` must not exist, builds, `gh release create` with `dist/LANFax-Setup.exe`).
+
+Updater (`Logic/UpdateChecker.cs`, `Logic/UpdateService.cs`):
+- Source: `https://api.github.com/repos/legoj15/LANFax/releases/latest` (unauthenticated, so the repo must be public). Draft, prerelease and non-`vN.N[.N]` tags are ignored; 404 = no release yet = up to date.
+- The asset must be named `LANFax-Setup.exe`, carry GitHub's `digest` (`sha256:<64 hex>`), a sane size, and an https `github.com` download URL. Missing any of these is an error, never an install: the installer runs elevated. The download is kept only when size and SHA-256 match; otherwise nothing is left in `%TEMP%\LANFax-update`.
+- Startup: one check when `CheckForUpdates` (config, default true, Settings checkbox) is on; failure is logged and silent. A found update raises a balloon (click opens the monitor window) and shows the banner in `MainForm` (Download and install / Later; Later hides it until a different version is found).
+- Settings: "Check for updates" always checks and reports the result inline; "Download and install <ver>" appears when an update is known.
+- Install: refused while a send dialog is sending; downloads, starts the installer with `/SILENT /SUPPRESSMSGBOXES /NORESTART` (UAC prompt; declining it keeps the app running), then exits through the tray's normal Exit path. The installer has a `Check: WizardSilent` [Run] entry that relaunches LANFax as the original user.
+- Known limit: the installer is unsigned, so the UAC prompt shows an unknown publisher; integrity rests on the GitHub-reported digest over TLS.

@@ -29,6 +29,8 @@ internal sealed class TrayContext : ApplicationContext
     private readonly ToolStripMenuItem _installItem;
     private readonly ToolStripMenuItem _unsentItem;
     private readonly ToolStripMenuItem _retryItem;
+    private readonly HttpClient _updateHttp = new() { Timeout = Timeout.InfiniteTimeSpan }; // UpdateChecker limits each call itself
+    private readonly UpdateService _updates;
     private readonly RegisteredWaitHandle? _showWait;
     private readonly EventWaitHandle _showEvent;
     /// <summary>"Arm window ends in 5 minutes", once per window; checked on arm changes and by <see cref="_armTimer"/>.</summary>
@@ -51,6 +53,9 @@ internal sealed class TrayContext : ApplicationContext
         _loc = loc;
         _cfg = runtime.Config;
 
+        // Installing an update closes this app through the normal Exit path once the installer is running.
+        _updates = new UpdateService(new UpdateChecker(_updateHttp), UpdateChecker.CurrentVersion(),
+            () => _openDialog is { Sending: true }, UpdateService.ShellLaunch, () => _ = ExitAppAsync());
         _notices = new NotificationQueue(ShowBalloon, stopTimer: () => _noticeTimer.Stop());
         _noticeTimer.Tick += (_, _) => { _noticeTimer.Stop(); _notices.OnTimeout(_noticeId); };
 
@@ -109,6 +114,19 @@ internal sealed class TrayContext : ApplicationContext
             AnnouncePrinter(start.Printer);
         else if (string.IsNullOrEmpty(_cfg.Token) && _cfg.LoadError == null)
             Balloon("Set the server token in LANFax settings. Click here.", OpenSettings);
+        if (_cfg.CheckForUpdates) _ = CheckForUpdateAtStartupAsync();
+    }
+
+    /// <summary>The one automatic check: a balloon (and the monitor window's banner) when a newer release exists; silent otherwise.</summary>
+    private async Task CheckForUpdateAtStartupAsync()
+    {
+        try
+        {
+            await _updates.CheckAsync();
+            if (_updates.Available is { } a && !_exiting)
+                Balloon($"LANFax {a.Version} is available. Click to update.", ShowMonitor);
+        }
+        catch (Exception e) { FileLog.Error("startup update check failed", e); }
     }
 
     /// <summary>The runtime raises on this thread: handlers touch the UI directly.</summary>
@@ -151,7 +169,7 @@ internal sealed class TrayContext : ApplicationContext
         {
             if (_monitor == null || _monitor.IsDisposed)
             {
-                var form = new MainForm(_runtime, openSettings: OpenSettings);
+                var form = new MainForm(_runtime, openSettings: OpenSettings, updates: _updates);
                 form.FormClosed += (_, _) => { if (_monitor == form) _monitor = null; form.Dispose(); };
                 _monitor = form;
             }
@@ -398,7 +416,7 @@ internal sealed class TrayContext : ApplicationContext
         _settingsOpen = true;
         try
         {
-            using var dlg = new SettingsDialog(_cfg, _loc, () => _openDialog is { Sending: true });
+            using var dlg = new SettingsDialog(_cfg, _loc, () => _openDialog is { Sending: true }, _updates);
             if (dlg.ShowDialog() == DialogResult.OK)
             {
                 FileLog.Info($"settings saved: {_cfg.Server}:{_cfg.Port}, token set={!string.IsNullOrEmpty(_cfg.Token)}");
@@ -451,6 +469,7 @@ internal sealed class TrayContext : ApplicationContext
             _exiting = true;
             _noticeTimer.Dispose();
             _armTimer.Dispose();
+            _updateHttp.Dispose();
             var monitor = _monitor; _monitor = null;
             if (monitor != null) { monitor.AllowClose = true; monitor.Dispose(); }
             _showWait?.Unregister(null);

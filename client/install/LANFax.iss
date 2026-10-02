@@ -2,7 +2,10 @@
 ; Output: client\dist\LANFax-Setup.exe. The installer is unsigned.
 
 #define AppName "LANFax"
-#define AppVersion "0.2.0"
+; Fallback only: build.ps1 passes /DAppVersion=<Version from Directory.Build.props>, and a test keeps this equal to it.
+#ifndef AppVersion
+  #define AppVersion "1.0.0"
+#endif
 #define AppExe "LANFax.exe"
 ; The published app folder. The test suite compiles this script with /DAppSource=<stub dir>, so no publish is needed there.
 #ifndef AppSource
@@ -52,6 +55,8 @@ Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 ; Start the tray app as the logged-in user, not elevated. (The printer script runs from [Code] so its exit code is checked.)
 Filename: "{app}\{#AppExe}"; Description: "Start LANFax"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; The in-app updater runs this installer silently: start the tray app again for the user who was running it.
+Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
 [UninstallRun]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install\Uninstall-LANFaxPrinter.ps1"""; RunOnceId: "RemoveLANFaxPrinter"; Flags: runhidden waituntilterminated

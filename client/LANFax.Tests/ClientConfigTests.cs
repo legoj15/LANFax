@@ -47,6 +47,19 @@ public class ClientConfigTests
     }
 
     [Fact]
+    public void CheckForUpdatesDefaultsOnAndRoundTrips()
+    {
+        Assert.True(new ClientConfig().CheckForUpdates);
+        var path = Tmp();
+        new ClientConfig { Server = "h", CheckForUpdates = false }.Save(path, TokenFor(path));
+        Assert.False(Load(path).CheckForUpdates);
+        WriteTmpAt(path, "{\"server\":\"h\"}"); // a file from before 1.0.0 has no such key
+        Assert.True(Load(path).CheckForUpdates);
+    }
+
+    private static void WriteTmpAt(string path, string content) => File.WriteAllText(path, content);
+
+    [Fact]
     public void NullTokenRoundTrips()
     {
         var path = Tmp();

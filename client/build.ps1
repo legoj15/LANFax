@@ -29,9 +29,11 @@ if ($onPath) { $iscc = $onPath.Source }
 foreach ($c in @('E:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) {
     if (-not $iscc -and (Test-Path $c)) { $iscc = $c }
 }
+# One version, in Directory.Build.props: the app, the installer and the updater all read it.
+$version = ([xml](Get-Content (Join-Path $root 'Directory.Build.props'))).Project.PropertyGroup.Version
 if ($iscc -and (Test-Path $iss)) {
-    Invoke-Step 'inno setup' { & $iscc $iss }
+    Invoke-Step 'inno setup' { & $iscc "/DAppVersion=$version" $iss }
 } else {
     Write-Host 'Inno Setup or LANFax.iss not found, skipping installer'
 }
-Write-Host 'build ok'
+Write-Host "build ok (version $version)"
