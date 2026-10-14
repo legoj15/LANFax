@@ -163,9 +163,17 @@ public sealed class SendSession
 
     /// <summary>The plan for the next attempt: the frozen one when locked, else built from the fields (may throw ArgumentException).</summary>
     public SendPlan Build(string rawNumber, string? subject, bool useTestPage, bool keepLocalCopies) =>
-        LockedPlan ?? SendPlan.Create(SpoolId, PdfPaths, rawNumber, subject,
+        LockedPlan ?? SendPlan.Create(PrimaryId(), PdfPaths, rawNumber, subject,
             useTestPage || (PdfPaths.Count == 0 && _testPageWhenEmpty),
             keepLocalCopies, IdempotencyKey);
+
+    /// <summary>
+    /// The spool id the fax is journalled under: the first document's own id when its file is a spool file
+    /// (the print path already uses exactly that id; a compose fax adopts its first document's id so the
+    /// record's primary PDF is a real file), else the session's own id (a test page: nothing on disk).
+    /// </summary>
+    public Guid PrimaryId() =>
+        PdfPaths.Count > 0 && Guid.TryParse(Path.GetFileNameWithoutExtension(PdfPaths[0]), out var g) ? g : SpoolId;
 
     /// <summary>The request is about to go out. Call after the plan is validated and persisted.</summary>
     /// <param name="server">The base URI it goes to; pinned as <see cref="LockedServer"/> if the attempt turns out uncertain.</param>

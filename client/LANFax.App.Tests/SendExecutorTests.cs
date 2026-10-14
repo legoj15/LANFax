@@ -498,4 +498,60 @@ public sealed class SendExecutorTests : IDisposable
         var parts = Assert.Single(api.Analyzed);
         Assert.Equal(2, parts.Count);
     }
+
+    // ---- the compose fax journals like a printed one (review fix) ----
+
+    [Fact]
+    public async Task A_compose_fax_is_journalled_under_its_first_document_before_the_request_goes_out()
+    {
+        var a = SpooledA("%PDF-a");
+        var b = SpooledA("%PDF-b");
+        var api = new FakeApi();
+        string? recordState = null;
+        api.OnCall = () => recordState = RecordAt(a.id);   // what is on disk while the request is out
+        var throwaway = Guid.NewGuid();                    // the compose request's own id: never a file
+        var session = new SendSession(throwaway, new[] { a.pdf, b.pdf }, testPageWhenEmpty: false);
+        var tracker = new JobTracker(_dir);
+        var plan = session.Build("5552345678", null, false, false);
+        Assert.Equal(a.id, plan.JobId);                    // the first document's id, not the throwaway
+        var r = await new SendExecutor(api, Cfg, tracker).RunAsync(session, plan);
+
+        Assert.Equal(SendAttemptStatus.Accepted, r.Status);
+        Assert.Equal("sending " + plan.IdempotencyKey, recordState);   // the record existed mid-flight
+        tracker.Track(plan, r.Job!);
+        var tracked = Assert.Single(tracker.Pending);
+        Assert.Equal(new[] { b.id }, tracked.Parts);
+    }
+
+    [Fact]
+    public async Task An_uncertain_compose_send_resumes_with_all_documents_and_the_same_key()
+    {
+        var a = SpooledA("%PDF-a");
+        var b = SpooledA("%PDF-b");
+        var api = new FakeApi(() => throw new FaxApiException(0, "timeout"));
+        var session = new SendSession(Guid.NewGuid(), new[] { a.pdf, b.pdf }, testPageWhenEmpty: false);
+        var key = session.IdempotencyKey;
+        await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, false, false));
+
+        var offer = Assert.Single(new JobTracker(_dir).Scan());
+        Assert.Equal(SendKind.Resume, offer.Kind);
+        Assert.Equal(a.id, offer.SpoolId);                 // keyed by the first document: a real file
+        Assert.NotNull(offer.LockedPlan);
+        Assert.Equal(new[] { a.pdf, b.pdf }, offer.LockedPlan!.PdfPaths);
+        Assert.Equal(key, offer.LockedPlan.IdempotencyKey);
+        Assert.True(File.Exists(a.pdf) && File.Exists(b.pdf));   // nothing eaten by a phantom primary
+    }
+
+    [Fact]
+    public async Task PreCheck_skips_when_the_server_is_busy()
+    {
+        var a = Spooled();
+        var api = new FakeApi { OnAnalyze = () => new FaxApiException(503, "too many uploads") };
+        var session = new SendSession(a.id, a.pdf);
+        var (blanks, error) = await new SendExecutor(api, Cfg, null)
+            .PreCheckAsync(session.Build("5552345678", null, false, false));
+        Assert.Null(blanks);
+        Assert.Null(error);
+    }
+
 }

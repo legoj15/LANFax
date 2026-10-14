@@ -15,7 +15,9 @@ from datetime import datetime
 from typing import Optional
 
 DEFAULT_DPI = 50            # enough to tell ink from paper; a page renders in ~50 ms
-BLANK_THRESHOLD = 252       # a page whose darkest sample is at least this is blank paper
+BLANK_THRESHOLD = 252       # a page whose darkest sample is still this close to white is blank paper
+MAX_OUTPUT = 100 * 1024 * 1024   # a merged/stamped PDF larger than this is not a fax; refuses rather than slurps
+MAX_PGM = 64 * 1024 * 1024  # one rendered page above this (huge MediaBox) is skipped, not slurped
 ASCII_ONLY = re.compile(r"[^ -~]")   # header/footer text must be ASCII (PostScript string)
 
 
@@ -27,8 +29,8 @@ def _gs(gs_bin: str, args: list[str], timeout: float) -> bytes:
     """Run gs to completion; returns its stderr (the bbox device reports there). Raises GsError."""
     try:
         p = subprocess.run([gs_bin, *args], capture_output=True, timeout=timeout)
-    except FileNotFoundError as e:
-        raise GsError(f"ghostscript ({gs_bin}) is not installed") from e
+    except (FileNotFoundError, OSError) as e:
+        raise GsError(f"ghostscript ({gs_bin}) could not be run: {e}") from e
     except subprocess.TimeoutExpired as e:
         raise GsError(f"ghostscript timed out after {timeout:.0f}s") from e
     if p.returncode != 0:
@@ -102,8 +104,14 @@ def compose(gs_bin: str, parts: list[tuple[str, bytes]], *, header: Optional[str
         else:
             args += names
         _gs(gs_bin, args, timeout)
-        with open(out, "rb") as f:
-            return f.read()
+        try:
+            with open(out, "rb") as f:
+                data = f.read(MAX_OUTPUT + 1)
+            if len(data) > MAX_OUTPUT:
+                raise GsError("merged output exceeds %d MB" % (MAX_OUTPUT // (1024 * 1024)))
+            return data
+        except OSError as e:
+            raise GsError(f"ghostscript wrote no output ({e})") from e
 
 
 def page_count(gs_bin: str, pdf: bytes, timeout: float = 30.0) -> Optional[int]:
@@ -165,17 +173,22 @@ def blank_pages(gs_bin: str, pdf: bytes, *, dpi: int = DEFAULT_DPI,
                 f.write(pdf)
             _gs(gs_bin, ["-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pgmraw",
                          "-r" + str(dpi), "-o", os.path.join(tmp, "p-%d.pgm"), path], timeout)
+            pages = sorted((int(m.group(1)), name) for name in os.listdir(tmp)
+                           if (m := re.fullmatch(r"p-(\d+)\.pgm", name)))
             nums = []
-            for name in sorted(os.listdir(tmp)):
-                m = re.fullmatch(r"p-(\d+)\.pgm", name)
-                if not m:
-                    continue
+            for number, name in pages:            # numeric order: p-10 does not sort after p-1
                 if len(nums) >= max_pages:
                     break
-                with open(os.path.join(tmp, name), "rb") as f:
-                    darkest = _pgm_min(f.read())
+                path = os.path.join(tmp, name)
+                try:
+                    if os.path.getsize(path) > MAX_PGM:
+                        continue   # a huge MediaBox rendered huge: not blank by any sane measure
+                    with open(path, "rb") as f:
+                        darkest = _pgm_min(f.read(MAX_PGM + 1))
+                except OSError:
+                    continue
                 if darkest is not None and darkest >= threshold:
-                    nums.append(int(m.group(1)))
+                    nums.append(number)
             return nums
     except GsError:
         return []

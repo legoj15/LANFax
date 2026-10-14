@@ -148,7 +148,7 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
         var offer = status == LoadStatus.Ok && t != null ? OfferFor(original.SpoolId, t) : null;
         if (offer == null && session?.LockedPlan is { } locked)
             offer = new SendRequest(original.SpoolId, pdf, locked.Number, locked.Subject, SendKind.Resume, locked,
-                session.LockedServer?.Authority, locked.PartIds.Skip(1).ToList() is { Count: > 0 } parts ? parts : null);
+                session.LockedServer?.Authority, locked.PartIds.Where(g => g != locked.JobId).ToList() is { Count: > 0 } parts ? parts : null);
         offer ??= original;
         if (original.Kind == SendKind.Suspect && offer.LockedPlan == null && offer.Kind != SendKind.Suspect)
             offer = offer with { Kind = SendKind.Suspect };
@@ -308,7 +308,8 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
 
     private static TrackedJob FromPlan(SendPlan p, string state, string? key) =>
         new(p.JobId, null, p.Number, p.Subject, p.AfterAccept == FileAction.MoveToSent, state, key,
-            p.Route == SendRoute.TestPage, Parts: p.PartIds.Skip(1).ToList() is { Count: > 0 } parts ? parts : null);
+            p.Route == SendRoute.TestPage,
+            Parts: p.PartIds.Where(g => g != p.JobId).ToList() is { Count: > 0 } parts ? parts : null);
 
     /// <summary>Rebuilds the exact plan of a stored attempt (same key, number, subject, route, file action and parts).</summary>
     private SendPlan ToPlan(TrackedJob t) =>

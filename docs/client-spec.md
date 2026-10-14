@@ -766,8 +766,11 @@ Seven user asks from the 2026-10-14 blank-page incident, all implemented:
   prints open their own dialogs exactly as before.
 - **Blank-page pre-check**: before the attempt, `SendExecutor.PreCheckAsync`
   POSTs the documents to `/analyze`; blank pages prompt "send anyway?".
-  A 404/405/501 (older faxd), 401 or network failure skips the check; a
-  400 (merge failure) blocks with the server's reason.
+  A 404/405/501 (older faxd), 401, 5xx or network failure skips the check
+  (the courtesy check never blocks a send the real attempt might make); a
+  400 (merge failure) blocks with the server's reason. Compose faxes
+  journal under their first document's spool id, so a crash mid-upload
+  resumes with the same key and every document (review fix).
 - **Cancel**: `POST /jobs/{id}/cancel` through the runtime (which applies
   the answer to the rows). Right-click a queued/dialing/sending row ->
   "Cancel this fax..." with a confirmation naming the risk (a transmitting

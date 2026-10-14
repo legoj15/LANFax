@@ -146,9 +146,9 @@ public sealed class SendExecutor(ISendApi api, ClientConfig cfg, JobTracker? jou
             var check = await api.AnalyzeJobAsync(endpoint, parts);
             return (check?.BlankPages, null);
         }
-        catch (FaxApiException e) when (e.StatusCode is 401 or 0)
+        catch (FaxApiException e) when (e.StatusCode is 401 or 0 or >= 500)
         {
-            return (null, null); // unreachable/forbidden now: do not block on the courtesy check
+            return (null, null); // unreachable/busy/forbidden now: do not block on the courtesy check
         }
         catch (FaxApiException e)
         {

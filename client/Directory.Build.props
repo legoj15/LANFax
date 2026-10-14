@@ -1,6 +1,6 @@
 <Project>
   <!-- The one place the release version lives. install\LANFax.iss carries the same number as its fallback (a test keeps them equal; build.ps1 passes this one in). -->
   <PropertyGroup>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
   </PropertyGroup>
 </Project>

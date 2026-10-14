@@ -479,6 +479,12 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
     public void TrackSubmitted(string serverId) => _submitted.Add(serverId);
 
     /// <summary>
+    /// Marks a spool id as already offered, so a later re-scan (listener restart, printer reinstall) does not
+    /// raise a document the user already staged into the open send dialog as a fresh print.
+    /// </summary>
+    public void MarkSpoolOffered(Guid spoolId) => _offeredSpool.Add(spoolId);
+
+    /// <summary>
     /// Cancels a fax the user no longer wants sent: one still queued stops before dialling, one whose call is up is
     /// hung up through the PBX. The server's answer is applied to the rows like any update. Throws <see cref="FaxApiException"/>
     /// (409: it already moved on) for the caller to show.

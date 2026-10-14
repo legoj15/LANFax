@@ -19,6 +19,7 @@ log = logging.getLogger("faxd.api")
 
 MAX_BODY = 25 * 1024 * 1024   # faxd.service caps the whole daemon at 96 MB
 MAX_CONNS = 32                # concurrent connections, SSE streams included
+MAX_PARTS = 50                # documents in one multipart fax; more is abuse, not a fax
 REQUEST_TIMEOUT = 30          # seconds; socket timeout for every connection
 MAX_UPLOADS = 2               # concurrent POST /jobs body reads (each may hold MAX_BODY)
 REPLAY_MAX = 200              # missed job_events rows replayed on reconnect; more -> `resync`
@@ -42,32 +43,44 @@ class CancelRefused(Exception):
 
 def parse_multipart(body: bytes, ctype: str) -> list[tuple[str, bytes]]:
     """(filename, content) parts of a multipart/form-data body: what a browser FormData
-    or the client's multi-document send posts. A body that does not split on its own
-    boundary, or has no usable part, is a 400."""
+    or the client's multi-document send posts. A boundary shorter than 8 characters, a
+    body that does not carry it, a malformed part, or more than MAX_PARTS parts is a 400.
+    Delimiters are CRLF-anchored (RFC 2046) and located with find(), never split(), so a
+    hostile tiny boundary cannot make the parser materialise millions of chunks inside
+    the daemon's memory cap."""
     m = re.search(r'boundary="?([^";]+)"?', ctype or "")
-    if not m or not m.group(1).strip():
-        raise _HttpError(400, "multipart body without a boundary")
-    delim = b"--" + m.group(1).encode("utf-8", "replace")
+    boundary = (m.group(1) if m else "").strip()
+    if len(boundary) < 8:
+        raise _HttpError(400, "multipart body without a usable boundary")
+    delim = b"--" + boundary.encode("utf-8", "replace")
+    marker = b"\r\n" + delim
+    first = body.find(delim)
+    if first < 0 or (first > 0 and body[first - 2:first] != b"\r\n"):
+        raise _HttpError(400, "multipart body with no parts")
     out: list[tuple[str, bytes]] = []
-    for chunk in body.split(delim):
-        if chunk[:2] == b"--":        # the closing marker: nothing after it
-            break
-        if chunk.startswith(b"\r\n"):
-            chunk = chunk[2:]
-        elif not chunk:
-            continue                  # the preamble split before the first part
+    pos = first
+    while True:
+        end = pos + len(delim)
+        if body[end:end + 2] == b"--":
+            break                                    # the closing marker
+        start = end + 2 if body[end:end + 2] == b"\r\n" else end
+        nxt = body.find(marker, start)
+        if nxt < 0:
+            raise _HttpError(400, "multipart body with no closing boundary")
+        chunk = body[start:nxt]                      # the marker's CRLF ends the data
         sep = chunk.find(b"\r\n\r\n")
         if sep < 0:
-            continue
+            raise _HttpError(400, "multipart body with a malformed part")
         head, data = chunk[:sep], chunk[sep + 4:]
-        if data.endswith(b"\r\n"):
-            data = data[:-2]
         name = "part%d.pdf" % (len(out) + 1)
         # quoted or bare (a browser quotes, .NET's MultipartFormDataContent does not for simple tokens)
         fn = re.search(rb'filename=("?)([^";\r\n]*)\1', head)
         if fn and fn.group(2):
             name = fn.group(2).decode("utf-8", "replace")
+        if len(out) >= MAX_PARTS:
+            raise _HttpError(400, f"multipart body with more than {MAX_PARTS} parts")
         out.append((name, data))
+        pos = nxt + 2                                # step over the marker's CRLF
     if not out:
         raise _HttpError(400, "multipart body with no parts")
     return out

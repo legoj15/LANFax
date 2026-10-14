@@ -63,7 +63,7 @@ public sealed class UpdateTests : IDisposable
 
     [Fact]
     public void Current_is_the_assembly_version_without_a_commit_suffix() =>
-        Assert.Equal(new Version(1, 1, 0), UpdateChecker.CurrentVersion());
+        Assert.Equal(new Version(1, 1, 1), UpdateChecker.CurrentVersion());
 
     // ---- check ----
 

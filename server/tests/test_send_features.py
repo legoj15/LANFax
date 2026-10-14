@@ -214,3 +214,141 @@ class CancelCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MultipartHardeningCase(unittest.TestCase):
+    """The parser's abuse answers: tiny boundaries, too many parts, bodies that lie."""
+
+    BOUNDARY = b"lanfax-hardening-bnd"
+
+    def setUp(self):
+        self.api = make_api()
+        self.addCleanup(self.api.shutdown)
+
+    def post(self, body, boundary=BOUNDARY, ctype_extra=""):
+        h = {"Content-Type": f"multipart/form-data; boundary={boundary.decode()}{ctype_extra}",
+             "X-Fax-To": "5551234567"}
+        return jreq(self.api, "POST", "/jobs", body, h)
+
+    def test_short_boundary_is_400(self):
+        self.assertEqual(self.post(multipart_body(b"x12", (b"a.pdf", PDF)), boundary=b"x12")[0], 400)
+
+    def test_boundary_with_surrounding_space_is_used_trimmed(self):
+        body = multipart_body(self.BOUNDARY, (b"a.pdf", PDF))
+        s, _ = self.post(body, ctype_extra=" ")   # "boundary=<b> " -- trailing space in the header value
+        self.assertEqual(s, 201)
+
+    def test_too_many_parts_is_400(self):
+        parts = [(b"a.pdf", PDF)] * 51
+        self.assertEqual(self.post(multipart_body(self.BOUNDARY, *parts))[0], 400)
+        self.assertEqual(self.api.calls["enqueue"], [])
+
+    def test_missing_closing_boundary_is_400(self):
+        body = multipart_body(self.BOUNDARY, (b"a.pdf", PDF))[:-len(b"--" + self.BOUNDARY + b"--\r\n")]
+        self.assertEqual(self.post(body)[0], 400)
+
+    def test_part_without_headers_is_400(self):
+        body = (b"--" + self.BOUNDARY + b"\r\njust data no header break\r\n"
+                b"--" + self.BOUNDARY + b"--\r\n")
+        self.assertEqual(self.post(body)[0], 400)
+
+    def test_a_bare_delimiter_inside_data_does_not_split_the_part(self):
+        # no CRLF before the "--boundary" occurrence inside the document bytes: RFC 2046
+        payload = b"%PDF-with--" + self.BOUNDARY + b"-inside"
+        s, _ = self.post(multipart_body(self.BOUNDARY, (b"a.pdf", payload)))
+        self.assertEqual(s, 201)
+        parts = self.api.calls["enqueue"][0]["pdf"]
+        self.assertEqual([(n, bytes(b)) for n, b in parts], [("a.pdf", payload)])
+
+
+class CancelShareFileCase(unittest.TestCase):
+    """cancel_job's file handling: faxd's staging copies go, the user's share file survives."""
+
+    def setUp(self):
+        from faxd.db import Registry
+        from faxd.enqueue import enqueue_pdf
+        from faxd.events import EventBus
+        from faxd.main import cancel_job
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        r = self.tmp.name
+        self.cfg = SimpleNamespace(http_bind="127.0.0.1", http_port=0, token=TOKEN, station_id="T",
+                                   outbox=os.path.join(r, "outbox"),
+                                   sending=os.path.join(r, "sending"),
+                                   outqueue=os.path.join(r, "outqueue"),
+                                   failed=os.path.join(r, "failed"),
+                                   queue_meta=os.path.join(r, "queue-meta"),
+                                   allowed_numbers="nanp,000,ext")
+        os.makedirs(self.cfg.outqueue)
+        os.makedirs(self.cfg.failed)
+        os.makedirs(self.cfg.outbox)
+        os.makedirs(self.cfg.sending)
+        self.reg = Registry(os.path.join(r, "f.db"))
+        self.addCleanup(self.reg.close)
+        self.bus = EventBus()
+        self.progress = SimpleNamespace(channel_for=lambda job_id: None)
+        self.ami = SimpleNamespace(action=lambda name, **f: {"Response": "Success"})
+        self.cancel = lambda job_id: cancel_job(self.cfg, self.reg, self.bus, self.progress, self.ami, job_id)
+        _ = (enqueue_pdf,)  # imported for the share-row helper below
+
+    def share_row(self, name="5551234567_cover.pdf"):
+        """A queued row for a file a user dropped on the share (origin share)."""
+        path = os.path.join(self.cfg.outbox, name)
+        with open(path, "wb") as f:
+            f.write(PDF)
+        row = self.reg.upsert_job({"id": "shshare000001", "direction": "out", "state": "queued",
+                                   "filename": name, "to_number": "5551234567", "origin": "share",
+                                   "pdf_path": path})
+        return self.reg.set_state(row["id"], "queued") or row
+
+    def test_share_file_is_moved_to_failed_not_deleted(self):
+        row = self.share_row()
+        out = self.cancel(row["id"])
+        self.assertEqual(out["state"], "cancelled")
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.outbox, row["filename"])))
+        self.assertTrue(os.path.exists(os.path.join(self.cfg.failed, row["filename"])))
+        self.assertEqual(os.listdir(self.cfg.outbox), [])
+
+    def test_api_staging_copy_is_deleted(self):
+        row = self.share_row("5551234567_x-lf000000000001.pdf")
+        self.reg.upsert_job({"id": row["id"], "origin": "api"})
+        out = self.cancel(row["id"])
+        self.assertEqual(out["state"], "cancelled")
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.outbox, row["filename"])))
+        self.assertEqual(os.listdir(self.cfg.failed), [])
+
+    def test_a_file_that_cannot_be_removed_reverts_the_row_and_refuses(self):
+        from unittest.mock import patch
+        import faxd.main as main_mod
+        from faxd.api import CancelRefused
+        row = self.share_row()
+        name = row["filename"]
+        # neither a move nor an unlink can take the file (a watcher holds it, say): the "file"
+        # survives the cancel, so the row must go back to queued and the cancel must refuse
+        real = main_mod._unlink
+        stubborn = lambda path: False if os.path.basename(path) == name else real(path)
+        with patch.object(main_mod, "_unlink", stubborn), patch.object(main_mod, "_move", lambda s, d: False):
+            with self.assertRaises(CancelRefused):
+                self.cancel(row["id"])
+        self.assertEqual(self.reg.get_job(row["id"])["state"], "queued")   # honest again
+
+    def test_pending_part_file_and_unobserved_env_are_removed(self):
+        from faxd.enqueue import enqueue_pdf
+        row = self.share_row("5551234567_env-lf000000000002.pdf")
+        self.reg.upsert_job({"id": row["id"], "origin": "api"})
+        name = row["filename"]
+        # the enqueue's rename is still pending, and the pipeline wrote the env after the observer's scan
+        os.unlink(os.path.join(self.cfg.outbox, name))
+        with open(os.path.join(self.cfg.outbox, "." + name + ".part"), "wb") as f:
+            f.write(PDF)
+        env = os.path.join(self.cfg.outqueue, "j20261014-160000-x.env")
+        with open(env, "w", encoding="utf-8") as f:
+            f.write(f"TO='5551234567'\nSRCFILE='/srv/fax/outbox/{name}'\n")
+        other = os.path.join(self.cfg.outqueue, "j20261014-160001-y.env")
+        with open(other, "w", encoding="utf-8") as f:
+            f.write("TO='5550000000'\nSRCFILE='/srv/fax/outbox/other.pdf'\n")
+        out = self.cancel(row["id"])
+        self.assertEqual(out["state"], "cancelled")
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.outbox, "." + name + ".part")))
+        self.assertFalse(os.path.exists(env))
+        self.assertTrue(os.path.exists(other))

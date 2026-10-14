@@ -86,14 +86,24 @@ def _unlink(path):
         return False
 
 
+def _move(path, dest):
+    try:
+        os.replace(path, dest)
+        return True
+    except OSError:
+        return False
+
+
 def cancel_job(cfg, reg, bus, progress, ami, job_id) -> Optional[dict]:
     """Stop a job the user no longer wants sent. Returns the cancelled row.
 
     queued: the pipeline has not dialled yet -- mark the row first (so a concurrent
-    pickup cannot win), then remove the outbox/queue-meta files that would feed the
-    pipeline. dialing/sending: the call is up -- hang up its channel through AMI, then
-    mark the row; the receipt the pipeline writes afterwards finds a terminal row and
-    changes nothing.
+    state change cannot win), then remove the files that would feed the pipeline:
+    faxd's own staging copies (api/test origin) are deleted, a file the user dropped
+    on the share is moved to failed/ so it is never re-queued as a new fax but stays
+    retrievable. dialing/sending: the call is up -- hang up its channel through AMI,
+    then mark the row; the receipt the pipeline writes afterwards finds a terminal row
+    and changes nothing.
     """
     row = reg.get_job(job_id)
     if row is None:
@@ -120,14 +130,48 @@ def cancel_job(cfg, reg, bus, progress, ami, job_id) -> Optional[dict]:
             raise CancelRefused(f"the fax already moved on ({(now or row).get('state')})")
         name = row.get("filename")
         if name:
-            _unlink(os.path.join(cfg.outbox, name))
-            _unlink(os.path.join(cfg.sending, name))
+            own_file = row.get("origin") in ("api", "test")
+            outbox = os.path.join(cfg.outbox, name)
+            sending = os.path.join(cfg.sending, name)
+            for path in (outbox, sending):
+                if not os.path.exists(path):
+                    continue
+                if own_file:
+                    _unlink(path)
+                else:
+                    # the user's file: keep it, but out of every rule's reach
+                    if not _move(path, os.path.join(cfg.failed, name)) and not _unlink(path):
+                        log.warning("cancel of %s: %s could not be removed", job_id, path)
+            # the enqueue's atomic rename may still be pending: its temp must not resurrect the fax
+            _unlink(os.path.join(cfg.outbox, "." + name + ".part"))
             _unlink(os.path.join(cfg.queue_meta, name + ".json"))
         if row.get("ast_jobid"):
             _unlink(os.path.join(cfg.outqueue, row["ast_jobid"] + ".env"))
+        elif name and os.path.isdir(cfg.outqueue):
+            # the pipeline may have written the env since the observer's last scan
+            for fn in os.listdir(cfg.outqueue):
+                if not fn.endswith(".env"):
+                    continue
+                try:
+                    with open(os.path.join(cfg.outqueue, fn), "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                except OSError:
+                    continue
+                if name in content:   # unlink after the read handle is closed (Windows)
+                    _unlink(os.path.join(cfg.outqueue, fn))
+        # the pipeline may have picked the file up in the same instant: a file that
+        # survived could still be faxed, so the row goes back to queued (honest) and
+        # the caller is told the cancel did not land
+        if name and (os.path.exists(os.path.join(cfg.outbox, name)) or
+                     os.path.exists(os.path.join(cfg.sending, name))):
+            back = reg.set_state_if(job_id, ("cancelled",), "queued")
+            if back is not None:
+                bus.publish("job", **back)
+            raise CancelRefused("the pipeline already picked this fax up; if it is dialing, cancel again")
     if new is None or new.get("state") != "cancelled":
         # the pipeline finished it between our read and the guarded write
-        raise CancelRefused(f"the fax already moved on ({(new or row).get('state')})")
+        now = reg.get_job(job_id) or row
+        raise CancelRefused(f"the fax already moved on ({(new or now).get('state')})")
     bus.publish("job", **new)
     log.info("job %s cancelled by request (was %s)", job_id, state)
     return new

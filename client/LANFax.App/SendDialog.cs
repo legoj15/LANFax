@@ -87,7 +87,10 @@ internal sealed class SendDialog : Form
     public SendDialog(ClientConfig cfg, ISendApi api, SendRequest request, JobTracker? journal, Action openSettings)
     {
         _cfg = cfg; _openSettings = openSettings;
-        _executor = new SendExecutor(api, cfg, request.PdfPath != null ? journal : null,
+        // A compose fax journals like a printed one: its record must exist before the first byte
+        // goes out, or a crash mid-upload means a duplicate fax (a test page has nothing to journal).
+        _executor = new SendExecutor(api, cfg,
+            request.PdfPath != null || request.Kind == SendKind.Compose ? journal : null,
             (m, e) => { if (e == null) FileLog.Info(m); else FileLog.Error(m, e); });
         Request = request;
         Session = SendSession.For(request);
@@ -230,15 +233,23 @@ internal sealed class SendDialog : Form
     private void AddDoc(SendDoc doc)
     {
         _docs.Add(doc);
+        DocumentStaged?.Invoke(doc.Id);
         RenderDocuments();
         _ = DescribeAsync(doc);
     }
 
-    /// <summary>A document printed while this dialog was open joins the fax (the tray asked the user first).</summary>
-    public void AddPrinted(Guid spoolId, string pdfPath)
+    /// <summary>Raised with each staged document's spool id, so the runtime never re-offers it as a new print.</summary>
+    public event Action<Guid>? DocumentStaged;
+
+    /// <summary>
+    /// A document printed while this dialog was open joins the fax (the tray asked the user first). False when it
+    /// could not be taken now (busy, locked, already staged): the caller then offers it its own dialog.
+    /// </summary>
+    public bool AddPrinted(Guid spoolId, string pdfPath)
     {
-        if (!CanChangeDocuments) return;
+        if (!CanChangeDocuments || _docs.Any(d => d.Id == spoolId)) return false;
         AddDoc(new SendDoc(spoolId, pdfPath));
+        return true;
     }
 
     private void RemoveSelected()

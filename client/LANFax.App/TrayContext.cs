@@ -321,13 +321,12 @@ internal sealed class TrayContext : ApplicationContext
             _askingAttach = true;
             try
             {
-                var r = MessageBox.Show("You printed another document.\n\nAdd it to the fax you are preparing?",
+                // owned by the dialog: its fields are disabled while the question is up
+                var r = MessageBox.Show(dlg, "You printed another document.\n\nAdd it to the fax you are preparing?",
                     "LANFax", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button1);
-                if (r == DialogResult.Yes)
-                {
-                    dlg.AddPrinted(req.SpoolId, req.PdfPath!);
+                if (r == DialogResult.Yes && dlg.AddPrinted(req.SpoolId, req.PdfPath!))
                     return;
-                }
+                // No, or the dialog could not take it (it went busy meanwhile): its own dialog, never dropped
             }
             finally { _askingAttach = false; }
         }
@@ -350,6 +349,8 @@ internal sealed class TrayContext : ApplicationContext
         try
         {
             dlg.Text = _queue.Title(dlg.BaseTitle);
+            // Files the dialog stages must never be re-offered as new prints by a listener re-scan.
+            dlg.DocumentStaged += _runtime.MarkSpoolOffered;
             dlg.FormClosed += (_, _) => OnSendDialogClosed(dlg);
             _openDialog = dlg;
             dlg.Show();
