@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 
+from . import gs
 from .events import utcnow_iso
 
 log = logging.getLogger("faxd.enqueue")
@@ -70,17 +71,45 @@ def _unlink(path: str) -> None:
         pass
 
 
-def enqueue_pdf(cfg, reg, bus, pdf_bytes: bytes, to: str, *, subject="", origin="api", client="",
-                client_key=None) -> dict:
-    """Queue a PDF (bytes or bytearray). The row and queue-meta exist before the final
-    outbox name appears, so the observer never sees a file without its row.
+def _compose_fax(cfg, parts: list, header) -> bytes:
+    """One PDF out of the request's parts: merged when several, stamped with the fax
+    header (sender, recipient, date, page numbers) when the server is configured for it.
+
+    A single unstamped part keeps its exact bytes (what was printed is what is faxed). A
+    stamping failure on a single document falls back to the original bytes -- a fax
+    without a header beats no fax; only a merge failure refuses the request.
+    """
+    if len(parts) == 1 and not header:
+        return parts[0][1]
+    try:
+        return gs.compose(getattr(cfg, "gs_bin", "gs"), parts, header=header,
+                          footer=bool(header))
+    except gs.GsError as e:
+        if len(parts) == 1:
+            log.warning("stamping failed; sending the document unstamped: %s", e)
+            return parts[0][1]
+        raise ValueError("the documents could not be combined into one fax "
+                         f"(ghostscript: {e})") from e
+
+
+def enqueue_pdf(cfg, reg, bus, pdf, to: str, *, subject="", origin="api", client="",
+                client_key=None, parts: list = None) -> dict:
+    """Queue a PDF (bytes, or a list of (name, bytes) parts sent as one fax). The row and
+    queue-meta exist before the final outbox name appears, so the observer never sees a
+    file without its row.
 
     `client_key` (the Idempotency-Key) is stored on the row, globally unique. A key used
     before (from any address) raises ExistingJob with that row, also when two requests race
     to insert it; the caller decides whether the number matches."""
-    if not pdf_bytes.startswith(b"%PDF"):
-        raise ValueError("body is not a PDF")
+    if parts is None:
+        parts = pdf if isinstance(pdf, list) else [("fax.pdf", pdf)]
+    for _, data in parts:
+        if not data.startswith(b"%PDF"):
+            raise ValueError("body is not a PDF")
     number = check_number(normalize_number(to), getattr(cfg, "allowed_numbers", DEFAULT_ALLOWED))
+    header = (gs.header_text(getattr(cfg, "station_id", "LANFax"), number)
+              if getattr(cfg, "fax_header", False) else None)
+    pdf_bytes = _compose_fax(cfg, parts, header)
     client_key = client_key or None
     if client_key:
         prior = reg.find_by_client_key(client_key)
@@ -100,6 +129,8 @@ def enqueue_pdf(cfg, reg, bus, pdf_bytes: bytes, to: str, *, subject="", origin=
             f.write(pdf_bytes)
         meta = {"id": job_id, "to": number, "subject": subject, "origin": origin,
                 "client": client, "client_key": client_key, "created_at": now}
+        if len(parts) > 1:
+            meta["parts"] = len(parts)
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f)
         row = reg.upsert_job({

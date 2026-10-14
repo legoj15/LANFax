@@ -741,6 +741,44 @@ default for that value; a token that is not decryptable for this user is
 dropped; all set `LoadError` (never contains the token) for the App to
 show.
 
+## Send usability (1.1.0)
+
+Seven user asks from the 2026-10-14 blank-page incident, all implemented:
+
+- **Pick files instead of printing**: "Send a fax..." (tray menu, and a
+  button beside the window title) opens the compose dialog; the picker is
+  multi-select, chosen PDFs are copied into `spool\jobs\` under fresh guids
+  so the whole journal machinery covers them unchanged. The compose dialog
+  is `SendKind.Compose`: same fields, no test-page checkbox, Send disabled
+  until at least one document.
+- **One fax, several documents**: `SendPlan` carries `PdfPaths` (cover
+  page first); `TrackedJob.Parts` records the extra spool ids on the one
+  record, so finish/discard/scan/resume handle every file (a part's PDF is
+  never offered as a document of its own: `Scan`/`NewDocuments` skip ids
+  named by a record's parts). One document is uploaded as its exact bytes;
+  several go as one `multipart/form-data` body the server merges.
+  `SendDialog` shows the list with per-file pages/size, add/remove buttons.
+- **"Add it to the fax?" prompt**: a print that arrives while a
+  composing-capable dialog is open (not locked, not busy, `New`/`Compose`)
+  asks Yes/No -- Yes attaches (`SendDialog.AddPrinted`), No queues a dialog
+  of its own. `PromptToAddPages` (default on) in Settings turns the
+  question off; with it off, or while the dialog cannot take documents,
+  prints open their own dialogs exactly as before.
+- **Blank-page pre-check**: before the attempt, `SendExecutor.PreCheckAsync`
+  POSTs the documents to `/analyze`; blank pages prompt "send anyway?".
+  A 404/405/501 (older faxd), 401 or network failure skips the check; a
+  400 (merge failure) blocks with the server's reason.
+- **Cancel**: `POST /jobs/{id}/cancel` through the runtime (which applies
+  the answer to the rows). Right-click a queued/dialing/sending row ->
+  "Cancel this fax..." with a confirmation naming the risk (a transmitting
+  fax stops mid-send).
+- **Copy number**: right-click any row in either grid -> "Copy number".
+- **Receipts**: a sent fax's balloon click opens `ReceiptDialog` (number,
+  subject, pages, finish time, transmission detail and the job's event
+  history from `GET /jobs/{id}`), with Open PDF and Copy number; double-
+  click (or right-click) a sent row opens the same window. `Job` gained an
+  optional `Detail`; `MonitorRow` carries the raw `State`.
+
 ## Build and test rules
 
 - Tests first in `LANFax.Tests` for Core: number normalization, spool

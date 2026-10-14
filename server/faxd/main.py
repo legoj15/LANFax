@@ -12,10 +12,10 @@ from typing import Callable, Mapping, Optional
 
 from . import __version__
 from .ami import AmiClient, AmiError, AmiProgress
-from .api import Api
+from .api import Api, CancelRefused
 from .arm import ArmController
 from .config import DEFAULT_ENV_FILE, Config, load
-from .db import Registry
+from .db import Registry, TERMINAL_STATES
 from .enqueue import enqueue_pdf
 from .events import EventBus, utcnow_iso
 from .spool import SpoolObserver
@@ -78,6 +78,61 @@ def build_status_fn(cfg: Config, reg: Registry, ami: AmiClient) -> Callable[[], 
     return status
 
 
+def _unlink(path):
+    try:
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+
+
+def cancel_job(cfg, reg, bus, progress, ami, job_id) -> Optional[dict]:
+    """Stop a job the user no longer wants sent. Returns the cancelled row.
+
+    queued: the pipeline has not dialled yet -- mark the row first (so a concurrent
+    pickup cannot win), then remove the outbox/queue-meta files that would feed the
+    pipeline. dialing/sending: the call is up -- hang up its channel through AMI, then
+    mark the row; the receipt the pipeline writes afterwards finds a terminal row and
+    changes nothing.
+    """
+    row = reg.get_job(job_id)
+    if row is None:
+        return None
+    state = row.get("state")
+    if state in TERMINAL_STATES:
+        raise CancelRefused(f"the fax already finished ({state})")
+    if state in ("dialing", "sending"):
+        chan = progress.channel_for(job_id)
+        if not chan:
+            raise CancelRefused("the call is being placed; try again in a few seconds")
+        try:
+            resp = ami.action("Hangup", Channel=chan)
+        except AmiError as e:
+            raise CancelRefused(f"the PBX could not hang up the call: {e}") from e
+        if resp.get("Response") != "Success":
+            raise CancelRefused("the PBX refused to hang up the call")
+        new = reg.set_state_if(job_id, ("dialing", "sending"), "cancelled",
+                               error="cancelled before finishing")
+    else:
+        new = reg.set_state_if(job_id, ("queued",), "cancelled", error="cancelled before sending")
+        if new is None:
+            now = reg.get_job(job_id)
+            raise CancelRefused(f"the fax already moved on ({(now or row).get('state')})")
+        name = row.get("filename")
+        if name:
+            _unlink(os.path.join(cfg.outbox, name))
+            _unlink(os.path.join(cfg.sending, name))
+            _unlink(os.path.join(cfg.queue_meta, name + ".json"))
+        if row.get("ast_jobid"):
+            _unlink(os.path.join(cfg.outqueue, row["ast_jobid"] + ".env"))
+    if new is None or new.get("state") != "cancelled":
+        # the pipeline finished it between our read and the guarded write
+        raise CancelRefused(f"the fax already moved on ({(new or row).get('state')})")
+    bus.publish("job", **new)
+    log.info("job %s cancelled by request (was %s)", job_id, state)
+    return new
+
+
 class Daemon:
     """All components plus their threads. start()/stop() are idempotent-ish."""
 
@@ -99,7 +154,11 @@ class Daemon:
             return enqueue_pdf(cfg, self.reg, self.bus, pdf, to, subject=subject,
                                origin=origin, client=client, client_key=client_key)
 
-        self.api = Api(cfg, self.reg, self.bus, self.arm, self.status_fn, enqueue, make_test_pdf)
+        def cancel(job_id):
+            return cancel_job(cfg, self.reg, self.bus, self.progress, self.ami, job_id)
+
+        self.api = Api(cfg, self.reg, self.bus, self.arm, self.status_fn, enqueue, make_test_pdf,
+                       cancel_fn=cancel)
         self.port = self.api.port
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []

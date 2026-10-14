@@ -49,6 +49,8 @@ public enum SendKind
 {
     /// <summary>A fresh print job (or an unsent PDF with no record).</summary>
     New,
+    /// <summary>The tray's or window's "Send a fax": no document yet, the dialog picks files (or takes prints) to send.</summary>
+    Compose,
     /// <summary>The server reported the job failed: prefilled, fresh key.</summary>
     Retry,
     /// <summary>An earlier attempt was definitely not accepted: prefilled, fresh key.</summary>
@@ -59,13 +61,33 @@ public enum SendKind
     Suspect,
 }
 
-/// <summary>What a send dialog is opened for: a spooled PDF or, with no PDF, a test page.</summary>
+/// <summary>What a send dialog is opened for: spooled PDFs, or with no PDF a test page or a compose-from-files fax.</summary>
 /// <param name="Server">For <see cref="SendKind.Resume"/>: the authority (host:port) the stored key went to, null when
 /// the record predates it.</param>
+/// <param name="Parts">Additional spool ids faxed with <see cref="SpoolId"/>'s document (the record's parts).</param>
 public sealed record SendRequest(Guid SpoolId, string? PdfPath, string? Number = null, string? Subject = null,
-    SendKind Kind = SendKind.New, SendPlan? LockedPlan = null, string? Server = null)
+    SendKind Kind = SendKind.New, SendPlan? LockedPlan = null, string? Server = null,
+    IReadOnlyList<Guid>? Parts = null)
 {
     public bool NeedsConfirmation => Kind == SendKind.Suspect;
+
+    /// <summary>The primary document plus its parts, in send order (empty for a test page or the compose dialog).</summary>
+    public IReadOnlyList<string> AllPdfPaths
+    {
+        get
+        {
+            var paths = new List<string>();
+            if (PdfPath != null) paths.Add(PdfPath);
+            var dir = Path.GetDirectoryName(PdfPath ?? ".");
+            if (Parts != null && dir != null)
+                foreach (var g in Parts)
+                {
+                    var p = Path.Combine(dir, g + ".pdf");
+                    if (paths.Count == 0 || !string.Equals(p, PdfPath, StringComparison.OrdinalIgnoreCase)) paths.Add(p);
+                }
+            return paths;
+        }
+    }
 }
 
 /// <summary>The event stream's 401 balloon: once per app run, re-armed when Settings are saved.</summary>

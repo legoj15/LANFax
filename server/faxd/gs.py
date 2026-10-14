@@ -1,0 +1,187 @@
+"""Ghostscript helpers: multi-document merge, fax header stamping, blank-page analysis.
+
+gs is already a hard dependency of the outbound pipeline (PDF -> TIFF G4), so these
+reuse it rather than adding a PDF library. Everything here is best effort with one
+exception: compose() with more than one document cannot fall back (a multi-part fax
+must be one PDF), and raises GsError for the caller to refuse.
+"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import tempfile
+from datetime import datetime
+from typing import Optional
+
+DEFAULT_DPI = 50            # enough to tell ink from paper; a page renders in ~50 ms
+BLANK_THRESHOLD = 252       # a page whose darkest sample is at least this is blank paper
+ASCII_ONLY = re.compile(r"[^ -~]")   # header/footer text must be ASCII (PostScript string)
+
+
+class GsError(Exception):
+    """gs is missing, timed out, or failed on the input."""
+
+
+def _gs(gs_bin: str, args: list[str], timeout: float) -> bytes:
+    """Run gs to completion; returns its stderr (the bbox device reports there). Raises GsError."""
+    try:
+        p = subprocess.run([gs_bin, *args], capture_output=True, timeout=timeout)
+    except FileNotFoundError as e:
+        raise GsError(f"ghostscript ({gs_bin}) is not installed") from e
+    except subprocess.TimeoutExpired as e:
+        raise GsError(f"ghostscript timed out after {timeout:.0f}s") from e
+    if p.returncode != 0:
+        tail = p.stderr.decode("utf-8", "replace").strip().splitlines()[-6:]
+        raise GsError("ghostscript failed: " + " | ".join(tail))
+    return p.stderr
+
+
+def _escape(text: str) -> str:
+    r"""A PostScript string literal body: ASCII, with ( ) \ escaped."""
+    return ASCII_ONLY.sub("?", text).replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+
+
+def _stamp_prologue(header: Optional[str], footer_total: Optional[int]) -> str:
+    """The -c PostScript that stamps every page via the page device's BeginPage hook.
+
+    BeginPage receives the page device dict (popped, unread: the Red Book forbids
+    looking inside) and runs before each page is imaged, so the stamp lands on every
+    page of every input document. Page geometry comes from clippath, not the device
+    dict, and lands in points with the origin at the bottom-left corner.
+    """
+    lines = ["userdict /pg 0 put", "<< /BeginPage {",
+             "  pop",
+             "  userdict /pg userdict /pg get 1 add put",
+             "  gsave",
+             "    /Helvetica findfont 7 scalefont setfont 0 setgray",
+             "    clippath pathbbox userdict begin",
+             "      /ury exch def /urx exch def /lly exch def /llx exch def"]
+    if header:
+        lines.append(f"      llx 20 add ury 20 sub moveto ({_escape(header)}) show")
+    if footer_total:
+        lines.append("      llx 20 add lly 10 add moveto"
+                     " (Page ) show userdict /pg get 20 string cvs show"
+                     f" ( of {footer_total}) show")
+    elif footer_total is None and header:
+        # page numbers wanted but the count failed: number alone rather than nothing
+        lines.append("      llx 20 add lly 10 add moveto"
+                     " (Page ) show userdict /pg get 20 string cvs show")
+    lines += ["    end", "  grestore", "} bind >> setpagedevice"]
+    return "\n".join(lines)
+
+
+def compose(gs_bin: str, parts: list[tuple[str, bytes]], *, header: Optional[str] = None,
+            footer: bool = False, timeout: float = 60.0) -> bytes:
+    """One PDF out of <parts> (name, pdf bytes), optionally stamped per page.
+
+    A single unstamped part is returned byte-for-byte: the print path's exact bytes
+    stay what the server faxes and keeps. Stamping or merging re-encodes through
+    gs pdfwrite, which is fine (the pipeline rasterises for transmission anyway).
+    """
+    if len(parts) == 1 and not header and not footer:
+        return parts[0][1]
+    total: Optional[int] = None
+    if footer:
+        try:
+            total = sum(filter(None, (page_count(gs_bin, b, timeout=timeout) for _, b in parts)))
+        except GsError:
+            total = None   # footer without the total beats no footer
+    with tempfile.TemporaryDirectory(prefix="faxd-gs-") as tmp:
+        names = []
+        for i, (_, data) in enumerate(parts):
+            path = os.path.join(tmp, f"in{i}.pdf")
+            with open(path, "wb") as f:
+                f.write(data)
+            names.append(path)
+        out = os.path.join(tmp, "out.pdf")
+        args = ["-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pdfwrite",
+                "-dAutoRotatePages=/None", "-o", out]
+        if header or footer:
+            args += ["-c", _stamp_prologue(header, total), "-f", *names]
+        else:
+            args += names
+        _gs(gs_bin, args, timeout)
+        with open(out, "rb") as f:
+            return f.read()
+
+
+def page_count(gs_bin: str, pdf: bytes, timeout: float = 30.0) -> Optional[int]:
+    """Pages of a PDF per gs's bbox device (one HiResBoundingBox line per page on stderr)."""
+    with tempfile.TemporaryDirectory(prefix="faxd-gs-") as tmp:
+        path = os.path.join(tmp, "in.pdf")
+        with open(path, "wb") as f:
+            f.write(pdf)
+        err = _gs(gs_bin, ["-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=bbox",
+                           "-o", os.devnull, path], timeout)
+        return err.count(b"HiResBoundingBox") or None
+
+
+def _pgm_min(data: bytes) -> Optional[int]:
+    """The darkest sample of a P5 (binary graymap, maxval<=255) image, or None if unreadable."""
+    fields: list[bytes] = []
+    i, n = 0, len(data)
+    while len(fields) < 4 and i < n:
+        c = data[i:i + 1]
+        if c == b"#":
+            while i < n and data[i:i + 1] not in (b"\n", b"\r"):
+                i += 1
+        elif c.isspace():
+            i += 1
+        else:
+            j = i
+            while j < n and not data[j:j + 1].isspace():
+                j += 1
+            fields.append(data[i:j])
+            i = j
+    if len(fields) < 4 or fields[0] != b"P5":
+        return None
+    try:
+        w, h, maxval = (int(x) for x in fields[1:4])
+        if w <= 0 or h <= 0 or not 0 < maxval < 256:
+            return None
+    except ValueError:
+        return None
+    i += 1   # exactly one whitespace byte after maxval
+    body = data[i:i + w * h]
+    if len(body) < w * h:
+        return None
+    return min(body)
+
+
+def blank_pages(gs_bin: str, pdf: bytes, *, dpi: int = DEFAULT_DPI,
+                threshold: int = BLANK_THRESHOLD, max_pages: int = 200,
+                timeout: float = 60.0) -> list[int]:
+    """1-based numbers of pages that render as blank paper ([] when gs cannot say).
+
+    Renders at low dpi and flags a page whose darkest sample still rounds to white:
+    that is the signature of both incident variants (a page with no drawing
+    operators and one whose blitted raster strips are pure white).
+    """
+    try:
+        with tempfile.TemporaryDirectory(prefix="faxd-gs-") as tmp:
+            path = os.path.join(tmp, "in.pdf")
+            with open(path, "wb") as f:
+                f.write(pdf)
+            _gs(gs_bin, ["-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pgmraw",
+                         "-r" + str(dpi), "-o", os.path.join(tmp, "p-%d.pgm"), path], timeout)
+            nums = []
+            for name in sorted(os.listdir(tmp)):
+                m = re.fullmatch(r"p-(\d+)\.pgm", name)
+                if not m:
+                    continue
+                if len(nums) >= max_pages:
+                    break
+                with open(os.path.join(tmp, name), "rb") as f:
+                    darkest = _pgm_min(f.read())
+                if darkest is not None and darkest >= threshold:
+                    nums.append(int(m.group(1)))
+            return nums
+    except GsError:
+        return []
+
+
+def header_text(station_id: str, to: str, now: Optional[datetime] = None) -> str:
+    """The top line burned into every page: who, to whom, when (the fax machine convention)."""
+    stamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M")
+    return f"TO {to} FROM {station_id} {stamp}"

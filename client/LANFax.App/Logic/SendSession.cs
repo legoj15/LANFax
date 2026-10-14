@@ -83,9 +83,15 @@ public sealed class SendSession
     private Uri? _inFlightServer;
 
     public SendSession(Guid spoolId, string? pdfPath, Func<Guid>? newKey = null)
+        : this(spoolId, pdfPath == null ? null : new[] { pdfPath }, testPageWhenEmpty: true, newKey) { }
+
+    /// <param name="testPageWhenEmpty">What no documents means: the tray's test page (true) or the compose
+    /// dialog, which adds its documents before sending (false).</param>
+    public SendSession(Guid spoolId, IReadOnlyList<string>? pdfPaths, bool testPageWhenEmpty, Func<Guid>? newKey = null)
     {
         SpoolId = spoolId;
-        PdfPath = pdfPath;
+        PdfPaths = pdfPaths?.ToList() ?? [];
+        _testPageWhenEmpty = testPageWhenEmpty;
         _newKey = newKey ?? Guid.NewGuid;
         IdempotencyKey = _newKey().ToString();
     }
@@ -93,7 +99,8 @@ public sealed class SendSession
     private SendSession(SendPlan locked, Uri? server, Func<Guid> newKey)
     {
         SpoolId = locked.JobId;
-        PdfPath = locked.PdfPath;
+        PdfPaths = locked.PdfPaths.ToList();
+        _testPageWhenEmpty = true;
         _newKey = newKey;
         IdempotencyKey = locked.IdempotencyKey;
         LockedPlan = locked;
@@ -112,13 +119,18 @@ public sealed class SendSession
     /// <summary>The session a dialog opens for <paramref name="request"/>: resumed (locked and pinned) or fresh.</summary>
     public static SendSession For(SendRequest request) => request.LockedPlan is { } locked
         ? Resume(locked, request.Server)
-        : new SendSession(request.SpoolId, request.PdfPath);
+        : new SendSession(request.SpoolId, request.AllPdfPaths,
+            testPageWhenEmpty: request.PdfPath == null && request.Kind != SendKind.Compose);
 
     private static Uri? ServerUri(string? authority) =>
         !string.IsNullOrEmpty(authority) && Uri.TryCreate("http://" + authority + "/", UriKind.Absolute, out var u) ? u : null;
 
+    private readonly bool _testPageWhenEmpty;
+
     public Guid SpoolId { get; }
-    public string? PdfPath { get; }
+    public IReadOnlyList<string> PdfPaths { get; }
+    /// <summary>The first (cover) document; null with none.</summary>
+    public string? PdfPath => PdfPaths.Count > 0 ? PdfPaths[0] : null;
     public string IdempotencyKey { get; private set; }
     public int Attempts { get; private set; }
     public SendPlan? LockedPlan { get; private set; }
@@ -132,13 +144,13 @@ public sealed class SendSession
     /// Cancel keeps the document (listed under "Unsent documents") instead of deleting it: the server may have the
     /// job, so the document and its record must not be lost. The tray's test page has no document to keep.
     /// </summary>
-    public bool CancelKeepsDocument => FieldsLocked && PdfPath != null;
+    public bool CancelKeepsDocument => FieldsLocked && PdfPaths.Count > 0;
 
     /// <summary>
     /// <see cref="CancelKeepsDocument"/>, and also for a <see cref="SendKind.Suspect"/> document: its warning says it
     /// may already have been sent, so a user who cancels rather than risk a duplicate must not lose it.
     /// </summary>
-    public bool CancelKeepsDocumentFor(SendKind kind) => PdfPath != null && (FieldsLocked || kind == SendKind.Suspect);
+    public bool CancelKeepsDocumentFor(SendKind kind) => PdfPaths.Count > 0 && (FieldsLocked || kind == SendKind.Suspect);
     /// <summary>Locked from a record on disk (a previous run), not by a failure in this dialog.</summary>
     public bool Resumed { get; }
     /// <summary>Resumed from a record written before the server was recorded: nothing pins it to one server.</summary>
@@ -151,7 +163,8 @@ public sealed class SendSession
 
     /// <summary>The plan for the next attempt: the frozen one when locked, else built from the fields (may throw ArgumentException).</summary>
     public SendPlan Build(string rawNumber, string? subject, bool useTestPage, bool keepLocalCopies) =>
-        LockedPlan ?? SendPlan.Create(SpoolId, PdfPath ?? "", rawNumber, subject, useTestPage || PdfPath == null,
+        LockedPlan ?? SendPlan.Create(SpoolId, PdfPaths, rawNumber, subject,
+            useTestPage || (PdfPaths.Count == 0 && _testPageWhenEmpty),
             keepLocalCopies, IdempotencyKey);
 
     /// <summary>The request is about to go out. Call after the plan is validated and persisted.</summary>

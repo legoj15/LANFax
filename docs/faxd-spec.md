@@ -53,6 +53,8 @@ class Config:
     faxin_ext: str = "300"
     allowed_numbers: str = "nanp,000,ext"  # FAXD_ALLOWED_NUMBERS, see enqueue.py
     event_retention_days: int = 30         # FAXD_EVENT_RETENTION_DAYS; job_events older are pruned, 0 = keep
+    gs_bin: str = "gs"                     # FAXD_GS_BIN; the merge/stamp/blank-analysis binary
+    fax_header: bool = False               # FAXD_FAX_HEADER (1/true/yes/on); stamp sender/recipient/date + page numbers
 
 def load(env_file="/etc/faxserver/settings.env", environ=os.environ) -> Config
 ```
@@ -371,10 +373,18 @@ failure (`SubprocessError`/`OSError`) raises `ArmError` (HTTP 502).
 def safe_slug(s: str, maxlen=24) -> str            # [A-Za-z0-9-] only
 def normalize_number(s: str) -> str                # digits only; 10-digit NANP -> "1"+digits; raise ValueError if < 2 digits
 def check_number(number: str, allowed: str) -> str # FAXD_ALLOWED_NUMBERS rules, ValueError naming the rule
-def enqueue_pdf(cfg, reg, bus, pdf_bytes: bytes, to: str, *, subject="", origin="api", client="",
-                client_key=None) -> dict
+def enqueue_pdf(cfg, reg, bus, pdf, to: str, *, subject="", origin="api", client="",
+                client_key=None, parts=None) -> dict
 class ExistingJob(Exception): job: dict   # client_key already used; nothing was written
 ```
+
+`pdf` may be one PDF (`bytes`/`bytearray`) or `parts` a list of
+`(name, bytes)` sent as one fax: several parts are merged (and everything
+stamped when `FAXD_FAX_HEADER=1`) through `gs.compose` before the outbox
+file is written; `queue-meta` records `parts: <n>` for a multi-part fax.
+A single unstamped document is written byte-for-byte. A merge failure of
+several parts raises ValueError (HTTP 400: "could not be combined"); a
+stamping failure of a single document logs and sends the original bytes.
 
 Writes `<number>_<slug>-<id>.pdf` where `<id>` is the new `lf…` row id and
 slug is `safe_slug(subject) or "fax"`. Order matters (the observer must never
@@ -415,6 +425,42 @@ have correct xref offsets. Test: bytes start `%PDF-1.4`, end with
 `%%EOF`, contain `/Type /Page`, contain the number, and if `gs` is on PATH,
 `gs -dNOPAUSE -dBATCH -sDEVICE=nullpage` exits 0.
 
+## gs.py
+
+Ghostscript is already a hard dependency of the outbound pipeline (PDF ->
+TIFF G4); `gs.py` reuses it rather than adding a PDF library. All functions
+are best effort with one exception: a merge of several documents cannot
+fall back and raises `GsError` for the caller to refuse the request. The
+subprocess seam is `gs._gs(gs_bin, args, timeout)` (tests fake it; the
+deployed server runs the real binary, verified live on gs 10.02.1).
+
+```python
+def compose(gs_bin, parts, *, header=None, footer=False, timeout=60.0) -> bytes
+def page_count(gs_bin, pdf, timeout=30.0) -> int | None      # bbox device, HiRes lines
+def blank_pages(gs_bin, pdf, *, dpi=50, threshold=252, max_pages=200) -> list[int]
+def header_text(station_id, to, now=None) -> str              # "TO <to> FROM <station> <date>"
+```
+
+- `compose`: one PDF out of `(name, bytes)` parts via `-sDEVICE=pdfwrite`;
+  a single unstamped part is returned byte-for-byte (the print path's exact
+  bytes stay what is faxed and kept in `sent/`). `header`/`footer` stamp
+  every page through the page device's `BeginPage` hook (a `-c` PostScript
+  prologue before `-f`): the header at the top-left, `Page n of N` at the
+  bottom-left, 7 pt Helvetica, page geometry from `clippath pathbbox`.
+  Page counts for `of N` come from a bbox pass per input (sum); a failed
+  count leaves the page number without the total.
+- `blank_pages`: renders at 50 dpi (`pgmraw`, one `.pgm` per page) and
+  flags pages whose darkest sample is still `>= 252` -- both incident
+  variants (a page with no drawing operators and one whose raster strips
+  are pure white). Any gs failure returns `[]` (never blocks a send).
+
+Config: `FAXD_GS_BIN` (default `gs`), `FAXD_FAX_HEADER` (default off;
+`1/true/yes/on`) stamps `header_text(cfg.station_id, number)` plus page
+numbers on every outbound fax at enqueue time. A stamping failure on a
+single document falls back to the original bytes; a merge failure of
+several parts refuses the request (400). The stored sent PDF is the
+stamped one, so the receipt matches what was faxed.
+
 ## api.py
 
 `ThreadingHTTPServer` + `BaseHTTPRequestHandler`, `daemon_threads=True`.
@@ -425,7 +471,7 @@ Request logs never contain `token=` values (redacted to `token=***`).
 ```python
 class Api:
     def __init__(self, cfg, reg, bus, arm: ArmController, status_fn: Callable[[], dict],
-                 enqueue_fn, testpage_fn)
+                 enqueue_fn, testpage_fn, *, cancel_fn=None)
     def serve_forever(self); def shutdown(self)
 ```
 
@@ -447,7 +493,9 @@ Routes:
 | `GET /jobs?direction=out&state=sent,failed&limit=50` | `{"jobs":[…]}` newest first. `since=` filters `created_at >=` (raw text compare); `updated_since=<iso8601>` filters `updated_at >=` (normalized to UTC `…Z`, naive = UTC, 400 if unparseable). A reconnecting client polls `updated_since=<last sync>` to catch up. |
 | `GET /jobs/<id>` | job dict + `"events": [...]` |
 | `GET /jobs/<id>/pdf` | streams `pdf_path` as `application/pdf`, `Content-Disposition: inline; filename="<filename>"`; 404 if missing |
-| `POST /jobs` | body is the PDF (`Content-Type: application/pdf`), headers `X-Fax-To` (required), `X-Fax-Subject` (optional), `Idempotency-Key` (optional, 16-128 chars `[A-Za-z0-9._:-]`, else 400 naming the minimum; clients send a random GUID). Keys are global, not per caller ip: a laptop that lost the response and resumes from another ip (Wi-Fi vs Ethernet, new DHCP lease) must dedupe, and random GUIDs do not collide between honest callers. Returns 201 with the new job dict; a repeated key returns 200 with the job it created first and writes nothing (the body is read and discarded), unless the stored job's `to_number` differs from the normalized `X-Fax-To`: then 409 `{"error": "idempotency key already used for a different number"}` and nothing is written. Max body 25 MB (413 before reading; read into one preallocated buffer, no extra copy). At most 2 bodies are read at once: a third upload gets 503 `Retry-After: 2` without its body being read, and the connection is closed (a client that already sent the body may see a reset instead: retry with the same key). |
+| `POST /jobs` | body is one PDF (`Content-Type: application/pdf`) or, for a multi-document fax, `multipart/form-data` with a `file` part per PDF (quoted or bare filenames; each part must start `%PDF`). `enqueue_fn` receives the parts list; several parts are merged (and everything stamped when `FAXD_FAX_HEADER=1`) by `gs.compose`. Headers `X-Fax-To` (required), `X-Fax-Subject` (optional), `Idempotency-Key` (optional, 16-128 chars `[A-Za-z0-9._:-]`, else 400 naming the minimum; clients send a random GUID). Keys are global, not per caller ip: a laptop that lost the response and resumes from another ip (Wi-Fi vs Ethernet, new DHCP lease) must dedupe, and random GUIDs do not collide between honest callers. Returns 201 with the new job dict; a repeated key returns 200 with the job it created first and writes nothing (the body is read and discarded), unless the stored job's `to_number` differs from the normalized `X-Fax-To`: then 409 `{"error": "idempotency key already used for a different number"}` and nothing is written. Max body 25 MB (413 before reading; read into one preallocated buffer, no extra copy). At most 2 bodies are read at once: a third upload gets 503 `Retry-After: 2` without its body being read, and the connection is closed (a client that already sent the body may see a reset instead: retry with the same key). |
+| `POST /analyze` | The pre-send blank-page check (the client's "page N appears blank" prompt): same body forms as `POST /jobs`, merged the way a send would but unstamped (a stamp would ink every page), and answered `{"pages": n, "blank_pages": [1-based numbers]}`. Nothing is enqueued; the same 25 MB cap and upload semaphore apply. An older faxd without the route answers 404, which the client treats as "cannot pre-check" and skips. |
+| `POST /jobs/<id>/cancel` | Stops a job the user no longer wants sent. `queued`: the row is marked cancelled first (a concurrent pipeline pickup cannot win), then the outbox/queue-meta files are removed. `dialing`/`sending`: the live channel (from `AmiProgress.channel_for`) is hung up through AMI, then the row is cancelled; the receipt the pipeline writes afterwards finds a terminal row and changes nothing. 404 unknown id; 409 with the reason when terminal, when the call is being placed but has no channel yet, or when the pipeline moved the job on between the read and the guarded write. Returns the cancelled row (200). |
 | `GET /inbox?limit=50` | inbound jobs newest first |
 | `POST /arm` | JSON `{"minutes": 60}` -> arm state |
 | `POST /disarm` | -> arm state |

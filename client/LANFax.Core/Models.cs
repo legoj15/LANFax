@@ -5,11 +5,21 @@ namespace LANFax.Core;
 public record Job(
     string Id, string Direction, string State, string? Filename, string? ToNumber, string? FromNumber,
     string? Subject, string? Origin, int? Pages, string? Error,
-    DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, DateTimeOffset? FinishedAt)
+    DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, DateTimeOffset? FinishedAt,
+    string? Detail = null)
 {
     /// <summary>faxd TERMINAL_STATES: sent, failed, received, cancelled.</summary>
     public bool IsTerminal => State is "sent" or "failed" or "received" or "cancelled";
 }
+
+/// <summary>One row of a job's <c>job_events</c>: a state transition or progress note.</summary>
+public record JobEvent(long Id, DateTimeOffset Ts, string? State, string? Detail);
+
+/// <summary>GET /jobs/{id}: the job plus its event history (the confirmation's transmission log).</summary>
+public record JobDetail(Job Job, IReadOnlyList<JobEvent> Events);
+
+/// <summary>POST /analyze: the pre-send check behind the blank-page prompt.</summary>
+public record FaxCheck(int? Pages, IReadOnlyList<int> BlankPages);
 
 public record ArmState(bool Armed, DateTimeOffset? Until, int RemainingMin, string Ext);
 

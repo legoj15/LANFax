@@ -12,8 +12,10 @@ public enum PillTone { Neutral, Ok, Bad }
 /// <summary>The header pill: short text and whether it reads as good, bad or neither.</summary>
 public sealed record Pill(string Text, PillTone Tone);
 
-/// <summary>One grid row, already formatted. <c>Party</c> is the "to" number for a sent job, the "from" for a received one.</summary>
-public sealed record MonitorRow(string Id, string Time, string Party, string Badge, BadgeColor Color, string Pages, string Error);
+/// <summary>One grid row, already formatted. <c>Party</c> is the "to" number for a sent job, the "from" for a received one;
+/// <c>State</c> is the raw server (or record) state, for gating actions like cancel.</summary>
+public sealed record MonitorRow(string Id, string Time, string Party, string Badge, BadgeColor Color, string Pages, string Error,
+    string State = "");
 
 /// <summary>
 /// The monitor window's view-model, no UI: the jobs and inbox rows (merged by id, newest first, capped), the badge,
@@ -55,7 +57,7 @@ public sealed partial class MonitorModel(TimeZoneInfo zone)
         var party = j.Direction == "in" ? j.FromNumber : j.ToNumber;
         var (badge, color) = Badge(j.State);
         return new MonitorRow(j.Id, FormatTime(j.CreatedAt), string.IsNullOrWhiteSpace(party) ? "-" : party,
-            badge, color, j.Pages?.ToString(CultureInfo.InvariantCulture) ?? "", j.Error ?? "");
+            badge, color, j.Pages?.ToString(CultureInfo.InvariantCulture) ?? "", j.Error ?? "", j.State);
     }
 
     /// <summary>"Oct 1 07:05": month, day, 24 h time in the display zone, the same in every culture.</summary>

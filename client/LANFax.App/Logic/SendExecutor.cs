@@ -17,8 +17,8 @@ public sealed record SendAttemptResult(SendAttemptStatus Status, string? Message
     AttemptOutcome Outcome = AttemptOutcome.NotSent, Exception? Failure = null);
 
 /// <summary>
-/// One send attempt, in the order that keeps a crash from producing a duplicate or a lost fax: check the document's
-/// size and read it, snapshot the endpoint (server, port, token) from the config, persist <c>sending</c> with the key
+/// One send attempt, in the order that keeps a crash from producing a duplicate or a lost fax: check the documents'
+/// sizes and read them, snapshot the endpoint (server, port, token) from the config, persist <c>sending</c> with the key
 /// and plan, <see cref="SendSession.Started"/>, then the request, whose retries all use that snapshot. A document over
 /// faxd's limit, a config that cannot form a URI, or a record that cannot be written means nothing is sent. A failure after Started goes to <see cref="SendSession.Failed(Exception)"/> and
 /// is recorded (<c>uncertain</c> or <c>draft</c>). The caller validates the plan (<see cref="SendSession.Build"/>)
@@ -32,21 +32,41 @@ public sealed class SendExecutor(ISendApi api, ClientConfig cfg, JobTracker? jou
         $"Nothing was sent: the document is larger than the server accepts ({FaxApi.MaxBodyBytes / (1024 * 1024)} MB). " +
         "Print fewer pages at a time, or send the test page instead.";
 
-    public async Task<SendAttemptResult> RunAsync(SendSession session, SendPlan plan)
+    /// <summary>
+    /// Reads a plan's documents (each file, and the fax together, within the server's limit) as the upload's parts.
+    /// The first unreadable file means nothing is sent; its name says which one.
+    /// </summary>
+    private static async Task<IReadOnlyList<(byte[] Bytes, string Name)>?> ReadDocumentsAsync(SendPlan plan)
     {
-        byte[]? bytes = null;
-        if (plan.Route == SendRoute.Document)
+        var parts = new List<(byte[], string)>();
+        long total = 0;
+        foreach (var path in plan.PdfPaths)
         {
+            byte[] bytes;
             try
             {
-                if (new FileInfo(plan.PdfPath).Length > FaxApi.MaxBodyBytes) return NotSent(session, TooLargeMessage);
-                bytes = await File.ReadAllBytesAsync(plan.PdfPath);
+                if (new FileInfo(path).Length > FaxApi.MaxBodyBytes) return null;
+                bytes = await File.ReadAllBytesAsync(path);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
-                return NotSent(session, "Cannot read the document: " + e.Message);
+                throw new IOException($"cannot read {Path.GetFileName(path)}: {e.Message}", e);
             }
-            if (bytes.Length > FaxApi.MaxBodyBytes) return NotSent(session, TooLargeMessage); // grew since the check
+            if (bytes.Length > FaxApi.MaxBodyBytes) return null; // grew since the check
+            total += bytes.Length;
+            parts.Add((bytes, Path.GetFileName(path)));
+        }
+        return total > FaxApi.MaxBodyBytes ? null : parts;
+    }
+
+    public async Task<SendAttemptResult> RunAsync(SendSession session, SendPlan plan)
+    {
+        IReadOnlyList<(byte[] Bytes, string Name)>? parts = null;
+        if (plan.Route == SendRoute.Document)
+        {
+            try { parts = await ReadDocumentsAsync(plan); }
+            catch (IOException e) { return NotSent(session, "Cannot read the document (" + e.Message + ")."); }
+            if (parts == null) return NotSent(session, TooLargeMessage);
         }
 
         SendEndpoint endpoint;
@@ -78,9 +98,12 @@ public sealed class SendExecutor(ISendApi api, ClientConfig cfg, JobTracker? jou
         Exception failure;
         try
         {
+            // One document goes as its exact bytes; several go as one multipart fax the server combines.
             var job = plan.Route == SendRoute.TestPage
                 ? await api.SendTestPageAsync(endpoint, plan.Number, plan.Subject, plan.IdempotencyKey)
-                : await api.PostJobAsync(endpoint, bytes!, plan.Number, plan.Subject, plan.IdempotencyKey);
+                : parts!.Count == 1
+                    ? await api.PostJobAsync(endpoint, parts[0].Bytes, plan.Number, plan.Subject, plan.IdempotencyKey)
+                    : await api.PostJobAsync(endpoint, parts, plan.Number, plan.Subject, plan.IdempotencyKey);
             session.Succeeded(job);
             return new SendAttemptResult(SendAttemptStatus.Accepted, Job: job);
         }
@@ -100,6 +123,37 @@ public sealed class SendExecutor(ISendApi api, ClientConfig cfg, JobTracker? jou
                     $"(status {(failure as FaxApiException)?.StatusCode.ToString() ?? failure.GetType().Name})", null);
         journal?.RecordFailure(session, plan);
         return new SendAttemptResult(SendAttemptStatus.Failed, SendOutcome.Describe(failure), Outcome: outcome, Failure: failure);
+    }
+
+    /// <summary>
+    /// The blank-page check before anything is sent: the server renders the combined documents and names pages that
+    /// come out blank paper (the incident's silent-loss signature). Null pages means it could not check (an older
+    /// server, or a token problem the send itself will report); <paramref name="error"/> blocks the send when the
+    /// documents provably cannot go out as one fax.
+    /// </summary>
+    public async Task<(IReadOnlyList<int>? BlankPages, string? Error)> PreCheckAsync(SendPlan plan)
+    {
+        if (plan.Route != SendRoute.Document) return (null, null);
+        SendEndpoint endpoint;
+        try { endpoint = SendEndpoint.From(cfg); }
+        catch (FaxApiConfigException) { return (null, null); } // the send itself will say it
+        IReadOnlyList<(byte[] Bytes, string Name)> parts;
+        try { parts = (await ReadDocumentsAsync(plan))!; }
+        catch (IOException e) { return (null, "Cannot read the document (" + e.Message + ")."); }
+        if (parts == null) return (null, TooLargeMessage);
+        try
+        {
+            var check = await api.AnalyzeJobAsync(endpoint, parts);
+            return (check?.BlankPages, null);
+        }
+        catch (FaxApiException e) when (e.StatusCode is 401 or 0)
+        {
+            return (null, null); // unreachable/forbidden now: do not block on the courtesy check
+        }
+        catch (FaxApiException e)
+        {
+            return (null, "The documents could not be checked: " + e.Message);
+        }
     }
 
     private static SendAttemptResult NotSent(SendSession session, string message)

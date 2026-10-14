@@ -56,11 +56,14 @@ public sealed record SendEndpoint(Uri BaseUri, string? Token)
     }
 }
 
-/// <summary>The two requests that submit a fax; the send dialog's <c>SendExecutor</c> depends on this, not on HTTP.</summary>
+/// <summary>The requests that submit a fax; the send dialog's <c>SendExecutor</c> depends on this, not on HTTP.</summary>
 public interface ISendApi
 {
     Task<Job> PostJobAsync(SendEndpoint endpoint, byte[] pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default);
+    Task<Job> PostJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, string to, string? subject, string idempotencyKey, CancellationToken ct = default);
     Task<Job> SendTestPageAsync(SendEndpoint endpoint, string to, string? note, string idempotencyKey, CancellationToken ct = default);
+    /// <summary>The pre-send blank-page check; null when the server does not offer it (an older faxd).</summary>
+    Task<FaxCheck?> AnalyzeJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, CancellationToken ct = default);
 }
 
 /// <summary>The reads and arm calls the monitor window makes; its smoke test fakes them.</summary>
@@ -73,6 +76,8 @@ public interface IMonitorApi
     Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default);
     Task<ArmState> DisarmAsync(CancellationToken ct = default);
     Task<ArmState> ReceiveTestAsync(int minutes = 20, CancellationToken ct = default);
+    Task<Job> CancelJobAsync(string id, CancellationToken ct = default);
+    Task<JobDetail> GetJobDetailAsync(string id, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -127,6 +132,71 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi, IMonit
     {
         var (code, body) = await SendAsync(() => Req(HttpMethod.Get, "jobs/" + Uri.EscapeDataString(id)), ct);
         return ParseJob(code, body);
+    }
+
+    /// <summary>GET /jobs/{id} with the event history: what the confirmation window shows.</summary>
+    public async Task<JobDetail> GetJobDetailAsync(string id, CancellationToken ct = default)
+    {
+        var (code, body) = await SendAsync(() => Req(HttpMethod.Get, "jobs/" + Uri.EscapeDataString(id)), ct);
+        using var doc = ParseDoc(code, body, "job");
+        try
+        {
+            var job = doc.RootElement.Deserialize<Job>(Json.Options)
+                ?? throw new FaxApiException((int)code, "faxd returned an empty job response");
+            var events = new List<JobEvent>();
+            if (doc.RootElement.TryGetProperty("events", out var arr) && arr.ValueKind == JsonValueKind.Array)
+                foreach (var e in arr.EnumerateArray())
+                {
+                    try { if (e.Deserialize<JobEvent>(Json.Options) is { } ev) events.Add(ev); }
+                    catch (JsonException) { }
+                }
+            return new JobDetail(job, events);
+        }
+        catch (JsonException e) { throw Unreadable(code, "job", e); }
+    }
+
+    /// <summary>
+    /// POST /jobs/{id}/cancel. A queued job stops before dialling; one whose call is up is hung up through the
+    /// PBX. A 409 means it already moved on (or finished) and carries the server's reason.
+    /// </summary>
+    public async Task<Job> CancelJobAsync(string id, CancellationToken ct = default)
+    {
+        var (code, body) = await SendAsync(
+            () => Req(HttpMethod.Post, "jobs/" + Uri.EscapeDataString(id) + "/cancel"), ct);
+        return ParseJob(code, body);
+    }
+
+    /// <summary>
+    /// POST /analyze: page count and pages that render as blank paper, exactly as the send would combine them.
+    /// Null when the server has no such route (an older faxd): the caller skips the check instead of blocking.
+    /// </summary>
+    public async Task<FaxCheck?> AnalyzeJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(endpoint);
+        ArgumentNullException.ThrowIfNull(parts);
+        var uri = Url(endpoint, "analyze");
+        try
+        {
+            var (code, body) = await SendAsync(() =>
+            {
+                var r = Req(endpoint, HttpMethod.Post, uri);
+                r.Content = PartsContent(parts);
+                return r;
+            }, ct);
+            using var doc = ParseDoc(code, body, "analyze");
+            try
+            {
+                var check = doc.RootElement.Deserialize<FaxCheck>(Json.Options)
+                    ?? throw new FaxApiException((int)code, "faxd returned an empty analyze response");
+                return check;
+            }
+            catch (JsonException e) { throw Unreadable(code, "analyze", e); }
+        }
+        catch (FaxApiException e) when (e.StatusCode is 404 or 405 or 501)
+        {
+            return null;   // this server cannot pre-check; sending must not depend on it
+        }
     }
 
     public async Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default)
@@ -225,6 +295,44 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi, IMonit
             r.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
             return r;
         }, ct);
+    }
+
+    /// <summary>
+    /// POST /jobs with several documents faxed as one multi-page job: the server combines them into a single
+    /// PDF before dialling. One part never uses this path (the body stays the exact document bytes).
+    /// </summary>
+    /// <exception cref="ArgumentException"><paramref name="to"/> has non-ASCII characters or no digits; nothing is sent.</exception>
+    public Task<Job> PostJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, string to,
+        string? subject, string idempotencyKey, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(endpoint);
+        ArgumentNullException.ThrowIfNull(parts);
+        if (parts.Count == 0) throw new ArgumentException("no documents to send", nameof(parts));
+        if (parts.Count == 1) return PostJobAsync(endpoint, parts[0].Bytes, to, subject, idempotencyKey, ct);
+        to = WireNumber(to);
+        var uri = Url(endpoint, "jobs");
+        return PostWithRetryAsync(() =>
+        {
+            var r = Req(endpoint, HttpMethod.Post, uri);
+            r.Content = PartsContent(parts);
+            r.Headers.TryAddWithoutValidation("X-Fax-To", to);
+            if (!string.IsNullOrEmpty(subject)) r.Headers.TryAddWithoutValidation("X-Fax-Subject", Ascii(subject));
+            r.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+            return r;
+        }, ct);
+    }
+
+    /// <summary>The documents as one multipart/form-data body; built fresh per attempt (content cannot be resent).</summary>
+    private static MultipartFormDataContent PartsContent(IReadOnlyList<(byte[] Bytes, string Name)> parts)
+    {
+        var content = new MultipartFormDataContent();
+        foreach (var (bytes, name) in parts)
+        {
+            var part = new ByteArrayContent(bytes);
+            part.Headers.ContentType = new MediaTypeHeaderValue("application/pdf");
+            content.Add(part, "file", Path.GetFileName(name) is { Length: > 0 } fn ? fn : "fax.pdf");
+        }
+        return content;
     }
 
     /// <summary>POST /test/send, same retry rules and number handling as <see cref="PostJobAsync"/>.</summary>

@@ -24,6 +24,10 @@ public sealed class SendExecutorTests : IDisposable
         public readonly List<string?> DiskAtCall = new();
         public byte[]? Body;
         public readonly List<SendEndpoint> Endpoints = new();
+        public List<IReadOnlyList<(byte[] Bytes, string Name)>>? Parts;
+        public FaxCheck? AnalyzeAnswer { get; set; }
+        public readonly List<IReadOnlyList<(byte[] Bytes, string Name)>> Analyzed = new();
+        public Func<Exception?>? OnAnalyze { get; set; }
 
         public Task<Job> PostJobAsync(SendEndpoint endpoint, byte[] pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default)
         {
@@ -32,6 +36,23 @@ public sealed class SendExecutorTests : IDisposable
             DiskAtCall.Add(OnCall?.Invoke());
             Body = pdf;
             return Task.FromResult((answer ?? (() => J("lf1")))());
+        }
+
+        public Task<Job> PostJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, string to, string? subject, string idempotencyKey, CancellationToken ct = default)
+        {
+            Calls.Add($"post {parts.Count} doc(s) {to} {subject} {idempotencyKey}");
+            Endpoints.Add(endpoint);
+            DiskAtCall.Add(OnCall?.Invoke());
+            (Parts ??= new()).Add(parts);
+            Body = parts.Count == 1 ? parts[0].Bytes : parts.SelectMany(p => p.Bytes).ToArray();
+            return Task.FromResult((answer ?? (() => J("lf1")))());
+        }
+
+        public Task<FaxCheck?> AnalyzeJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, CancellationToken ct = default)
+        {
+            if (OnAnalyze is { } raise && raise() is { } e) return Task.FromException<FaxCheck?>(e);
+            Analyzed.Add(parts);
+            return Task.FromResult(AnalyzeAnswer);
         }
 
         public Task<Job> SendTestPageAsync(SendEndpoint endpoint, string to, string? note, string idempotencyKey, CancellationToken ct = default)
@@ -379,5 +400,102 @@ public sealed class SendExecutorTests : IDisposable
             Requests.Add(new Seen(request.RequestUri!.ToString(), request.Headers.Authorization?.ToString()));
             return Task.FromResult(answer(request));
         }
+    }
+    (Guid id, string pdf) SpooledA(string body)
+    {
+        var id = Guid.NewGuid();
+        var pdf = Path.Combine(Jobs, id + ".pdf");
+        File.WriteAllText(pdf, body);
+        return (id, pdf);
+    }
+
+
+// ---- multi-document sends and the blank-page pre-check ----
+
+    (Guid id, string pdf) Spooled(string body = "%PDF-body\n%%EOF\n")
+    {
+        var id = Guid.NewGuid();
+        var pdf = Path.Combine(Jobs, id + ".pdf");
+        File.WriteAllText(pdf, body);
+        return (id, pdf);
+    }
+
+    [Fact]
+    public async Task Two_documents_are_uploaded_as_parts_and_journalled_as_one_fax()
+    {
+        var a = SpooledA("%PDF-a");
+        var b = SpooledA("%PDF-b");
+        var api = new FakeApi();
+        var session = new SendSession(a.id, new[] { a.pdf, b.pdf }, testPageWhenEmpty: true);
+        var plan = session.Build("5552345678", null, false, false);
+        var tracker = new JobTracker(_dir);
+        var r = await new SendExecutor(api, Cfg, tracker).RunAsync(session, plan);
+
+        Assert.Equal(SendAttemptStatus.Accepted, r.Status);
+        var parts = Assert.Single(api.Parts!);
+        Assert.Equal(2, parts.Count);
+        Assert.Equal(Path.GetFileName(a.pdf), parts[0].Name);
+        Assert.Equal(File.ReadAllBytes(a.pdf), parts[0].Bytes);
+        Assert.Equal(Path.GetFileName(b.pdf), parts[1].Name);
+        Assert.Equal(File.ReadAllBytes(b.pdf), parts[1].Bytes);
+
+        tracker.Track(plan, r.Job!);
+        var tracked = Assert.Single(tracker.Pending);
+        Assert.Equal(new[] { b.id }, tracked.Parts);
+    }
+
+    [Fact]
+    public async Task One_missing_document_means_nothing_is_sent()
+    {
+        var a = Spooled();
+        var b = Spooled();
+        File.Delete(b.pdf);
+        var api = new FakeApi();
+        var session = new SendSession(a.id, new[] { a.pdf, b.pdf }, testPageWhenEmpty: true);
+        var r = await new SendExecutor(api, Cfg, new JobTracker(_dir)).RunAsync(session, session.Build("5552345678", null, false, false));
+        Assert.Equal(SendAttemptStatus.NotSent, r.Status);
+        Assert.Contains(Path.GetFileName(b.pdf), r.Message);
+        Assert.Empty(api.Calls);
+    }
+
+    [Fact]
+    public async Task PreCheck_reports_blank_pages_and_surfaces_a_merge_error()
+    {
+        var a = Spooled();
+        var session = new SendSession(a.id, a.pdf);
+        var plan = session.Build("5552345678", null, false, false);
+        var exec = new SendExecutor(new FakeApi(), Cfg, null);
+
+        var (blanks, error) = await exec.PreCheckAsync(plan);
+        Assert.Null(blanks);        // a fake server that cannot analyze: no check, no block
+        Assert.Null(error);
+
+        var api = new FakeApi { AnalyzeAnswer = new FaxCheck(3, [1, 2]) };
+        (blanks, error) = await new SendExecutor(api, Cfg, null).PreCheckAsync(plan);
+        Assert.Equal(new[] { 1, 2 }, blanks);
+        Assert.Null(error);
+        Assert.Single(api.Analyzed);
+
+        api = new FakeApi { OnAnalyze = () => new FaxApiException(400, "the documents could not be combined") };
+        (blanks, error) = await new SendExecutor(api, Cfg, null).PreCheckAsync(plan);
+        Assert.Null(blanks);
+        Assert.Contains("could not be combined", error);
+
+        api = new FakeApi { OnAnalyze = () => new FaxApiUnauthorizedException() };
+        (blanks, error) = await new SendExecutor(api, Cfg, null).PreCheckAsync(plan);
+        Assert.Null(blanks);        // an auth problem now does not block: the send itself reports it
+        Assert.Null(error);
+    }
+
+    [Fact]
+    public async Task PreCheck_reads_the_documents_the_send_will_send()
+    {
+        var a = SpooledA("%PDF-a");
+        var b = SpooledA("%PDF-b");
+        var api = new FakeApi { AnalyzeAnswer = new FaxCheck(null, []) };
+        var session = new SendSession(a.id, new[] { a.pdf, b.pdf }, testPageWhenEmpty: true);
+        await new SendExecutor(api, Cfg, null).PreCheckAsync(session.Build("5552345678", null, false, false));
+        var parts = Assert.Single(api.Analyzed);
+        Assert.Equal(2, parts.Count);
     }
 }

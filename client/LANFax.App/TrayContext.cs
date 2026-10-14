@@ -68,6 +68,7 @@ internal sealed class TrayContext : ApplicationContext
         _retryItem = new ToolStripMenuItem("", null, (_, _) => OpenOffers(OfferCategory.Retry)) { Visible = false };
         menu.Items.Add(_unsentItem);
         menu.Items.Add(_retryItem);
+        menu.Items.Add("Send a fax...", null, (_, _) => EnqueueSend(new SendRequest(Guid.NewGuid(), null, Kind: SendKind.Compose)));
         menu.Items.Add("Send a test page...", null, (_, _) => EnqueueSend(new SendRequest(Guid.NewGuid(), null)));
         menu.Items.Add("Receive a test (arm 20 min)", null, async (_, _) => await ReceiveTestAsync());
         menu.Items.Add(new ToolStripSeparator());
@@ -169,7 +170,9 @@ internal sealed class TrayContext : ApplicationContext
         {
             if (_monitor == null || _monitor.IsDisposed)
             {
-                var form = new MainForm(_runtime, openSettings: OpenSettings, updates: _updates);
+                var form = new MainForm(_runtime, openSettings: OpenSettings, updates: _updates,
+                    sendFax: () => EnqueueSend(new SendRequest(Guid.NewGuid(), null, Kind: SendKind.Compose)),
+                    showReceipt: ShowReceipt);
                 form.FormClosed += (_, _) => { if (_monitor == form) _monitor = null; form.Dispose(); };
                 _monitor = form;
             }
@@ -262,7 +265,37 @@ internal sealed class TrayContext : ApplicationContext
             _offers.Add(OfferCategory.Retry, req); // stays in the tray menu if the balloon is missed
             Balloon(NotificationText.ForFailedWithRetry(j), () => OpenOffer(req));
         }
+        else if (j.State == "sent")
+        {
+            var text = NotificationText.ForTerminalJob(j);
+            if (text != null) Balloon(text + " Click to see the confirmation.", () => ShowReceipt(j.Id));
+        }
         else if (NotificationText.ForTerminalJob(j) is { } text) Balloon(text);
+    }
+
+    // ---- receipts ----
+
+    private readonly List<ReceiptDialog> _receipts = [];
+
+    /// <summary>Opens (or raises) the confirmation window for a sent fax: what went out, to whom, and the transmission log.</summary>
+    private void ShowReceipt(string jobId)
+    {
+        if (_exiting || _exitPending) return;
+        try
+        {
+            var open = _receipts.FirstOrDefault(r => r.JobId == jobId && !r.IsDisposed);
+            if (open != null)
+            {
+                if (!open.Visible) open.Show();
+                open.Activate();
+                return;
+            }
+            var form = new ReceiptDialog(() => _runtime.MonitorApi, jobId, MonitorModel.DefaultCacheDir);
+            form.FormClosed += (_, _) => { _receipts.Remove(form); form.Dispose(); };
+            _receipts.Add(form);
+            form.Show();
+        }
+        catch (Exception e) { FileLog.Error("opening the confirmation failed", e); }
     }
 
     /// <summary>A balloon's click: opens the offer unless it was already opened (e.g. from the tray menu).</summary>
@@ -273,11 +306,31 @@ internal sealed class TrayContext : ApplicationContext
 
     // ---- send dialogs (one at a time) ----
 
+    /// <summary>Set while the "add this print to the fax you are preparing?" question is up (its message pump would re-enter here).</summary>
+    private bool _askingAttach;
+
     private void EnqueueSend(SendRequest req)
     {
         if (_exiting || _exitPending) return;
         _offers.Remove(req.SpoolId);
         if (req.PdfPath != null && _queue.Contains(q => q.SpoolId == req.SpoolId)) return; // already open or waiting
+        // A print that arrives while a fax is being composed can join it (the setting can turn the question off).
+        if (req.PdfPath != null && req.Kind == SendKind.New && _cfg.PromptToAddPages && !_askingAttach &&
+            _openDialog is { CanAttach: true } dlg)
+        {
+            _askingAttach = true;
+            try
+            {
+                var r = MessageBox.Show("You printed another document.\n\nAdd it to the fax you are preparing?",
+                    "LANFax", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button1);
+                if (r == DialogResult.Yes)
+                {
+                    dlg.AddPrinted(req.SpoolId, req.PdfPath!);
+                    return;
+                }
+            }
+            finally { _askingAttach = false; }
+        }
         var now = _queue.Enqueue(req);
         if (now != null) ShowSendDialog(now);
         else if (_openDialog != null) _openDialog.Text = _queue.Title(_openDialog.BaseTitle);
@@ -326,14 +379,14 @@ internal sealed class TrayContext : ApplicationContext
                     }
                     else
                     {
-                        if (req.PdfPath != null) _runtime.Tracker.Discard(req.SpoolId); // test page instead: document not needed
+                        foreach (var g in dlg.SpoolIds) _runtime.Tracker.Discard(g); // test page instead: documents not needed
                         _runtime.TrackSubmitted(job.Id);
                     }
                     FileLog.Info($"job {job.Id} queued (spool {req.SpoolId}, attempts {s.Attempts})");
                     Balloon(NotificationText.Queued(job, plan.Number));
                     break;
                 case DialogOutcome.Cancelled when !_exiting:
-                    if (req.PdfPath != null) _runtime.Tracker.Discard(req.SpoolId);
+                    foreach (var g in dlg.SpoolIds) _runtime.Tracker.Discard(g);
                     FileLog.Info($"send cancelled (spool {req.SpoolId}, attempts {s.Attempts})");
                     break;
                 case DialogOutcome.Kept when !_exiting:

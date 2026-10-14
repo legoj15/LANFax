@@ -29,4 +29,9 @@ public interface IMonitorSource
     event Action<Exception>? MonitorLoadFailed;
     /// <summary>An arm call's answer, asked at the current <see cref="ServerGeneration"/>: into the status at once.</summary>
     void NoteArm(ArmState answer);
+    /// <summary>
+    /// Cancels a fax (queued: stops before dialling; sending: hangs up the call) and applies the answer to the rows.
+    /// Throws for the window to show (409: it already moved on).
+    /// </summary>
+    Task<Job> CancelJobAsync(string id);
 }

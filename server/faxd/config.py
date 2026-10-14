@@ -32,6 +32,8 @@ class Config:
     faxin_ext: str = "300"
     allowed_numbers: str = "nanp,000,ext"  # enqueue.check_number rule names
     event_retention_days: int = 30          # job_events rows older than this are pruned; 0 = keep
+    gs_bin: str = "gs"                      # ghostscript binary for merge/stamp/blank analysis
+    fax_header: bool = False                # stamp sender/recipient/date and page numbers on every page
 
     @property
     def outbox(self) -> str:
@@ -80,6 +82,8 @@ _KEYS: dict[str, tuple[str, type]] = {
     "FAXIN_EXT": ("faxin_ext", str),
     "FAXD_ALLOWED_NUMBERS": ("allowed_numbers", str),
     "FAXD_EVENT_RETENTION_DAYS": ("event_retention_days", int),
+    "FAXD_GS_BIN": ("gs_bin", str),
+    "FAXD_FAX_HEADER": ("fax_header", bool),
 }
 
 
@@ -106,6 +110,15 @@ def _parse_env_file(path: str) -> dict[str, str]:
     return out
 
 
+def _parse_bool(raw: str) -> bool:
+    """1/true/yes/on (any case) are true; 0/false/no/off and empty are false."""
+    if raw.strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    if raw.strip().lower() in ("", "0", "false", "no", "off"):
+        return False
+    raise ValueError("not a boolean")
+
+
 def load(env_file: str = DEFAULT_ENV_FILE, environ: Mapping[str, str] = os.environ) -> Config:
     """Build a Config from the env file, overlaid by `environ`."""
     values = _parse_env_file(env_file)
@@ -118,7 +131,7 @@ def load(env_file: str = DEFAULT_ENV_FILE, environ: Mapping[str, str] = os.envir
             continue
         raw = values[key]
         try:
-            val = typ(raw)
+            val = _parse_bool(raw) if typ is bool else typ(raw)
             if typ is float and not math.isfinite(val):
                 raise ValueError("not finite")
             setattr(cfg, field, val)

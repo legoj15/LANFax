@@ -96,19 +96,23 @@ receipts.
 ### Windows client: one tray app, `LANFax` (.NET 8, single self-contained exe)
 
 - **Printer**: installs a printer named "LAN Fax" using the built-in
-  *Microsoft Print To PDF* driver bound to a Local Port whose name is a file
-  path under `%ProgramData%\LANFax\spool\`. That driver writes silently to a
-  path port. Install is two PowerShell cmdlets (`Add-PrinterPort`,
-  `Add-Printer`); no driver signing, no port monitor DLL.
-- **Print flow**: tray app watches the spool path; new file -> dialog for
-  number, subject, "send test page instead" -> `POST /jobs` (raw PDF body,
-  `Idempotency-Key` so a retry never sends twice) -> toast on sent/failed.
+  *Microsoft Print To PDF* driver bound to a named pipe port
+  (`\\.\pipe\LANFax`, a `NamedPipeServerStream` in the tray app; spooled
+  PDFs land under `%ProgramData%\LANFax\spool\jobs\`). Install is two
+  PowerShell cmdlets (`Add-PrinterPort`, `Add-Printer`); no driver signing,
+  no port monitor DLL.
+- **Print flow**: tray app takes the spooled PDF; dialog for number,
+  subject, the document list (further prints can be attached, files can be
+  picked), a blank-page pre-check against `POST /analyze`, then
+  `POST /jobs` (raw PDF body for one document, multipart for several, with
+  an `Idempotency-Key` so a retry never sends twice) -> toast on
+  sent/failed, confirmation window for sent faxes.
 - **Monitor**: window with status, arm countdown + arm/disarm buttons, jobs
-  (sending/sent/failed) and inbox with open-in-viewer, "Send a test" and
-  "Receive a test (arm 20 min)" buttons. Subscribes to `/events`.
+  (sending/sent/failed) and inbox with open-in-viewer, cancel, copy-number
+  and confirmation actions, plus "Send a fax...", "Send a test" and
+  "Receive a test (arm 20 min)". Subscribes to `/events`.
 - **Config**: server host or IP + token. Defaults to IP so VPN name
   resolution is irrelevant.
-- Also: drag-drop a PDF onto the tray icon / Explorer "Send to" entry.
 
 Rejected client options: IPP printer (Windows adds it natively but there is
 no way to ask for a number at print time), real port monitor DLL (signing and

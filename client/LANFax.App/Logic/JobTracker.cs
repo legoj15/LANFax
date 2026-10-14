@@ -24,10 +24,12 @@ public static class SendState
 /// The record for one spooled PDF. <see cref="State"/> is a <see cref="SendState"/> or, once the server reports it,
 /// a terminal server state (sent, failed, cancelled). Older records may hold a live server state (queued, dialing),
 /// read as <see cref="SendState.Accepted"/>. <see cref="Server"/> is the authority (host:port) the key was sent to;
-/// null in records written before it was recorded.
+/// null in records written before it was recorded. <see cref="Parts"/> names the other spool files faxed with this
+/// one as a single multi-document fax; they share its record and its fate.
 /// </summary>
 public sealed record TrackedJob(Guid SpoolId, string? ServerId, string Number, string? Subject, bool KeepLocalCopies,
-    string State, string? IdempotencyKey = null, bool TestPage = false, string? Server = null)
+    string State, string? IdempotencyKey = null, bool TestPage = false, string? Server = null,
+    IReadOnlyList<Guid>? Parts = null)
 {
     [JsonIgnore] public bool IsTerminal => State is "sent" or "failed" or "cancelled" or "received";
     /// <summary>Only an accepted job with a server id is polled; any other or unknown state is never asked about.</summary>
@@ -129,7 +131,7 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
 
     /// <summary>The dialog request for a record that needs the user (failed or unknown).</summary>
     public SendRequest RequestFor(TrackedJob t) => new(t.SpoolId, PdfPath(t.SpoolId), t.Number, t.Subject,
-        t.State == "failed" ? SendKind.Retry : SendKind.Suspect);
+        t.State == "failed" ? SendKind.Retry : SendKind.Suspect, Parts: t.Parts);
 
     /// <summary>
     /// The request that offers a kept document again (tray menu, balloon): rebuilt from its record, which knows what
@@ -140,13 +142,13 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
     /// </summary>
     public SendRequest Reoffer(SendRequest original, SendSession? session = null)
     {
-        if (original.PdfPath == null) return original; // a test page: no document, no record
+        if (original.PdfPath == null) return original; // a test page or compose: no document, no record
         var pdf = original.PdfPath;
         var (t, status) = Load(JsonPath(original.SpoolId));
-        var offer = status == LoadStatus.Ok && t != null ? OfferFor(original.SpoolId, t, pdf) : null;
+        var offer = status == LoadStatus.Ok && t != null ? OfferFor(original.SpoolId, t) : null;
         if (offer == null && session?.LockedPlan is { } locked)
             offer = new SendRequest(original.SpoolId, pdf, locked.Number, locked.Subject, SendKind.Resume, locked,
-                session.LockedServer?.Authority);
+                session.LockedServer?.Authority, locked.PartIds.Skip(1).ToList() is { Count: > 0 } parts ? parts : null);
         offer ??= original;
         if (original.Kind == SendKind.Suspect && offer.LockedPlan == null && offer.Kind != SendKind.Suspect)
             offer = offer with { Kind = SendKind.Suspect };
@@ -157,26 +159,30 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
     /// What a record asks of the user: the dialog request for spool file <paramref name="id"/> (the file name's id,
     /// not the record's), or null when it needs none (accepted, terminal).
     /// </summary>
-    private static SendRequest? OfferFor(Guid id, TrackedJob t, string pdf) => t.State switch
+    private SendRequest? OfferFor(Guid id, TrackedJob t) => t.State switch
     {
         _ when t.IsTerminal && t.State != "failed" => null,
         SendState.Sending or SendState.Uncertain when !string.IsNullOrEmpty(t.IdempotencyKey) =>
-            new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Resume, ToPlan(t, pdf), t.Server),
-        SendState.Draft => new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Draft),
-        "failed" => new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Retry),
+            new SendRequest(id, PdfPath(id), t.Number, t.Subject, SendKind.Resume, ToPlan(t), t.Server, t.Parts),
+        SendState.Draft => new SendRequest(id, PdfPath(id), t.Number, t.Subject, SendKind.Draft, Parts: t.Parts),
+        "failed" => new SendRequest(id, PdfPath(id), t.Number, t.Subject, SendKind.Retry, Parts: t.Parts),
         SendState.Accepted when t.IsPollable => null,
         // unknown, a sending record without a key, an accepted one without a server id, or a state this version
         // does not know: it may have been sent, so the user decides.
-        _ => new SendRequest(id, pdf, t.Number, t.Subject, SendKind.Suspect),
+        _ => new SendRequest(id, PdfPath(id), t.Number, t.Subject, SendKind.Suspect, Parts: t.Parts),
     };
 
-    /// <summary>The user cancelled a dialog: the PDF and its record go.</summary>
+    /// <summary>The user cancelled a dialog: the fax's PDFs and its record go (parts first named by the record).</summary>
     public void Discard(Guid spoolId)
     {
+        var parts = Load(JsonPath(spoolId)).Record?.Parts;
         ForgetSpool(spoolId);
-        TryDelete(PdfPath(spoolId));
-        TryDelete(JsonPath(spoolId));
-        TryDelete(BadPath(spoolId));
+        foreach (var g in (parts ?? []).Append(spoolId))
+        {
+            TryDelete(PdfPath(g));
+            TryDelete(JsonPath(g));
+            TryDelete(BadPath(g));
+        }
     }
 
     /// <summary>
@@ -190,11 +196,14 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
         if (!Directory.Exists(JobsDir)) return offers;
         AdoptLeftoverTemps();
         var skipped = new HashSet<Guid>();
+        // A part's PDF belongs to its fax's record: never offered as a document of its own.
+        var partsOfFaxes = new HashSet<Guid>();
         foreach (var json in Directory.EnumerateFiles(JobsDir, "*.json"))
         {
             if (!Guid.TryParse(Path.GetFileNameWithoutExtension(json), out var id)) continue;
             var pdf = PdfPath(id);
             var (t, status) = Load(json);
+            if (t?.Parts is { } ps) partsOfFaxes.UnionWith(ps);
             if (status == LoadStatus.Missing)
             {
                 // Removed since it was listed (a Discard, a finished job): no record, so its PDF, if any, is new.
@@ -230,13 +239,13 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
                 }
                 continue;
             }
-            if (OfferFor(id, t, pdf) is { } offer) offers.Add(offer);
+            if (OfferFor(id, t) is { } offer) offers.Add(offer);
             else if (t.IsPollable) _byServerId[t.ServerId!] = t;
         }
         foreach (var pdf in Directory.EnumerateFiles(JobsDir, "*.pdf"))
         {
             if (!Guid.TryParse(Path.GetFileNameWithoutExtension(pdf), out var id) || File.Exists(JsonPath(id))) continue;
-            if (skipped.Contains(id)) continue;
+            if (skipped.Contains(id) || partsOfFaxes.Contains(id)) continue;
             if (offers.Any(o => o.SpoolId == id)) continue;
             offers.Add(new SendRequest(id, pdf, Kind: File.Exists(BadPath(id)) ? SendKind.Suspect : SendKind.New));
         }
@@ -251,12 +260,26 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
     {
         var offers = new List<SendRequest>();
         if (!Directory.Exists(JobsDir)) return offers;
+        var partsOfFaxes = PartsOnDisk();
         foreach (var pdf in Directory.EnumerateFiles(JobsDir, "*.pdf"))
         {
             if (!Guid.TryParse(Path.GetFileNameWithoutExtension(pdf), out var id) || File.Exists(JsonPath(id)) || File.Exists(BadPath(id))) continue;
+            if (partsOfFaxes.Contains(id)) continue;
             if (seen.Add(id)) offers.Add(new SendRequest(id, pdf, Kind: SendKind.New));
         }
         return offers;
+    }
+
+    /// <summary>The part ids every readable record names: their PDFs belong to a fax, not to the user alone.</summary>
+    private HashSet<Guid> PartsOnDisk()
+    {
+        var ids = new HashSet<Guid>();
+        foreach (var json in Directory.EnumerateFiles(JobsDir, "*.json"))
+        {
+            var t = Load(json).Record;
+            if (t?.Parts is { } ps) ids.UnionWith(ps);
+        }
+        return ids;
     }
 
     /// <summary>
@@ -285,12 +308,17 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
 
     private static TrackedJob FromPlan(SendPlan p, string state, string? key) =>
         new(p.JobId, null, p.Number, p.Subject, p.AfterAccept == FileAction.MoveToSent, state, key,
-            p.Route == SendRoute.TestPage);
+            p.Route == SendRoute.TestPage, Parts: p.PartIds.Skip(1).ToList() is { Count: > 0 } parts ? parts : null);
 
-    /// <summary>Rebuilds the exact plan of a stored attempt (same key, number, subject, route and file action).</summary>
-    private static SendPlan ToPlan(TrackedJob t, string pdf) =>
-        new(t.SpoolId, pdf, t.Number, t.Subject, t.TestPage ? SendRoute.TestPage : SendRoute.Document,
+    /// <summary>Rebuilds the exact plan of a stored attempt (same key, number, subject, route, file action and parts).</summary>
+    private SendPlan ToPlan(TrackedJob t) =>
+        new(t.SpoolId, PathsFor(t), t.Number, t.Subject, t.TestPage ? SendRoute.TestPage : SendRoute.Document,
             !t.TestPage && t.KeepLocalCopies ? FileAction.MoveToSent : FileAction.Delete, t.IdempotencyKey!);
+
+    /// <summary>Every file of the fax the record names: the primary spool file plus its parts.</summary>
+    private IReadOnlyList<string> PathsFor(TrackedJob t) =>
+        new[] { t.SpoolId }.Concat(t.Parts ?? [])
+            .Select(g => Path.Combine(JobsDir, g + ".pdf")).ToList();
 
     private void ForgetSpool(Guid spoolId)
     {
@@ -300,18 +328,21 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
 
     private TerminalOutcome Finish(TrackedJob t)
     {
-        var pdf = PdfPath(t.SpoolId);
         var outcome = t.KeepLocalCopies ? TerminalOutcome.MovedToSent : TerminalOutcome.Removed;
         try
         {
-            if (File.Exists(pdf))
+            foreach (var g in new[] { t.SpoolId }.Concat(t.Parts ?? []))
             {
-                if (t.KeepLocalCopies)
+                var pdf = PdfPath(g);
+                if (File.Exists(pdf))
                 {
-                    Directory.CreateDirectory(SentDir);
-                    File.Move(pdf, Path.Combine(SentDir, t.SpoolId + ".pdf"), overwrite: true);
+                    if (t.KeepLocalCopies)
+                    {
+                        Directory.CreateDirectory(SentDir);
+                        File.Move(pdf, Path.Combine(SentDir, g + ".pdf"), overwrite: true);
+                    }
+                    else File.Delete(pdf);
                 }
-                else File.Delete(pdf);
             }
             File.Delete(JsonPath(t.SpoolId));
             File.Delete(BadPath(t.SpoolId));

@@ -143,5 +143,7 @@ public sealed class PdfOpenerTests : IDisposable
         public Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<ArmState> DisarmAsync(CancellationToken ct = default) => throw new NotSupportedException();
         public Task<ArmState> ReceiveTestAsync(int minutes = 20, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<Job> CancelJobAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<JobDetail> GetJobDetailAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
     }
 }

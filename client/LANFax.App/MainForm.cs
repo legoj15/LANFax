@@ -20,6 +20,8 @@ public sealed class MainForm : Form
     private readonly IMonitorSource _src;
     private readonly Action? _openSettings;
     private readonly UpdateService? _updates;
+    private readonly Action? _sendFax;
+    private readonly Action<string>? _showReceipt;
     private readonly FlowLayoutPanel _banner = new() { Dock = DockStyle.Fill, AutoSize = true, Visible = false, BackColor = Color.FromArgb(255, 244, 204), Padding = new Padding(8, 6, 8, 6), Margin = new Padding(0, 0, 0, 8) };
     private readonly Label _bannerText = new() { AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Color.FromArgb(80, 60, 0), Margin = new Padding(0, 6, 12, 0) };
     private readonly Button _bannerInstall = new() { Text = "Download and install", AutoSize = true, MinimumSize = new Size(80, 28) };
@@ -32,6 +34,14 @@ public sealed class MainForm : Form
     private readonly List<Button> _armButtons = [];
     private readonly DataGridView _jobsGrid = MakeGrid(("Time", 22), ("To", 22), ("State", 16), ("Pages", 10), ("Error", 40));
     private readonly DataGridView _inboxGrid = MakeGrid(("Time", 30), ("From", 50), ("Pages", 20));
+    private readonly ContextMenuStrip _jobsMenu = new();
+    private readonly ToolStripMenuItem _menuCopy = new("Copy number");
+    private readonly ToolStripMenuItem _menuCancel = new("Cancel this fax...");
+    private readonly ToolStripMenuItem _menuReceipt = new("View confirmation");
+    private readonly ToolStripMenuItem _menuPdf = new("Open PDF");
+    private readonly ContextMenuStrip _inboxMenu = new();
+    private readonly ToolStripMenuItem _menuInboxCopy = new("Copy number");
+    private readonly ToolStripMenuItem _menuInboxPdf = new("Open PDF");
     private readonly System.Windows.Forms.Timer _tick = new() { Interval = 1000 };
     private readonly PdfOpener _pdf;
     /// <summary>The message line shows a load failure (cleared once a load succeeds, unless something else was said since).</summary>
@@ -42,11 +52,16 @@ public sealed class MainForm : Form
     /// <param name="openFile">Opens a downloaded PDF; ShellExecute by default.</param>
     /// <param name="openSettings">The tray's Settings dialog, for a refused token.</param>
     /// <param name="updates">When a newer release is known (and not dismissed) a banner offers to install it.</param>
-    public MainForm(IMonitorSource src, string? cacheDir = null, Action<string>? openFile = null, Action? openSettings = null, UpdateService? updates = null)
+    /// <param name="sendFax">Opens the compose-a-fax dialog (the tray's), for the Send a fax button.</param>
+    /// <param name="showReceipt">Opens the confirmation window for a job id, for sent rows.</param>
+    public MainForm(IMonitorSource src, string? cacheDir = null, Action<string>? openFile = null, Action? openSettings = null,
+        UpdateService? updates = null, Action? sendFax = null, Action<string>? showReceipt = null)
     {
         _src = src;
         _openSettings = openSettings;
         _updates = updates;
+        _sendFax = sendFax;
+        _showReceipt = showReceipt;
         _pdf =new PdfOpener(() => _src.MonitorApi, cacheDir ?? MonitorModel.DefaultCacheDir, openFile ?? ShellOpen);
 
         Text = "LANFax";
@@ -59,11 +74,20 @@ public sealed class MainForm : Form
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(10) };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
-        var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, AutoSize = true, Margin = Padding.Empty };
+        var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, AutoSize = true, Margin = Padding.Empty };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        header.Controls.Add(new Label { Text = "LANFax", AutoSize = true, Font = new Font(SystemFonts.MessageBoxFont!.FontFamily, 14f, FontStyle.Bold) }, 0, 0);
-        header.Controls.Add(_pill, 1, 0);
+        var title = new FlowLayoutPanel { AutoSize = true, Margin = Padding.Empty };
+        title.Controls.Add(new Label { Text = "LANFax", AutoSize = true, Font = new Font(SystemFonts.MessageBoxFont!.FontFamily, 14f, FontStyle.Bold) });
+        if (_sendFax != null)
+        {
+            var send = new Button { Text = "Send a fax...", AutoSize = true, MinimumSize = new Size(0, 28), Margin = new Padding(12, 2, 0, 0) };
+            send.Click += (_, _) => _sendFax();
+            title.Controls.Add(send);
+        }
+        header.Controls.Add(title, 0, 0);
+        header.Controls.Add(_pill, 2, 0);
 
         var arm = new GroupBox { Text = "Receive faxes", Dock = DockStyle.Fill, AutoSize = true, Padding = new Padding(8) };
         var armBody = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false };
@@ -95,6 +119,20 @@ public sealed class MainForm : Form
 
         _jobsGrid.CellDoubleClick += (_, e) => OnRowDoubleClick(_jobsGrid, e.RowIndex);
         _inboxGrid.CellDoubleClick += (_, e) => OnRowDoubleClick(_inboxGrid, e.RowIndex);
+
+        BuildMenus();
+        _jobsGrid.CellMouseDown += (_, e) => SelectOnRightClick(_jobsGrid, e);
+        _inboxGrid.CellMouseDown += (_, e) => SelectOnRightClick(_inboxGrid, e);
+        _menuCopy.Click += (_, _) => CopyRow(RowOf(_jobsGrid));
+        _menuInboxCopy.Click += (_, _) => CopyRow(RowOf(_inboxGrid));
+        _menuPdf.Click += (_, _) => OpenRowPdf(_jobsGrid);
+        _menuInboxPdf.Click += (_, _) => OpenRowPdf(_inboxGrid);
+        _menuReceipt.Click += (_, _) =>
+        {
+            if (RowOf(_jobsGrid) is { State: "sent" } r) (_showReceipt ?? (id => _ = OpenPdfAsync(id)))(r.Id);
+        };
+        _menuCancel.Click += async (_, _) => { if (RowOf(_jobsGrid) is { } r) await CancelFaxAsync(r); };
+
         _tick.Tick += (_, _) => { RenderArm(); RenderPill(); };
         VisibleChanged += (_, _) => { _tick.Enabled = Visible; if (Visible) { RenderArm(); RenderPill(); } };
 
@@ -245,7 +283,86 @@ public sealed class MainForm : Form
     private void OnRowDoubleClick(DataGridView grid, int row)
     {
         if (row < 0 || row >= grid.Rows.Count || grid.Rows[row].Tag is not string id) return;
+        // A sent fax's paper trail is its confirmation; everything else opens the PDF directly.
+        if (grid == _jobsGrid && RowOf(grid) is { State: "sent" } && _showReceipt != null) { _showReceipt(id); return; }
         _ = OpenPdfAsync(id);
+    }
+
+    // ---- row actions (context menus) ----
+
+    private void BuildMenus()
+    {
+        _jobsMenu.Items.AddRange([_menuCopy, _menuCancel, new ToolStripSeparator(), _menuReceipt, _menuPdf]);
+        _jobsGrid.ContextMenuStrip = _jobsMenu;
+        _jobsMenu.Opening += (_, _) =>
+        {
+            var r = RowOf(_jobsGrid);
+            bool active = r is { State: "queued" or "dialing" or "sending" };
+            _menuCancel.Enabled = active;
+            _menuReceipt.Enabled = r is { State: "sent" };
+            _menuCopy.Enabled = r != null;
+            _menuPdf.Enabled = r != null;
+        };
+        _inboxMenu.Items.AddRange([_menuInboxCopy, _menuInboxPdf]);
+        _inboxGrid.ContextMenuStrip = _inboxMenu;
+        _inboxMenu.Opening += (_, _) =>
+        {
+            var has = RowOf(_inboxGrid) != null;
+            _menuInboxCopy.Enabled = has;
+            _menuInboxPdf.Enabled = has;
+        };
+    }
+
+    /// <summary>Right-click selects the row (WinForms does not), so the menu acts on what is under it.</summary>
+    private static void SelectOnRightClick(DataGridView g, DataGridViewCellMouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Right || e.RowIndex < 0 || e.RowIndex >= g.Rows.Count) return;
+        g.ClearSelection();
+        g.Rows[e.RowIndex].Selected = true;
+        g.CurrentCell = g.Rows[e.RowIndex].Cells[Math.Min(e.ColumnIndex, g.Columns.Count - 1)];
+    }
+
+    /// <summary>The monitor's row for the grid's current selection (the grid rows carry only its id).</summary>
+    private MonitorRow? RowOf(DataGridView g)
+    {
+        if (g.CurrentRow?.Tag is not string id) return null;
+        var rows = g == _jobsGrid ? _src.Monitor.Jobs : _src.Monitor.Inbox;
+        return rows.FirstOrDefault(r => r.Id == id);
+    }
+
+    private void CopyRow(MonitorRow? r)
+    {
+        if (r == null || string.IsNullOrEmpty(r.Party) || r.Party == "-") return;
+        try { Clipboard.SetText(r.Party); Say($"Copied {r.Party}."); }
+        catch (Exception e) { Say("Could not copy: " + e.Message); }
+    }
+
+    private void OpenRowPdf(DataGridView g)
+    {
+        if (g.CurrentRow?.Tag is string id) _ = OpenPdfAsync(id);
+    }
+
+    /// <summary>Cancelling is a deliberate act: it stops a fax already going out, so it is confirmed first.</summary>
+    private async Task CancelFaxAsync(MonitorRow row)
+    {
+        if (MessageBox.Show(this,
+                $"Cancel the fax to {row.Party} ({MonitorModel.Badge(row.State).Text.ToLowerInvariant()})?\n\nA fax already transmitting stops mid-send; the recipient keeps any pages that got through.",
+                "Cancel fax", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            return;
+        try
+        {
+            var j = await _src.CancelJobAsync(row.Id);
+            Say(j.State == "cancelled" ? $"Fax to {row.Party} cancelled." : $"Fax to {row.Party} is {MonitorModel.Badge(j.State).Text.ToLowerInvariant()}.");
+        }
+        catch (FaxApiUnauthorizedException)
+        {
+            Say(NotificationText.WindowUnauthorized);
+            _openSettings?.Invoke();
+        }
+        catch (Exception e) when (e is FaxApiException or JsonException)
+        {
+            Say("Could not cancel: " + e.Message);
+        }
     }
 
     /// <summary>Downloads the fax's PDF and opens it (<see cref="PdfOpener"/>).</summary>

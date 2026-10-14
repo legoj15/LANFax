@@ -237,6 +237,8 @@ public sealed class MainFormSmokeTests
             : Task.FromResult(new ArmState(true, null, minutes, "300"));
         public Task<ArmState> DisarmAsync(CancellationToken ct = default) => Task.FromResult(new ArmState(false, null, 0, "300"));
         public Task<ArmState> ReceiveTestAsync(int minutes = 20, CancellationToken ct = default) => ArmAsync(minutes, ct);
+        public Task<Job> CancelJobAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<JobDetail> GetJobDetailAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     /// <summary>The runtime as the window sees it: the test plays its loads, live updates, arm notes and restarts.</summary>
@@ -267,6 +269,8 @@ public sealed class MainFormSmokeTests
             Status = Status with { Arm = answer };
             StatusChanged?.Invoke(Status);
         }
+
+        public Task<Job> CancelJobAsync(string id) => throw new NotSupportedException();
 
         public void Load(params Job[] jobs)
         {

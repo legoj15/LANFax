@@ -617,4 +617,98 @@ public sealed class JobTrackerTests : IDisposable
     [Fact]
     public void Scan_of_missing_dir_is_empty() =>
         Assert.Empty(new JobTracker(Path.Combine(_dir, "nope")).Scan());
+    // ---- multi-document faxes: the parts share the record's fate ----
+
+    (Guid a, Guid b, SendPlan plan) TwoDocPlan(bool keep = false)
+    {
+        var (a, pa) = Spooled();
+        var (b, pb) = Spooled();
+        return (a, b, SendPlan.Create(a, new[] { pa, pb }, "5552345678", "subj", false, keep, "K-multi"));
+    }
+
+    [Fact]
+    public void A_multi_document_record_names_its_parts()
+    {
+        var (a, b, plan) = TwoDocPlan();
+        new JobTracker(_dir).BeginSend(plan);
+        var rec = Record(a);
+        Assert.Equal("sending", rec.GetProperty("state").GetString());
+        Assert.Equal(JsonSerializer.Serialize(new[] { b }),
+                     JsonSerializer.Serialize(rec.GetProperty("parts").EnumerateArray().Select(g => g.GetGuid()).ToArray()));
+    }
+
+    [Fact]
+    public void Finishing_removes_or_moves_every_part()
+    {
+        var (a, b, plan) = TwoDocPlan(keep: true);
+        var t = new JobTracker(_dir);
+        t.Track(plan, J("lfmulti1", "queued"));
+        t.OnJobUpdate(J("lfmulti1", "sent"));
+
+        Assert.False(File.Exists(Path.Combine(Jobs, a + ".pdf")));
+        Assert.False(File.Exists(Path.Combine(Jobs, b + ".pdf")));
+        Assert.True(File.Exists(Path.Combine(_dir, "sent", a + ".pdf")));
+        Assert.True(File.Exists(Path.Combine(_dir, "sent", b + ".pdf")));
+        Assert.False(File.Exists(JsonOf(a)));
+    }
+
+    [Fact]
+    public void Discard_deletes_every_part_even_after_a_restart()
+    {
+        var (a, b, plan) = TwoDocPlan();
+        new JobTracker(_dir).BeginSend(plan);
+        var t = new JobTracker(_dir);   // a new run reads the record for the parts
+        t.Discard(a);
+        Assert.False(File.Exists(Path.Combine(Jobs, a + ".pdf")));
+        Assert.False(File.Exists(Path.Combine(Jobs, b + ".pdf")));
+        Assert.False(File.Exists(JsonOf(a)));
+    }
+
+    [Fact]
+    public void Scan_offers_the_fax_once_and_never_its_parts_alone()
+    {
+        var (a, b, plan) = TwoDocPlan();
+        new JobTracker(_dir).RecordFailure(new SendSession(a, new[] { Path.Combine(Jobs, a + ".pdf"), Path.Combine(Jobs, b + ".pdf") }, true), plan);
+        var offers = new JobTracker(_dir).Scan();
+        var offer = Assert.Single(offers);
+        Assert.Equal(a, offer.SpoolId);
+        Assert.Equal(new[] { b }, offer.Parts);
+        Assert.Equal(2, offer.AllPdfPaths.Count);
+        Assert.Equal(SendKind.Draft, offer.Kind);   // editable again, with both documents
+    }
+
+    [Fact]
+    public async Task An_uncertain_multi_document_failure_resumes_locked_with_all_documents()
+    {
+        var (a, b, plan) = TwoDocPlan();
+        var session = new SendSession(a, new[] { Path.Combine(Jobs, a + ".pdf"), Path.Combine(Jobs, b + ".pdf") }, true);
+        var exec = new SendExecutor(new FailingApi(), new ClientConfig { Server = "127.0.0.1", Port = 8081, Token = "t" }, new JobTracker(_dir));
+        Assert.Equal(AttemptOutcome.Uncertain, (await exec.RunAsync(session, plan)).Outcome);
+
+        var offer = Assert.Single(new JobTracker(_dir).Scan());
+        Assert.Equal(SendKind.Resume, offer.Kind);
+        Assert.NotNull(offer.LockedPlan);
+        Assert.Equal(2, offer.LockedPlan!.PdfPaths.Count);
+        Assert.Equal("K-multi", offer.LockedPlan.IdempotencyKey);
+    }
+
+    [Fact]
+    public void NewDocuments_skips_a_part_of_a_fax()
+    {
+        var (a, b, plan) = TwoDocPlan();
+        new JobTracker(_dir).BeginSend(plan);
+        var seen = new HashSet<Guid>();
+        Assert.Empty(new JobTracker(_dir).NewDocuments(seen));   // both files belong to the fax
+    }
+
+    /// <summary>Throws like a timeout: the attempt is uncertain and the session locks.</summary>
+    sealed class FailingApi : ISendApi
+    {
+        public Task<Job> PostJobAsync(SendEndpoint endpoint, byte[] pdf, string to, string? subject, string idempotencyKey, CancellationToken ct = default) => throw new FaxApiException(0, "timeout");
+        public Task<Job> PostJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, string to, string? subject, string idempotencyKey, CancellationToken ct = default) => throw new FaxApiException(0, "timeout");
+        public Task<Job> SendTestPageAsync(SendEndpoint endpoint, string to, string? note, string idempotencyKey, CancellationToken ct = default) => throw new FaxApiException(0, "timeout");
+        public Task<FaxCheck?> AnalyzeJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, CancellationToken ct = default) => Task.FromResult<FaxCheck?>(null);
+    }
+
+
 }

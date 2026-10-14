@@ -211,5 +211,74 @@ class EnqueueTests(unittest.TestCase):
         self.assertEqual(cm.exception.job["id"], a["id"])
 
 
+class ComposeTests(unittest.TestCase):
+    """enqueue_pdf's merge/stamp step: what a multi-document send and fax headers do."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        r = self.tmp.name
+        self.cfg = SimpleNamespace(outbox=os.path.join(r, "outbox"), queue_meta=os.path.join(r, "queue-meta"))
+        self.reg, self.bus = Reg(), Bus()
+
+    def outbox_bytes(self, row):
+        with open(row["pdf_path"], "rb") as f:
+            return f.read()
+
+    def meta(self, row):
+        with open(os.path.join(self.cfg.queue_meta, row["filename"] + ".json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_multiple_parts_merge_through_gs(self):
+        from unittest.mock import patch
+        with patch("faxd.gs.compose", return_value=b"%PDF-merged") as compose:
+            row = enqueue_pdf(self.cfg, self.reg, self.bus, None, "000",
+                              parts=[("a.pdf", b"%PDF-a"), ("b.pdf", b"%PDF-b")])
+        self.assertEqual(self.outbox_bytes(row), b"%PDF-merged")
+        self.assertEqual(self.meta(row)["parts"], 2)
+        self.assertEqual(compose.call_args[0][1], [("a.pdf", b"%PDF-a"), ("b.pdf", b"%PDF-b")])
+
+    def test_single_unstamped_part_stays_byte_identical(self):
+        from unittest.mock import patch
+        with patch("faxd.gs.compose", side_effect=AssertionError("gs must not run")):
+            row = enqueue_pdf(self.cfg, self.reg, self.bus, b"%PDF-original", "000")
+        self.assertEqual(self.outbox_bytes(row), b"%PDF-original")
+
+    def test_header_stamps_a_single_document(self):
+        from unittest.mock import patch
+        self.cfg.fax_header, self.cfg.station_id = True, "LANFax"
+        with patch("faxd.gs.compose", return_value=b"%PDF-stamped") as compose:
+            row = enqueue_pdf(self.cfg, self.reg, self.bus, b"%PDF-original", "000")
+        self.assertEqual(self.outbox_bytes(row), b"%PDF-stamped")
+        kwargs = compose.call_args.kwargs
+        self.assertIn("TO 000 FROM LANFax", kwargs["header"])
+        self.assertTrue(kwargs["footer"])
+
+    def test_stamp_failure_falls_back_to_the_original(self):
+        from faxd import gs as gs_mod
+        from unittest.mock import patch
+        self.cfg.fax_header = True
+        with patch.object(gs_mod, "compose", side_effect=gs_mod.GsError("nope")):
+            row = enqueue_pdf(self.cfg, self.reg, self.bus, b"%PDF-original", "000")
+        self.assertEqual(self.outbox_bytes(row), b"%PDF-original")
+
+    def test_merge_failure_refuses_the_request(self):
+        from faxd import gs as gs_mod
+        from unittest.mock import patch
+        self.cfg.fax_header = True
+        with patch.object(gs_mod, "compose", side_effect=gs_mod.GsError("nope")):
+            with self.assertRaises(ValueError) as cm:
+                enqueue_pdf(self.cfg, self.reg, self.bus, None, "000",
+                            parts=[("a.pdf", b"%PDF-a"), ("b.pdf", b"%PDF-b")])
+        self.assertIn("could not be combined", str(cm.exception))
+        if os.path.isdir(self.cfg.outbox):   # refused before the outbox was even created
+            self.assertEqual(os.listdir(self.cfg.outbox), [])
+
+    def test_non_pdf_part_is_refused(self):
+        with self.assertRaises(ValueError):
+            enqueue_pdf(self.cfg, self.reg, self.bus, None, "000",
+                        parts=[("a.pdf", b"%PDF-a"), ("b.pdf", b"not a pdf")])
+
+
 if __name__ == "__main__":
     unittest.main()

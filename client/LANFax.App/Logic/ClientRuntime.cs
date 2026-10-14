@@ -479,6 +479,18 @@ public sealed class ClientRuntime : IDisposable, IMonitorSource
     public void TrackSubmitted(string serverId) => _submitted.Add(serverId);
 
     /// <summary>
+    /// Cancels a fax the user no longer wants sent: one still queued stops before dialling, one whose call is up is
+    /// hung up through the PBX. The server's answer is applied to the rows like any update. Throws <see cref="FaxApiException"/>
+    /// (409: it already moved on) for the caller to show.
+    /// </summary>
+    public async Task<Job> CancelJobAsync(string id)
+    {
+        var j = await Api.CancelJobAsync(id);
+        ApplyJobUpdate(j);
+        return j;
+    }
+
+    /// <summary>
     /// A job update from the stream, the poll or a send just accepted: raised through <see cref="JobChanged"/>, then
     /// a terminal one goes to the tracker. A direct call after <see cref="StopAsync"/> still updates the tracker (a
     /// send that finishes while exiting must be recorded); only the events are not raised. Stream events never get

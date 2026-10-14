@@ -334,6 +334,14 @@ class AmiProgress:
         with self._lock:
             return uniqueid in self._jobs
 
+    def channel_for(self, job_id):
+        """The live Asterisk channel carrying this job's call, if its mapping is known."""
+        with self._lock:
+            for uid, jid in self._jobs.items():
+                if jid == job_id:
+                    return self._chan.get(uid)
+        return None
+
     def active(self):
         with self._lock:
             return bool(self._jobs)

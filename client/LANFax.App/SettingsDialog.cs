@@ -11,6 +11,11 @@ internal sealed class SettingsDialog : Form
     private readonly NumericUpDown _port = new() { Minimum = 1, Maximum = 65535, Dock = DockStyle.Left, Width = 90 };
     private readonly TextBox _token = new() { Dock = DockStyle.Fill, UseSystemPasswordChar = true };
     private readonly CheckBox _keep = new() { Text = "Keep local copies of sent faxes", AutoSize = true };
+    private readonly CheckBox _promptAdd = new()
+    {
+        Text = "When printing while a fax is being prepared, offer to add it to that fax",
+        AutoSize = true,
+    };
     private readonly Button _test = new() { Text = "Test connection", AutoSize = true };
     private readonly Label _result = new() { AutoSize = true, MaximumSize = new Size(420, 0) };
     private readonly Button _clearToken = new() { Text = "Clear token", AutoSize = true };
@@ -44,6 +49,7 @@ internal sealed class SettingsDialog : Form
         _host.Text = cfg.Server;
         _port.Value = Math.Clamp(cfg.Port, 1, 65535);
         _keep.Checked = cfg.KeepLocalCopies;
+        _promptAdd.Checked = cfg.PromptToAddPages;
         _checkUpdates.Checked = cfg.CheckForUpdates;
 
         var t = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Fill };
@@ -64,9 +70,10 @@ internal sealed class SettingsDialog : Form
         tokenRow.Controls.Add(_clearToken);
         t.Controls.Add(tokenRow, 1, 3);
         t.Controls.Add(_keep, 0, 4); t.SetColumnSpan(_keep, 2);
-        t.Controls.Add(_test, 0, 5); t.SetColumnSpan(_test, 2);
-        t.Controls.Add(_result, 0, 6); t.SetColumnSpan(_result, 2);
-        int next = 7;
+        t.Controls.Add(_promptAdd, 0, 5); t.SetColumnSpan(_promptAdd, 2);
+        t.Controls.Add(_test, 0, 6); t.SetColumnSpan(_test, 2);
+        t.Controls.Add(_result, 0, 7); t.SetColumnSpan(_result, 2);
+        int next = 8;
         if (updates != null)
         {
             t.Controls.Add(_checkUpdates, 0, next++); t.SetColumnSpan(_checkUpdates, 2);
@@ -120,6 +127,7 @@ internal sealed class SettingsDialog : Form
         PrinterName = _cfg.PrinterName,
         SpoolDir = _cfg.SpoolDir,
         KeepLocalCopies = _keep.Checked,
+        PromptToAddPages = _promptAdd.Checked,
         CheckForUpdates = _checkUpdates.Checked,
     };
 
@@ -215,7 +223,7 @@ internal sealed class SettingsDialog : Form
             MessageBox.Show(this, "Could not save settings: " + e.Message, "LANFax", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
-        _cfg.Server = c.Server; _cfg.Port = c.Port; _cfg.Token = c.Token; _cfg.KeepLocalCopies = c.KeepLocalCopies; _cfg.CheckForUpdates = c.CheckForUpdates;
+        _cfg.Server = c.Server; _cfg.Port = c.Port; _cfg.Token = c.Token; _cfg.KeepLocalCopies = c.KeepLocalCopies; _cfg.PromptToAddPages = c.PromptToAddPages; _cfg.CheckForUpdates = c.CheckForUpdates;
         return true;
     }
 

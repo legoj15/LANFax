@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from .arm import ArmError
 from .enqueue import ExistingJob, normalize_number
+from . import gs
 
 log = logging.getLogger("faxd.api")
 
@@ -33,6 +34,59 @@ class _HttpError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+class CancelRefused(Exception):
+    """The job cannot be cancelled (terminal, or a call that cannot be hung up)."""
+
+
+def parse_multipart(body: bytes, ctype: str) -> list[tuple[str, bytes]]:
+    """(filename, content) parts of a multipart/form-data body: what a browser FormData
+    or the client's multi-document send posts. A body that does not split on its own
+    boundary, or has no usable part, is a 400."""
+    m = re.search(r'boundary="?([^";]+)"?', ctype or "")
+    if not m or not m.group(1).strip():
+        raise _HttpError(400, "multipart body without a boundary")
+    delim = b"--" + m.group(1).encode("utf-8", "replace")
+    out: list[tuple[str, bytes]] = []
+    for chunk in body.split(delim):
+        if chunk[:2] == b"--":        # the closing marker: nothing after it
+            break
+        if chunk.startswith(b"\r\n"):
+            chunk = chunk[2:]
+        elif not chunk:
+            continue                  # the preamble split before the first part
+        sep = chunk.find(b"\r\n\r\n")
+        if sep < 0:
+            continue
+        head, data = chunk[:sep], chunk[sep + 4:]
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        name = "part%d.pdf" % (len(out) + 1)
+        # quoted or bare (a browser quotes, .NET's MultipartFormDataContent does not for simple tokens)
+        fn = re.search(rb'filename=("?)([^";\r\n]*)\1', head)
+        if fn and fn.group(2):
+            name = fn.group(2).decode("utf-8", "replace")
+        out.append((name, data))
+    if not out:
+        raise _HttpError(400, "multipart body with no parts")
+    return out
+
+
+def _request_parts(body: bytes, ctype: str) -> list[tuple[str, bytes]]:
+    """The PDF parts of a /jobs or /analyze body: multipart when the content type says
+    so, otherwise the whole body is one PDF (the original client and web page path) --
+    the receive buffer itself, never copied."""
+    if (ctype or "").lower().startswith("multipart/form-data"):
+        return parse_multipart(body, ctype)
+    return [("fax.pdf", body)]
+
+
+def _check_pdf_parts(parts: list[tuple[str, bytes]]) -> list[tuple[str, bytes]]:
+    for _, data in parts:
+        if not data.startswith(b"%PDF"):
+            raise _HttpError(400, "body is not a PDF")
+    return parts
 
 
 def _redact(s):
@@ -364,11 +418,10 @@ class _Handler(BaseHTTPRequestHandler):
             to = (self.headers.get("X-Fax-To") or "").strip()
             if not to:
                 raise _HttpError(400, "X-Fax-To header required")
-            if not body.startswith(b"%PDF"):
-                raise _HttpError(400, "body is not a PDF")
+            parts = _check_pdf_parts(_request_parts(body, self.headers.get("Content-Type", "")))
             subject = (self.headers.get("X-Fax-Subject") or "").strip()
             try:
-                job = self.api.enqueue_fn(body, to, subject=subject, origin="api",
+                job = self.api.enqueue_fn(parts, to, subject=subject, origin="api",
                                           client=self.client_ip, client_key=key)
             except ExistingJob as e:
                 return self._repeat(e.job, to)
@@ -378,6 +431,40 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             self.api.uploads.release()
         self._json(201, job)
+
+    def r_analyze(self, query):
+        """The pre-send check behind the client's blank-page prompt: merge the parts the
+        way a send would (unstamped -- a stamp would ink every page) and report page
+        count and pages that render as blank paper. Never enqueues anything."""
+        if not self.api.uploads.acquire(blocking=False):
+            self.close_connection = True
+            return self._json(503, {"error": "too many uploads in progress; retry"},
+                              {"Retry-After": "2"})
+        try:
+            body = self._read_body(self.api.max_body)
+            parts = _check_pdf_parts(_request_parts(body, self.headers.get("Content-Type", "")))
+            del body
+            try:
+                merged = gs.compose(self.api.cfg.gs_bin, parts)
+            except gs.GsError as e:
+                raise _HttpError(400, f"the documents could not be combined ({e})")
+            blanks = gs.blank_pages(self.api.cfg.gs_bin, merged)
+            pages = gs.page_count(self.api.cfg.gs_bin, merged)
+            self._json(200, {"pages": pages, "blank_pages": blanks})
+        finally:
+            self.api.uploads.release()
+
+    def r_job_cancel(self, query, job_id):
+        cancel = self.api.cancel_fn
+        if cancel is None:
+            raise _HttpError(501, "cancel not available")
+        try:
+            row = cancel(job_id)
+        except CancelRefused as e:
+            raise _HttpError(409, str(e) or "cannot cancel")
+        if row is None:
+            raise _HttpError(404, "no such job")
+        self._json(200, row)
 
     @staticmethod
     def _minutes(obj, default):
@@ -525,7 +612,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 class Api:
     def __init__(self, cfg, reg, bus, arm, status_fn, enqueue_fn, testpage_fn,
-                 *, sse_keepalive=15.0, max_body=MAX_BODY, max_conns=MAX_CONNS,
+                 *, cancel_fn=None, sse_keepalive=15.0, max_body=MAX_BODY, max_conns=MAX_CONNS,
                  max_uploads=MAX_UPLOADS):
         self.cfg = cfg
         self.reg = reg
@@ -534,6 +621,7 @@ class Api:
         self.status_fn = status_fn
         self.enqueue_fn = enqueue_fn
         self.testpage_fn = testpage_fn
+        self.cancel_fn = cancel_fn
         self.sse_keepalive = sse_keepalive
         self.max_body = max_body
         self.uploads = threading.BoundedSemaphore(max_uploads)
@@ -544,8 +632,10 @@ class Api:
         self.routes = [
             (re.compile(r"/status"), {"GET": H.r_status}),
             (re.compile(r"/jobs"), {"GET": H.r_jobs, "POST": H.r_post_job}),
+            (re.compile(r"/jobs/" + _ID + r"/cancel"), {"POST": H.r_job_cancel}),
             (re.compile(r"/jobs/" + _ID), {"GET": H.r_job}),
             (re.compile(r"/jobs/" + _ID + r"/pdf"), {"GET": H.r_job_pdf}),
+            (re.compile(r"/analyze"), {"POST": H.r_analyze}),
             (re.compile(r"/inbox"), {"GET": H.r_inbox}),
             (re.compile(r"/arm"), {"POST": H.r_arm}),
             (re.compile(r"/disarm"), {"POST": H.r_disarm}),

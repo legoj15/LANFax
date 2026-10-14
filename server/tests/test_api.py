@@ -15,7 +15,8 @@ PDF = b"%PDF-1.4\n%fake\n%%EOF\n"
 
 
 def make_api(reg=None, **kw):
-    cfg = SimpleNamespace(http_bind="127.0.0.1", http_port=0, token=TOKEN, station_id="TESTSTN")
+    cfg = SimpleNamespace(http_bind="127.0.0.1", http_port=0, token=TOKEN, station_id="TESTSTN",
+                          gs_bin="gs")
     reg = reg or FakeRegistry()
     bus, arm = FakeBus(), FakeArm()
     calls = {"enqueue": [], "testpage": []}
@@ -168,7 +169,7 @@ class ApiCase(unittest.TestCase):
         self.assertEqual(d["id"], "lf000000000001")
         c = self.api.calls["enqueue"][0]
         self.assertEqual((c["pdf"], c["to"], c["subject"], c["origin"], c["client"]),
-                         (PDF, "5551234567", "hello", "api", "127.0.0.1"))
+                         ([("fax.pdf", PDF)], "5551234567", "hello", "api", "127.0.0.1"))
 
     def test_post_job_errors(self):
         h = {"Content-Type": "application/pdf"}
@@ -295,9 +296,9 @@ class ReviewFixCase(unittest.TestCase):
         try:
             s, _ = jreq(api, "POST", "/jobs", PDF, {"Content-Type": "application/pdf", "X-Fax-To": "555"})
             self.assertEqual(s, 201)
-            pdf = api.calls["enqueue"][-1]["pdf"]
-            self.assertIsInstance(pdf, bytearray)   # the receive buffer itself, no bytes() copy
-            self.assertEqual(pdf, PDF)
+            body = api.calls["enqueue"][-1]["pdf"][0][1]
+            self.assertIsInstance(body, bytearray)   # the receive buffer itself, no bytes() copy
+            self.assertEqual(body, PDF)
         finally:
             api.shutdown()
 
