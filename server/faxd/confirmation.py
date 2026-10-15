@@ -153,7 +153,7 @@ def build_confirmation(job: dict, events: list[dict], *, station_id: str, versio
             ts = _local(e.get("ts"))
             what = str(e.get("state") or "")
             detail = str(e.get("detail") or "")
-            line = (ts.strftime("%H:%M:%S") if ts else "").ljust(8) + what.ljust(10)
+            line = (ts.strftime("%H:%M:%S") if ts else "").ljust(9) + what.ljust(10)
             if detail and detail != what:
                 line += detail
             text(54, y, 8, _wrap(line, 558 - 54, 8)[0], gray=True)   # the log never wraps: truncate
