@@ -10,3 +10,4 @@ obj/
 .claude/
 client/dist/
 docs/handoff.md
+artifacts/

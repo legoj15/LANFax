@@ -21,6 +21,13 @@ public record JobDetail(Job Job, IReadOnlyList<JobEvent> Events);
 /// <summary>POST /analyze: the pre-send check behind the blank-page prompt.</summary>
 public record FaxCheck(int? Pages, IReadOnlyList<int> BlankPages);
 
+/// <summary>
+/// POST /preview: the first pages of the combined documents, rendered exactly as the send
+/// would stamp them. <see cref="Pages"/> is the document's full page count; <see cref="Rendered"/>
+/// holds at most the pages the server includes (<see cref="Shown"/> of them).
+/// </summary>
+public record FaxPreview(int? Pages, int Shown, IReadOnlyList<byte[]> Rendered, bool Stamped);
+
 public record ArmState(bool Armed, DateTimeOffset? Until, int RemainingMin, string Ext);
 
 public record ServerStatus(

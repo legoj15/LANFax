@@ -19,6 +19,11 @@ BLANK_THRESHOLD = 252       # a page whose darkest sample is still this close to
 MAX_OUTPUT = 100 * 1024 * 1024   # a merged/stamped PDF larger than this is not a fax; refuses rather than slurps
 MAX_PGM = 64 * 1024 * 1024  # one rendered page above this (huge MediaBox) is skipped, not slurped
 ASCII_ONLY = re.compile(r"[^ -~]")   # header/footer text must be ASCII (PostScript string)
+PREVIEW_DPI = 80            # the compose preview: crisp enough to judge header/footer placement
+PREVIEW_MAX_PAGES = 8       # pages sent to the client; the sheet says how many more exist
+PREVIEW_PAGE_BYTES = 4 * 1024 * 1024   # one rendered preview page above this ends the series
+PREVIEW_TOTAL_BYTES = 12 * 1024 * 1024 # ... as does the whole series above this
+THUMB_DPI = 48              # the confirmation sheet's first-page thumbnail
 
 
 class GsError(Exception):
@@ -198,3 +203,58 @@ def header_text(station_id: str, to: str, now: Optional[datetime] = None) -> str
     """The top line burned into every page: who, to whom, when (the fax machine convention)."""
     stamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M")
     return f"TO {to} FROM {station_id} {stamp}"
+
+
+def preview_pages(gs_bin: str, pdf: bytes, *, dpi: int = PREVIEW_DPI, max_pages: int = PREVIEW_MAX_PAGES,
+                  max_page_bytes: int = PREVIEW_PAGE_BYTES, total_bytes: int = PREVIEW_TOTAL_BYTES,
+                  timeout: float = 120.0) -> list[bytes]:
+    """PNG (pnggray) renders of the first `max_pages` pages, in page order; what the send
+    dialog shows of the merged document. gs stops after `max_pages` (a page range, not a
+    post-render crop: rendering a 100-page fax for 8 previews is not a thing this box does);
+    the byte budgets below remain as a safety net for one huge page. Raises GsError; the
+    caller decides (an unrenderable merge still answers, with no pages)."""
+    with tempfile.TemporaryDirectory(prefix="faxd-preview-") as tmp:
+        path = os.path.join(tmp, "in.pdf")
+        with open(path, "wb") as f:
+            f.write(pdf)
+        _gs(gs_bin, ["-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pnggray",
+                     "-r" + str(dpi), "-dFirstPage=1", "-dLastPage=%d" % max_pages,
+                     "-o", os.path.join(tmp, "p-%d.png"), path], timeout)
+        pages = sorted((int(m.group(1)), name) for name in os.listdir(tmp)
+                       if (m := re.fullmatch(r"p-(\d+)\.png", name)))
+        out: list[bytes] = []
+        used = 0
+        for _, name in pages:
+            if len(out) >= max_pages:
+                break
+            try:
+                with open(os.path.join(tmp, name), "rb") as f:
+                    data = f.read(max_page_bytes + 1)
+            except OSError:
+                continue
+            if len(data) > max_page_bytes or used + len(data) > total_bytes:
+                break
+            out.append(data)
+            used += len(data)
+        return out
+
+
+def page_jpeg(gs_bin: str, pdf: bytes, *, page: int = 1, dpi: int = THUMB_DPI, timeout: float = 30.0) -> Optional[bytes]:
+    """One page as a JPEG (the confirmation sheet's thumbnail), or None when gs cannot say."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="faxd-thumb-") as tmp:
+            path = os.path.join(tmp, "in.pdf")
+            with open(path, "wb") as f:
+                f.write(pdf)
+            out = os.path.join(tmp, "p.jpg")
+            _gs(gs_bin, ["-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=jpeg",
+                         "-dFirstPage=%d" % page, "-dLastPage=%d" % page, "-r" + str(dpi),
+                         "-o", out, path], timeout)
+            # a JPEG bigger than the blank-check page budget is not a thumbnail; a
+            # truncated one embedded in the sheet would be declare-correct and corrupt
+            if os.path.getsize(out) > MAX_PGM:
+                return None
+            with open(out, "rb") as f:
+                return f.read()
+    except (GsError, OSError):
+        return None

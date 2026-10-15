@@ -55,6 +55,20 @@ public sealed class SendExecutorTests : IDisposable
             return Task.FromResult(AnalyzeAnswer);
         }
 
+        public FaxPreview? PreviewAnswer { get; set; }
+        public Func<Exception>? OnPreview { get; set; }
+        public string? PreviewedNumber;
+        public readonly List<IReadOnlyList<(byte[] Bytes, string Name)>> Previewed = new();
+
+        public Task<FaxPreview?> PreviewJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, string to, CancellationToken ct = default)
+        {
+            if (OnPreview is { } raise) throw raise();
+            Endpoints.Add(endpoint);
+            PreviewedNumber = to;
+            Previewed.Add(parts);
+            return Task.FromResult(PreviewAnswer);
+        }
+
         public Task<Job> SendTestPageAsync(SendEndpoint endpoint, string to, string? note, string idempotencyKey, CancellationToken ct = default)
         {
             Calls.Add($"test {to} {note} {idempotencyKey}");
@@ -552,6 +566,61 @@ public sealed class SendExecutorTests : IDisposable
             .PreCheckAsync(session.Build("5552345678", null, false, false));
         Assert.Null(blanks);
         Assert.Null(error);
+    }
+
+    // ---- the compose preview ----
+
+    [Fact]
+    public async Task Preview_reads_the_documents_and_passes_the_normalized_number()
+    {
+        var a = Spooled();
+        var api = new FakeApi
+        {
+            PreviewAnswer = new FaxPreview(3, 1, [new byte[] { 1, 2 }], Stamped: true),
+        };
+        var r = await new SendExecutor(api, Cfg, null).PreviewAsync([a.pdf], "15552345678");
+        Assert.True(r.Ok);
+        Assert.Equal(3, r.TotalPages);
+        Assert.Equal(1, r.Shown);
+        Assert.True(r.Stamped);
+        Assert.Equal(new byte[] { 1, 2 }, r.Pages.Single());
+        Assert.Equal("15552345678", api.PreviewedNumber);
+        var parts = Assert.Single(api.Previewed);
+        Assert.Equal(File.ReadAllBytes(a.pdf), parts[0].Bytes);
+        Assert.Equal(Path.GetFileName(a.pdf), parts[0].Name);
+        Assert.Equal(Cfg.Server + ":" + Cfg.Port, api.Endpoints.Single().BaseUri.Authority);
+    }
+
+    [Fact]
+    public async Task Preview_without_documents_or_a_usable_server_asks_nothing()
+    {
+        var api = new FakeApi();
+        Assert.Equal(SendPreviewFailure.NoDocuments,
+            (await new SendExecutor(api, Cfg, null).PreviewAsync([], "15552345678")).Failure);
+
+        var bad = new ClientConfig { Server = "127.0.0.1:99", Port = 8080, Token = "t" };
+        Assert.Equal(SendPreviewFailure.Config,
+            (await new SendExecutor(api, bad, null).PreviewAsync([@"C:\x.pdf"], "15552345678")).Failure);
+        Assert.Empty(api.Previewed);
+    }
+
+    [Fact]
+    public async Task Preview_failures_never_throw()
+    {
+        var gone = Spooled();
+        File.Delete(gone.pdf);
+        var api = new FakeApi();
+        Assert.Equal(SendPreviewFailure.Unreadable,
+            (await new SendExecutor(api, Cfg, null).PreviewAsync([gone.pdf], "15552345678")).Failure);
+
+        api = new FakeApi { OnPreview = () => new FaxApiException(0, "cannot reach faxd") };
+        var r = await new SendExecutor(api, Cfg, null).PreviewAsync([Spooled().pdf], "15552345678");
+        Assert.Equal(SendPreviewFailure.Unavailable, r.Failure);
+        Assert.Equal("cannot reach faxd", r.Error);
+
+        api = new FakeApi { PreviewAnswer = null };
+        Assert.Equal(SendPreviewFailure.NoServerRoute,
+            (await new SendExecutor(api, Cfg, null).PreviewAsync([Spooled().pdf], "15552345678")).Failure);
     }
 
 }

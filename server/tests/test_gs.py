@@ -191,3 +191,71 @@ def test_blank_pages_tolerates_gs_failure(monkeypatch):
 def test_header_text_is_ascii_and_dated():
     assert gs.header_text("LANFax", "15550100", datetime(2026, 10, 14, 9, 30)) == \
         "TO 15550100 FROM LANFax 2026-10-14 09:30"
+
+
+# ---- preview pages (the client's compose preview) ----------------------------
+
+def test_preview_pages_renders_pnggray_in_page_order(monkeypatch):
+    def run(args):
+        assert device_of(args) == "pnggray"
+        assert "-r80" in args
+        assert "-dFirstPage=1" in args and "-dLastPage=8" in args   # gs stops, not a post-render crop
+        out = args[args.index("-o") + 1]
+        for n, data in ((2, b"png2"), (10, b"png10"), (1, b"png1")):
+            with open(out % n, "wb") as f:
+                f.write(data)
+
+    fake_gs(monkeypatch, run)
+    assert gs.preview_pages("gs", PDF_A) == [b"png1", b"png2", b"png10"]
+
+
+def test_preview_pages_caps_the_count(monkeypatch):
+    def run(args):
+        assert "-dLastPage=2" in args
+        out = args[args.index("-o") + 1]
+        for n in range(1, 6):
+            with open(out % n, "wb") as f:
+                f.write(b"png%d" % n)
+
+    fake_gs(monkeypatch, run)
+    assert gs.preview_pages("gs", PDF_A, max_pages=2) == [b"png1", b"png2"]
+
+
+def test_preview_pages_stops_at_the_byte_budget(monkeypatch):
+    def run(args):
+        out = args[args.index("-o") + 1]
+        for n in range(1, 4):
+            with open(out % n, "wb") as f:
+                f.write(b"x" * (40 if n < 3 else 100))
+
+    fake_gs(monkeypatch, run)
+    assert gs.preview_pages("gs", PDF_A, max_page_bytes=50, total_bytes=100) == [b"x" * 40, b"x" * 40]
+
+
+def test_preview_pages_ignores_stray_files(monkeypatch):
+    def run(args):
+        out = args[args.index("-o") + 1]
+        with open(out % 1, "wb") as f:
+            f.write(b"png1")
+        with open(out % 1 + ".tmp", "wb") as f:
+            f.write(b"junk")
+
+    fake_gs(monkeypatch, run)
+    assert gs.preview_pages("gs", PDF_A) == [b"png1"]
+
+
+# ---- one-page jpeg (the confirmation sheet's thumbnail) ----------------------
+
+def test_page_jpeg_renders_the_first_page_only(monkeypatch):
+    def run(args):
+        assert device_of(args) == "jpeg"
+        assert "-dFirstPage=1" in args and "-dLastPage=1" in args
+        write_out(args, b"\xff\xd8\xff jpeg-data")
+
+    fake_gs(monkeypatch, run)
+    assert gs.page_jpeg("gs", PDF_A) == b"\xff\xd8\xff jpeg-data"
+
+
+def test_page_jpeg_is_best_effort(monkeypatch):
+    fake_gs(monkeypatch, lambda args: (_ for _ in ()).throw(gs.GsError("broken")))
+    assert gs.page_jpeg("gs", PDF_A) is None

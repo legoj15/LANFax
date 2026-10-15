@@ -231,6 +231,7 @@ public sealed class MainFormSmokeTests
             throw new NotSupportedException("the window must not load");
 
         public Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default) => Task.CompletedTask;
+        public Task DownloadConfirmationAsync(string id, string destPath, CancellationToken ct = default) => Task.CompletedTask;
         public Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default) =>
             ArmError is { } e ? Task.FromException<ArmState>(e)
             : ArmGate is { } g ? g.Task

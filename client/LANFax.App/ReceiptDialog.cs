@@ -24,10 +24,12 @@ internal sealed class ReceiptDialog : Form
         MultiSelect = false, HideSelection = true,
     };
     private readonly Label _error = new() { AutoSize = true, ForeColor = Color.Firebrick, MaximumSize = new Size(460, 0) };
+    private readonly Button _openSheet = new() { Text = "Open confirmation sheet", AutoSize = true, Enabled = false };
     private readonly Button _openPdf = new() { Text = "Open PDF", AutoSize = true, Enabled = false };
     private readonly Button _copyNumber = new() { Text = "Copy number", AutoSize = true, Enabled = false };
     private readonly Button _close = new() { Text = "Close", AutoSize = true, DialogResult = DialogResult.Cancel };
     private string? _number;
+    private bool _sheetAvailable;
 
     public string JobId { get; }
 
@@ -58,12 +60,14 @@ internal sealed class ReceiptDialog : Form
         buttons.Controls.Add(_close);
         buttons.Controls.Add(_copyNumber);
         buttons.Controls.Add(_openPdf);
+        buttons.Controls.Add(_openSheet);
         root.Controls.Add(buttons);
         for (int i = 0; i < 5; i++)
             root.RowStyles.Add(i == 2 ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.AutoSize));
         Controls.Add(root);
         CancelButton = _close;
 
+        _openSheet.Click += async (_, _) => await OpenSheetAsync();
         _openPdf.Click += async (_, _) => await OpenPdfAsync();
         _copyNumber.Click += (_, _) => CopyNumber();
         Shown += (_, _) => _ = LoadAsync();
@@ -121,6 +125,19 @@ internal sealed class ReceiptDialog : Form
 
         _openPdf.Enabled = true;
         _copyNumber.Enabled = _number is not (null or "-");
+        _sheetAvailable = j.Direction == "out" && j.IsTerminal;
+        _openSheet.Enabled = _sheetAvailable;
+    }
+
+    private async Task OpenSheetAsync()
+    {
+        _openSheet.Enabled = false;
+        try
+        {
+            var r = await _pdf.OpenConfirmationAsync(JobId);
+            if (r != null && !IsDisposed && r.Message != null) _error.Text = r.Message;
+        }
+        finally { if (!IsDisposed) _openSheet.Enabled = _sheetAvailable; }
     }
 
     private static string Party(Job j) =>

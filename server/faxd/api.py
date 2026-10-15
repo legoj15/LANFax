@@ -1,4 +1,5 @@
 """HTTP API + SSE for faxd (stdlib only). See docs/faxd-spec.md, api.py."""
+import base64
 import hmac
 import json
 import logging
@@ -11,8 +12,11 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from . import __version__
+from . import confirmation
 from .arm import ArmError
-from .enqueue import ExistingJob, normalize_number
+from .db import TERMINAL_STATES
+from .enqueue import ExistingJob, check_number, normalize_number
 from . import gs
 
 log = logging.getLogger("faxd.api")
@@ -22,8 +26,10 @@ MAX_CONNS = 32                # concurrent connections, SSE streams included
 MAX_PARTS = 50                # documents in one multipart fax; more is abuse, not a fax
 REQUEST_TIMEOUT = 30          # seconds; socket timeout for every connection
 MAX_UPLOADS = 2               # concurrent POST /jobs body reads (each may hold MAX_BODY)
+MAX_PREVIEWS = 1              # concurrent POST /preview requests (each runs gs; the box has one core)
 REPLAY_MAX = 200              # missed job_events rows replayed on reconnect; more -> `resync`
 CHUNK = 64 * 1024
+MAX_SENT_PDF_READ = 64 * 1024 * 1024   # a stored sent PDF larger than this gets no thumbnail
 _TOKEN_RE = re.compile(r"(token=)[^&\s]*", re.IGNORECASE)
 _ID = r"([A-Za-z0-9_-]+)"
 _CLIENT_KEY = re.compile(r"[A-Za-z0-9._:-]{16,128}")
@@ -401,6 +407,55 @@ class _Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
 
+    def r_job_confirmation(self, query, job_id):
+        """The printable fax confirmation sheet for a finished outbound fax: built on the
+        first ask (job row, event history, and a first-page thumbnail from the sent PDF
+        while it is still on disk) and cached in confirmations_dir. The cache is rebuilt
+        when the row moved after the sheet was written (a cancel that lost its race), and
+        an unwritable cache dir degrades to building per request, never a 500."""
+        job = self.api.reg.get_job(job_id)
+        if not job:
+            raise _HttpError(404, "no such job")
+        if job.get("direction") != "out" or job.get("state") not in TERMINAL_STATES:
+            raise _HttpError(404, "no confirmation for this fax")
+        path = confirmation.confirmation_path(getattr(self.api.cfg, "confirmations_dir", None), job_id)
+        # the build (gs thumbnail included) shares the preview slot: it is the same kind of
+        # one-core work, and this bounds N simultaneous first asks without refusing clicks --
+        # the request waits rather than 503s, well inside the 30 s socket timeout
+        with self.api.previews:
+            if path and (not os.path.exists(path) or confirmation.sheet_stale(path, job)):
+                try:
+                    confirmation.write_confirmation(path, self._build_confirmation(job))
+                except OSError as e:
+                    log.warning("confirmation cache write for %s failed; building per request: %s", job_id, e)
+        if path and os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    body = f.read()
+            except OSError:
+                body = self._build_confirmation(job)
+        else:
+            body = self._build_confirmation(job)
+        self._send(200, body, "application/pdf",
+                   {"Content-Disposition": 'inline; filename="confirmation-%s.pdf"' % job_id})
+
+    def _build_confirmation(self, job):
+        thumb = None
+        pdf_path = job.get("pdf_path")
+        if pdf_path:
+            try:
+                if os.path.getsize(pdf_path) <= MAX_SENT_PDF_READ:
+                    with open(pdf_path, "rb") as f:
+                        data = f.read()
+                    if data.startswith(b"%PDF"):
+                        thumb = gs.page_jpeg(self.api.cfg.gs_bin, data)
+            except OSError:
+                thumb = None
+        return confirmation.build_confirmation(
+            job, self.api.reg.job_events(job["id"]),
+            station_id=getattr(self.api.cfg, "station_id", "LANFax"),
+            version=__version__, thumbnail=thumb)
+
     def _prior(self, key):
         """The job an earlier request with this Idempotency-Key created, else None."""
         return self.api.reg.find_by_client_key(key) if key else None
@@ -466,6 +521,51 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, {"pages": pages, "blank_pages": blanks})
         finally:
             self.api.uploads.release()
+
+    def r_preview(self, query):
+        """The compose preview behind the send window's page panel: merge the parts the
+        way a send would (stamped exactly when FAXD_FAX_HEADER is on, so the header and
+        page numbers sit where they will sit on paper), render the first pages as PNGs,
+        and answer base64. Never enqueues anything. One at a time (`MAX_PREVIEWS`: the
+        renders run gs on the one core; a second caller gets 503 instead of queueing
+        behind them), and the POST /jobs upload slots stay free for real faxes."""
+        if not self.api.previews.acquire(blocking=False):
+            self.close_connection = True
+            return self._json(503, {"error": "too many previews in progress; retry"},
+                              {"Retry-After": "2"})
+        try:
+            body = self._read_body(self.api.max_body)
+            parts = _check_pdf_parts(_request_parts(body, self.headers.get("Content-Type", "")))
+            del body
+            header = None
+            if getattr(self.api.cfg, "fax_header", False):
+                to = (self.headers.get("X-Fax-To") or "").strip()
+                if not to:
+                    raise _HttpError(400, "X-Fax-To header required for a stamped preview")
+                try:
+                    number = check_number(normalize_number(to),
+                                          getattr(self.api.cfg, "allowed_numbers", "nanp,000,ext"))
+                except ValueError as e:
+                    raise _HttpError(400, str(e) or "bad number")
+                header = gs.header_text(getattr(self.api.cfg, "station_id", "LANFax"), number)
+            try:
+                merged = gs.compose(self.api.cfg.gs_bin, parts, header=header, footer=bool(header))
+            except gs.GsError as e:
+                raise _HttpError(400, f"the documents could not be combined ({e})")
+            try:
+                pages = gs.page_count(self.api.cfg.gs_bin, merged)
+            except gs.GsError:
+                pages = None
+            try:
+                rendered = gs.preview_pages(self.api.cfg.gs_bin, merged)
+            except gs.GsError:
+                rendered = []
+            del merged   # the base64 answer triples the PNG bytes; do not hold the merged PDF through it
+            self._json(200, {"pages": pages, "shown": len(rendered),
+                             "rendered": [base64.b64encode(p).decode("ascii") for p in rendered],
+                             "stamped": bool(header)})
+        finally:
+            self.api.previews.release()
 
     def r_job_cancel(self, query, job_id):
         cancel = self.api.cancel_fn
@@ -626,7 +726,7 @@ class _Handler(BaseHTTPRequestHandler):
 class Api:
     def __init__(self, cfg, reg, bus, arm, status_fn, enqueue_fn, testpage_fn,
                  *, cancel_fn=None, sse_keepalive=15.0, max_body=MAX_BODY, max_conns=MAX_CONNS,
-                 max_uploads=MAX_UPLOADS):
+                 max_uploads=MAX_UPLOADS, max_previews=MAX_PREVIEWS):
         self.cfg = cfg
         self.reg = reg
         self.bus = bus
@@ -638,6 +738,7 @@ class Api:
         self.sse_keepalive = sse_keepalive
         self.max_body = max_body
         self.uploads = threading.BoundedSemaphore(max_uploads)
+        self.previews = threading.BoundedSemaphore(max_previews)
         self.token = cfg.token
         self.stop = threading.Event()
         self._serving = threading.Event()
@@ -646,9 +747,11 @@ class Api:
             (re.compile(r"/status"), {"GET": H.r_status}),
             (re.compile(r"/jobs"), {"GET": H.r_jobs, "POST": H.r_post_job}),
             (re.compile(r"/jobs/" + _ID + r"/cancel"), {"POST": H.r_job_cancel}),
+            (re.compile(r"/jobs/" + _ID + r"/confirmation\.pdf"), {"GET": H.r_job_confirmation}),
             (re.compile(r"/jobs/" + _ID), {"GET": H.r_job}),
             (re.compile(r"/jobs/" + _ID + r"/pdf"), {"GET": H.r_job_pdf}),
             (re.compile(r"/analyze"), {"POST": H.r_analyze}),
+            (re.compile(r"/preview"), {"POST": H.r_preview}),
             (re.compile(r"/inbox"), {"GET": H.r_inbox}),
             (re.compile(r"/arm"), {"POST": H.r_arm}),
             (re.compile(r"/disarm"), {"POST": H.r_disarm}),

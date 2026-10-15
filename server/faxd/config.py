@@ -34,6 +34,7 @@ class Config:
     event_retention_days: int = 30          # job_events rows older than this are pruned; 0 = keep
     gs_bin: str = "gs"                      # ghostscript binary for merge/stamp/blank analysis
     fax_header: bool = False                # stamp sender/recipient/date and page numbers on every page
+    confirmations_dir: str = "/var/lib/faxd/confirmations"   # cached fax confirmation sheets
 
     @property
     def outbox(self) -> str:
@@ -84,6 +85,7 @@ _KEYS: dict[str, tuple[str, type]] = {
     "FAXD_EVENT_RETENTION_DAYS": ("event_retention_days", int),
     "FAXD_GS_BIN": ("gs_bin", str),
     "FAXD_FAX_HEADER": ("fax_header", bool),
+    "FAXD_CONFIRMATIONS_DIR": ("confirmations_dir", str),
 }
 
 

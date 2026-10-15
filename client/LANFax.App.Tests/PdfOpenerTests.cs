@@ -140,6 +140,7 @@ public sealed class PdfOpenerTests : IDisposable
             DateTimeOffset? updatedSince = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<Job>> GetInboxAsync(int limit = 50, CancellationToken ct = default) => throw new NotSupportedException();
         public Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default) => gate;
+        public Task DownloadConfirmationAsync(string id, string destPath, CancellationToken ct = default) => gate;
         public Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<ArmState> DisarmAsync(CancellationToken ct = default) => throw new NotSupportedException();
         public Task<ArmState> ReceiveTestAsync(int minutes = 20, CancellationToken ct = default) => throw new NotSupportedException();

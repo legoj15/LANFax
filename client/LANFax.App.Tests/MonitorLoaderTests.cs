@@ -178,6 +178,7 @@ public sealed class MonitorLoaderTests
             Task.FromResult<IReadOnlyList<Job>>([J("in1", "in")]);
 
         public Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default) => Task.CompletedTask;
+        public Task DownloadConfirmationAsync(string id, string destPath, CancellationToken ct = default) => Task.CompletedTask;
         public Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<ArmState> DisarmAsync(CancellationToken ct = default) => throw new NotSupportedException();
         public Task<ArmState> ReceiveTestAsync(int minutes = 20, CancellationToken ct = default) => throw new NotSupportedException();

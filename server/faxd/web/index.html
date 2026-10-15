@@ -144,6 +144,11 @@ function fmtTime(s) {
 const BADGE = { queued: "amber", dialing: "amber", sending: "amber", sent: "green", failed: "red", received: "blue", cancelled: "gray" };
 function badge(st) { return '<span class="badge b-' + (BADGE[st] || "gray") + '">' + esc(st) + "</span>"; }
 function pdfLink(j) { return j.pdf_path ? '<a class="lnk" data-pdf="' + esc(j.id) + '">open</a>' : ""; }
+// the printable confirmation sheet: finished outbound faxes only (faxd answers 404 for anything else)
+function confLink(j) {
+  return j.direction === "out" && ["sent", "failed", "cancelled"].includes(j.state)
+    ? '<a class="lnk" data-conf="' + esc(j.id) + '">confirmation</a>' : "";
+}
 
 function fill(tbody, empty, rows, ncols) {
   $(tbody).innerHTML = rows.join("");
@@ -153,7 +158,7 @@ async function loadJobs() {
   try {
     const d = await jget("/jobs?direction=out&limit=50");
     fill("jobs", "jobs-empty", d.jobs.map(j => "<tr><td>" + fmtTime(j.created_at) + "</td><td>" + esc(j.to_number) + "</td><td>" + badge(j.state) +
-      "</td><td>" + esc(j.pages) + '</td><td class="err">' + esc(j.error) + "</td><td>" + pdfLink(j) + "</td></tr>"));
+      "</td><td>" + esc(j.pages) + '</td><td class="err">' + esc(j.error) + "</td><td>" + pdfLink(j) + " " + confLink(j) + "</td></tr>"));
   } catch (e) { if (token) say("Could not load jobs: " + e.message, true); }
 }
 async function loadInbox() {
@@ -231,15 +236,25 @@ function connectEvents() {
   };
 }
 
-async function openPdf(id) {
-  const r = await api("/jobs/" + encodeURIComponent(id) + "/pdf");
-  if (!r.ok) { say("PDF not available", true); return; }
+async function openBlob(path, missing) {
+  const r = await api(path);
+  if (!r.ok) { say(missing, true); return; }
   const blob = await r.blob();
-  window.open(URL.createObjectURL(blob));
+  const url = URL.createObjectURL(blob);
+  window.open(url);
+  setTimeout(() => URL.revokeObjectURL(url), 60000);   // the viewer keeps the tab; the object URL need not live forever
+}
+function openPdf(id) {
+  return openBlob("/jobs/" + encodeURIComponent(id) + "/pdf", "PDF not available");
+}
+function openConfirmation(id) {
+  return openBlob("/jobs/" + encodeURIComponent(id) + "/confirmation.pdf", "No confirmation sheet for this fax");
 }
 document.addEventListener("click", e => {
   const a = e.target.closest("[data-pdf]");
   if (a) openPdf(a.dataset.pdf);
+  const c = e.target.closest("[data-conf]");
+  if (c) openConfirmation(c.dataset.conf);
 });
 
 async function act(fn, ok) {

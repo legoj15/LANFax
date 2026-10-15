@@ -38,6 +38,7 @@ public sealed class MainForm : Form
     private readonly ToolStripMenuItem _menuCopy = new("Copy number");
     private readonly ToolStripMenuItem _menuCancel = new("Cancel this fax...");
     private readonly ToolStripMenuItem _menuReceipt = new("View confirmation");
+    private readonly ToolStripMenuItem _menuSheet = new("Open confirmation sheet");
     private readonly ToolStripMenuItem _menuPdf = new("Open PDF");
     private readonly ContextMenuStrip _inboxMenu = new();
     private readonly ToolStripMenuItem _menuInboxCopy = new("Copy number");
@@ -74,12 +75,12 @@ public sealed class MainForm : Form
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(10) };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
-        var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, AutoSize = true, Margin = Padding.Empty };
+        var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, AutoSize = true, Margin = Padding.Empty, Padding = new Padding(0, 4, 0, 4) };
         header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        var title = new FlowLayoutPanel { AutoSize = true, Margin = Padding.Empty };
-        title.Controls.Add(new Label { Text = "LANFax", AutoSize = true, Font = new Font(SystemFonts.MessageBoxFont!.FontFamily, 14f, FontStyle.Bold) });
+        var title = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = Padding.Empty, WrapContents = false };
+        title.Controls.Add(new Label { Text = "LANFax", AutoSize = true, Font = new Font(SystemFonts.MessageBoxFont!.FontFamily, 14f, FontStyle.Bold), Margin = new Padding(0, 2, 0, 2) });
         if (_sendFax != null)
         {
             var send = new Button { Text = "Send a fax...", AutoSize = true, MinimumSize = new Size(0, 28), Margin = new Padding(12, 2, 0, 0) };
@@ -131,6 +132,7 @@ public sealed class MainForm : Form
         {
             if (RowOf(_jobsGrid) is { State: "sent" } r) (_showReceipt ?? (id => _ = OpenPdfAsync(id)))(r.Id);
         };
+        _menuSheet.Click += (_, _) => { if (RowOf(_jobsGrid)?.Id is { } id) _ = OpenSheetAsync(id); };
         _menuCancel.Click += async (_, _) => { if (RowOf(_jobsGrid) is { } r) await CancelFaxAsync(r); };
 
         _tick.Tick += (_, _) => { RenderArm(); RenderPill(); };
@@ -292,7 +294,7 @@ public sealed class MainForm : Form
 
     private void BuildMenus()
     {
-        _jobsMenu.Items.AddRange([_menuCopy, _menuCancel, new ToolStripSeparator(), _menuReceipt, _menuPdf]);
+        _jobsMenu.Items.AddRange([_menuCopy, _menuCancel, new ToolStripSeparator(), _menuReceipt, _menuSheet, _menuPdf]);
         _jobsGrid.ContextMenuStrip = _jobsMenu;
         _jobsMenu.Opening += (_, _) =>
         {
@@ -300,6 +302,7 @@ public sealed class MainForm : Form
             bool active = r is { State: "queued" or "dialing" or "sending" };
             _menuCancel.Enabled = active;
             _menuReceipt.Enabled = r is { State: "sent" };
+            _menuSheet.Enabled = r is { State: "sent" or "failed" or "cancelled" };
             _menuCopy.Enabled = r != null;
             _menuPdf.Enabled = r != null;
         };
@@ -370,6 +373,15 @@ public sealed class MainForm : Form
     {
         Say("Downloading the PDF...");
         var r = await _pdf.OpenAsync(id);
+        if (r == null || IsDisposed) return;
+        Say(r.Message ?? Hint);
+    }
+
+    /// <summary>Downloads the fax's printable confirmation sheet and opens it.</summary>
+    private async Task OpenSheetAsync(string id)
+    {
+        Say("Downloading the confirmation sheet...");
+        var r = await _pdf.OpenConfirmationAsync(id);
         if (r == null || IsDisposed) return;
         Say(r.Message ?? Hint);
     }

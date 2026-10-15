@@ -16,6 +16,35 @@ public enum SendAttemptStatus
 public sealed record SendAttemptResult(SendAttemptStatus Status, string? Message = null, Job? Job = null,
     AttemptOutcome Outcome = AttemptOutcome.NotSent, Exception? Failure = null);
 
+/// <summary>Why <see cref="SendExecutor.PreviewAsync"/> has no pages to show.</summary>
+public enum SendPreviewFailure
+{
+    /// <summary>Pages are shown.</summary>
+    None,
+    /// <summary>No documents to render (a test page's sheet is built on the server when it is sent).</summary>
+    NoDocuments,
+    /// <summary>The settings cannot form a server address.</summary>
+    Config,
+    /// <summary>A document could not be read.</summary>
+    Unreadable,
+    /// <summary>The documents together exceed the server's upload limit.</summary>
+    TooLarge,
+    /// <summary>The server is older than the preview route.</summary>
+    NoServerRoute,
+    /// <summary>The server could not be reached, or refused the render.</summary>
+    Unavailable,
+}
+
+/// <param name="Error">The server's reason, when it gave one (shown under the empty preview).</param>
+public sealed record SendPreview(IReadOnlyList<byte[]> Pages, int? TotalPages, int Shown, bool Stamped,
+    SendPreviewFailure Failure, string? Error = null)
+{
+    public bool Ok => Failure == SendPreviewFailure.None;
+
+    public static SendPreview Fail(SendPreviewFailure failure, string? error = null) =>
+        new(Array.Empty<byte[]>(), null, 0, false, failure, error);
+}
+
 /// <summary>
 /// One send attempt, in the order that keeps a crash from producing a duplicate or a lost fax: check the documents'
 /// sizes and read them, snapshot the endpoint (server, port, token) from the config, persist <c>sending</c> with the key
@@ -36,11 +65,11 @@ public sealed class SendExecutor(ISendApi api, ClientConfig cfg, JobTracker? jou
     /// Reads a plan's documents (each file, and the fax together, within the server's limit) as the upload's parts.
     /// The first unreadable file means nothing is sent; its name says which one.
     /// </summary>
-    private static async Task<IReadOnlyList<(byte[] Bytes, string Name)>?> ReadDocumentsAsync(SendPlan plan)
+    private static async Task<IReadOnlyList<(byte[] Bytes, string Name)>?> ReadDocumentsAsync(IReadOnlyList<string> paths)
     {
         var parts = new List<(byte[], string)>();
         long total = 0;
-        foreach (var path in plan.PdfPaths)
+        foreach (var path in paths)
         {
             byte[] bytes;
             try
@@ -64,7 +93,7 @@ public sealed class SendExecutor(ISendApi api, ClientConfig cfg, JobTracker? jou
         IReadOnlyList<(byte[] Bytes, string Name)>? parts = null;
         if (plan.Route == SendRoute.Document)
         {
-            try { parts = await ReadDocumentsAsync(plan); }
+            try { parts = await ReadDocumentsAsync(plan.PdfPaths); }
             catch (IOException e) { return NotSent(session, "Cannot read the document (" + e.Message + ")."); }
             if (parts == null) return NotSent(session, TooLargeMessage);
         }
@@ -138,7 +167,7 @@ public sealed class SendExecutor(ISendApi api, ClientConfig cfg, JobTracker? jou
         try { endpoint = SendEndpoint.From(cfg); }
         catch (FaxApiConfigException) { return (null, null); } // the send itself will say it
         IReadOnlyList<(byte[] Bytes, string Name)> parts;
-        try { parts = (await ReadDocumentsAsync(plan))!; }
+        try { parts = (await ReadDocumentsAsync(plan.PdfPaths))!; }
         catch (IOException e) { return (null, "Cannot read the document (" + e.Message + ")."); }
         if (parts == null) return (null, TooLargeMessage);
         try
@@ -154,6 +183,30 @@ public sealed class SendExecutor(ISendApi api, ClientConfig cfg, JobTracker? jou
         {
             return (null, "The documents could not be checked: " + e.Message);
         }
+    }
+
+    /// <summary>
+    /// The send window's page preview: the documents as the server would combine and stamp them, rendered. Never
+    /// throws (a preview is a courtesy, like <see cref="PreCheckAsync"/>); the failure kind tells the dialog what
+    /// note to show. Cancelled by the caller's token when the documents or number changed again.
+    /// </summary>
+    public async Task<SendPreview> PreviewAsync(IReadOnlyList<string> pdfPaths, string normalizedNumber,
+        CancellationToken ct = default)
+    {
+        if (pdfPaths.Count == 0) return SendPreview.Fail(SendPreviewFailure.NoDocuments);
+        SendEndpoint endpoint;
+        try { endpoint = SendEndpoint.From(cfg); }
+        catch (FaxApiConfigException) { return SendPreview.Fail(SendPreviewFailure.Config); }
+        IReadOnlyList<(byte[] Bytes, string Name)>? parts;
+        try { parts = await ReadDocumentsAsync(pdfPaths); }
+        catch (IOException e) { return SendPreview.Fail(SendPreviewFailure.Unreadable, e.Message); }
+        if (parts == null) return SendPreview.Fail(SendPreviewFailure.TooLarge);
+        FaxPreview? preview;
+        try { preview = await api.PreviewJobAsync(endpoint, parts, normalizedNumber, ct); }
+        catch (OperationCanceledException) { throw; }
+        catch (FaxApiException e) { return SendPreview.Fail(SendPreviewFailure.Unavailable, e.Message); }
+        if (preview == null) return SendPreview.Fail(SendPreviewFailure.NoServerRoute);
+        return new SendPreview(preview.Rendered, preview.Pages, preview.Shown, preview.Stamped, SendPreviewFailure.None);
     }
 
     private static SendAttemptResult NotSent(SendSession session, string message)

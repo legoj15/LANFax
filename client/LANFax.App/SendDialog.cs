@@ -23,10 +23,12 @@ internal sealed record SendDoc(Guid Id, string Path);
 /// is the compose dialog that picks files (and takes further prints) for one multi-document fax; with no PDF and no
 /// documents it is the tray's "Send a test page" prompt. Documents can be added and removed until the send starts;
 /// printing another document while this dialog is composing offers to attach it (a setting can turn that question
-/// off). One attempt: validate the number, ask the server for a blank-page check, then <see cref="SendExecutor"/> reads
-/// the documents, persists <c>sending</c>, calls <see cref="SendSession.Started"/> and sends; the dialog shows the
-/// result and locks or unlocks its fields. The dialog never deletes a PDF: <see cref="TrayContext"/> tracks, discards
-/// or keeps them from <see cref="Outcome"/> and <see cref="SpoolIds"/>.
+/// off). With documents, the left half of the window is a live preview of the pages the server will fax (stamped the
+/// way the send will stamp them), refreshed as documents or the number change; the window is resizable and the pages
+/// tile to the width. One attempt: validate the number, ask the server for a blank-page check, then
+/// <see cref="SendExecutor"/> reads the documents, persists <c>sending</c>, calls <see cref="SendSession.Started"/>
+/// and sends; the dialog shows the result and locks or unlocks its fields. The dialog never deletes a PDF:
+/// <see cref="TrayContext"/> tracks, discards or keeps them from <see cref="Outcome"/> and <see cref="SpoolIds"/>.
 /// </summary>
 internal sealed class SendDialog : Form
 {
@@ -34,6 +36,7 @@ internal sealed class SendDialog : Form
     private readonly SendExecutor _executor;
     private readonly Action _openSettings;
     private readonly Icon _icon = IconFactory.Create(true);
+    private readonly PagePreviewPanel? _preview;
 
     private readonly NumberBox _number = new();
     private readonly TextBox _subject = new() { Dock = DockStyle.Fill };
@@ -60,6 +63,12 @@ internal sealed class SendDialog : Form
     private readonly Button _cancel = new() { Text = "Cancel", AutoSize = true, MinimumSize = new Size(90, 28) };
     private readonly List<SendDoc> _docs = [];
     private readonly bool _compose;
+    private readonly System.Windows.Forms.Timer _previewTimer = new() { Interval = 500 };
+    private CancellationTokenSource _previewCts = new();
+    private bool _previewShowingPages;
+    private int _previewGen;
+    private string? _previewDocsKey;
+    private bool? _lastStamped;
     private bool _busy;
     private bool _blockingShutdown;
     private TaskCompletionSource _idle = CompletedIdle();
@@ -106,24 +115,36 @@ internal sealed class SendDialog : Form
         };
         Text = BaseTitle;
         AutoScaleMode = AutoScaleMode.Dpi;
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = false; MinimizeBox = false;
+        // With documents the left half is the live page preview and the window is resizable; the tray's test-page
+        // prompt has nothing to preview and stays the compact dialog it was.
+        bool withPreview = request.PdfPath != null || _compose;
+        FormBorderStyle = withPreview ? FormBorderStyle.Sizable : FormBorderStyle.FixedDialog;
+        MaximizeBox = withPreview; MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;
         ShowInTaskbar = true;
         Icon = _icon;
-        AutoSize = true;
-        AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        Padding = new Padding(12);
+        if (withPreview)
+        {
+            Size = new Size(1100, 700);
+            MinimumSize = new Size(880, 560);
+            Padding = new Padding(10);
+        }
+        else
+        {
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            Padding = new Padding(12);
+        }
         AcceptButton = _send;
         CancelButton = _cancel;
 
-        var t = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Fill };
+        var t = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = withPreview ? DockStyle.Top : DockStyle.Fill };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 300));
         int row = 0;
 
-        var showDocuments = request.PdfPath != null || _compose;
+        var showDocuments = withPreview;
         if (showDocuments)
         {
             t.Controls.Add(new Label { Text = "Documents:", AutoSize = true, Anchor = AnchorStyles.Top | AnchorStyles.Left, Margin = new Padding(0, 6, 8, 6) }, 0, row);
@@ -169,7 +190,22 @@ internal sealed class SendDialog : Form
         buttons.Controls.Add(_send);
         t.Controls.Add(buttons, 0, row);
         t.SetColumnSpan(buttons, 2);
-        Controls.Add(t);
+        if (withPreview)
+        {
+            var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 420));
+            _preview = new PagePreviewPanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 12, 0) };
+            root.Controls.Add(_preview, 0, 0);
+            root.Controls.Add(t, 1, 0);
+            _previewTimer.Tick += async (_, _) => { _previewTimer.Stop(); await RefreshPreviewAsync(); };
+            _number.Changed += SchedulePreview;
+            Controls.Add(root);
+        }
+        else
+        {
+            Controls.Add(t);
+        }
 
         _number.Changed += UpdateEnabled;
         _confirm.CheckedChanged += (_, _) => UpdateEnabled();
@@ -194,12 +230,104 @@ internal sealed class SendDialog : Form
         }
         RenderDocuments();
         UpdateEnabled();
-        _testPage.CheckedChanged += (_, _) => { _number.Input.Focus(); };
+        _testPage.CheckedChanged += (_, _) => { _number.Input.Focus(); SchedulePreview(); };
         _send.Click += async (_, _) => await SendAsync();
         _cancel.Click += (_, _) => Close(); // modeless: a DialogResult on the button would not close the form
-        Shown += (_, _) => { Activate(); _number.Focus(); if (_compose && _docs.Count == 0) PickDocuments(); };
+        Shown += (_, _) => { Activate(); _number.Focus(); if (_compose && _docs.Count == 0) PickDocuments(); SchedulePreview(); };
         FormClosing += OnClosing;
     }
+
+    // ---- the page preview ----
+
+    /// <summary>The preview refreshes half a second after the last change (typing included), not on every keystroke.</summary>
+    private void SchedulePreview()
+    {
+        if (_preview == null || IsDisposed) return;
+        _previewRetries = 0;
+        if (_previewTimer.Interval != Debounce) _previewTimer.Interval = Debounce;
+        _previewTimer.Stop();
+        _previewTimer.Start();
+    }
+
+    private const int Debounce = 500;
+    private int _previewRetries;
+
+    private async Task RefreshPreviewAsync()
+    {
+        if (_preview == null || IsDisposed || _busy) return;
+        int gen = ++_previewGen;
+        // Every note below means the pages just shown (if any) no longer describe the
+        // request, so the stamped-skip must not fire until pages are rendered again.
+        void Note(string text)
+        {
+            _previewShowingPages = false;
+            _preview.ShowNote(text);
+        }
+        if (_testPage.Checked) { Note("The server builds the test page when the fax is sent."); return; }
+        if (_docs.Count == 0) { Note("Add a document to preview its pages."); return; }
+        if (!_number.State.Allowed) { Note("Enter a fax number to preview the pages."); return; }
+        var docsKey = string.Join("|", _docs.Select(d => d.Path));
+        // Without the fax header the pages carry no number, so only a document change can alter them.
+        if (_lastStamped == false && docsKey == _previewDocsKey && _previewShowingPages) return;
+        _preview.ShowRendering();
+        _previewShowingPages = false;
+        _previewCts.Cancel();
+        _previewCts.Dispose();
+        _previewCts = new CancellationTokenSource();
+        SendPreview r;
+        try { r = await _executor.PreviewAsync(_docs.Select(d => d.Path).ToList(), _number.State.Normalized, _previewCts.Token); }
+        catch (OperationCanceledException) { return; }
+        catch (Exception e) { r = SendPreview.Fail(SendPreviewFailure.Unavailable, e.Message); }
+        if (gen != _previewGen || IsDisposed) return;
+        _previewDocsKey = docsKey;
+        _lastStamped = r.Stamped;
+        if (!r.Ok || r.Pages.Count == 0)
+        {
+            if (!r.Ok && r.Failure == SendPreviewFailure.Unavailable && _previewRetries < 2)
+            {
+                // the server allows one preview at a time; another window may hold it — a quiet retry beats an error
+                _previewRetries++;
+                _previewTimer.Interval = 2500;
+                _previewTimer.Stop();
+                _previewTimer.Start();
+                return;
+            }
+            Note(!r.Ok ? NoteFor(r) : "The pages could not be rendered (" + (r.Error ?? "the server did not say why") + ").");
+            return;
+        }
+        _previewRetries = 0;
+        try
+        {
+            string caption = r.TotalPages is { } total && total > r.Shown
+                ? $"First {r.Shown} of {total} pages, as faxed" : "Pages as faxed";
+            var images = new List<FaxPageImage>(r.Pages.Count);
+            try
+            {
+                images.AddRange(r.Pages.Select(p => new FaxPageImage(p)));
+                _preview.ShowPages(images, caption); // the panel owns the images
+                _previewShowingPages = true;
+            }
+            catch
+            {
+                foreach (var i in images) i.Dispose(); // never handed to the panel
+                throw;
+            }
+        }
+        catch (Exception e)
+        {
+            FileLog.Error("send: the preview pages could not be decoded", e);
+            Note("The preview pages could not be decoded.");
+        }
+    }
+
+    private static string NoteFor(SendPreview r) => r.Failure switch
+    {
+        SendPreviewFailure.Config => "Check the server address in Settings to see the pages.",
+        SendPreviewFailure.Unreadable => "The document could not be read (" + r.Error + ").",
+        SendPreviewFailure.TooLarge => "These documents are too large to preview.",
+        SendPreviewFailure.NoServerRoute => "This server's faxd has no page preview (update the server to get one).",
+        _ => "The preview is not available now: " + (r.Error ?? "the server did not say why"),
+    };
 
     private bool CanChangeDocuments => !_busy && !Session.FieldsLocked;
 
@@ -219,6 +347,7 @@ internal sealed class SendDialog : Form
         foreach (var d in _docs)
             _documents.Items.Add(Path.GetFileName(d.Path));
         if (at >= 0 && at < _documents.Items.Count) _documents.SelectedIndex = at;
+        SchedulePreview();
         UpdateEnabled();
     }
 
@@ -326,7 +455,7 @@ internal sealed class SendDialog : Form
         _cancel.Enabled = !busy;
         _addDocs.Enabled = !busy && CanChangeDocuments;
         _removeDoc.Enabled = !busy && CanChangeDocuments && _documents.SelectedIndex >= 0;
-        if (busy) _idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (busy) { _previewTimer.Stop(); _idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); }
         else
         {
             _idle.TrySetResult();
@@ -407,7 +536,13 @@ internal sealed class SendDialog : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) _icon.Dispose();
+        if (disposing)
+        {
+            _icon.Dispose();
+            _previewTimer.Dispose();
+            _previewCts.Cancel();
+            _previewCts.Dispose();
+        }
         base.Dispose(disposing);
     }
 }

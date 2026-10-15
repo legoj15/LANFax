@@ -708,6 +708,7 @@ public sealed class JobTrackerTests : IDisposable
         public Task<Job> PostJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, string to, string? subject, string idempotencyKey, CancellationToken ct = default) => throw new FaxApiException(0, "timeout");
         public Task<Job> SendTestPageAsync(SendEndpoint endpoint, string to, string? note, string idempotencyKey, CancellationToken ct = default) => throw new FaxApiException(0, "timeout");
         public Task<FaxCheck?> AnalyzeJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, CancellationToken ct = default) => Task.FromResult<FaxCheck?>(null);
+        public Task<FaxPreview?> PreviewJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, string to, CancellationToken ct = default) => Task.FromResult<FaxPreview?>(null);
     }
 
 

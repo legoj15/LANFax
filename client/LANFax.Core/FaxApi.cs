@@ -64,6 +64,11 @@ public interface ISendApi
     Task<Job> SendTestPageAsync(SendEndpoint endpoint, string to, string? note, string idempotencyKey, CancellationToken ct = default);
     /// <summary>The pre-send blank-page check; null when the server does not offer it (an older faxd).</summary>
     Task<FaxCheck?> AnalyzeJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, CancellationToken ct = default);
+    /// <summary>
+    /// The compose preview: the combined documents rendered as the send would stamp them. Null when the server does
+    /// not offer it (an older faxd).
+    /// </summary>
+    Task<FaxPreview?> PreviewJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts, string to, CancellationToken ct = default);
 }
 
 /// <summary>The reads and arm calls the monitor window makes; its smoke test fakes them.</summary>
@@ -73,6 +78,8 @@ public interface IMonitorApi
         int limit = 100, DateTimeOffset? updatedSince = null, CancellationToken ct = default);
     Task<IReadOnlyList<Job>> GetInboxAsync(int limit = 50, CancellationToken ct = default);
     Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default);
+    /// <summary>The fax's printable confirmation sheet; 404 when the server has none (older faxd, or not a finished outbound fax).</summary>
+    Task DownloadConfirmationAsync(string id, string destPath, CancellationToken ct = default);
     Task<ArmState> ArmAsync(int minutes, CancellationToken ct = default);
     Task<ArmState> DisarmAsync(CancellationToken ct = default);
     Task<ArmState> ReceiveTestAsync(int minutes = 20, CancellationToken ct = default);
@@ -199,14 +206,55 @@ public sealed class FaxApi(ClientConfig cfg, HttpClient http) : ISendApi, IMonit
         }
     }
 
-    public async Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default)
+    /// <summary>
+    /// POST /preview: the documents as the send would combine and stamp them, rendered as PNGs. Null when the server
+    /// has no such route (an older faxd); the caller shows no preview instead of blocking.
+    /// </summary>
+    public async Task<FaxPreview?> PreviewJobAsync(SendEndpoint endpoint, IReadOnlyList<(byte[] Bytes, string Name)> parts,
+        string to, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(endpoint);
+        ArgumentNullException.ThrowIfNull(parts);
+        if (parts.Count == 0) throw new ArgumentException("no documents to preview", nameof(parts));
+        var uri = Url(endpoint, "preview");
+        try
+        {
+            var (code, body) = await SendAsync(() =>
+            {
+                var r = Req(endpoint, HttpMethod.Post, uri);
+                r.Content = PartsContent(parts);
+                if (!string.IsNullOrEmpty(to)) r.Headers.TryAddWithoutValidation("X-Fax-To", to);
+                return r;
+            }, ct);
+            using var doc = ParseDoc(code, body, "preview");
+            try
+            {
+                return doc.RootElement.Deserialize<FaxPreview>(Json.Options)
+                    ?? throw new FaxApiException((int)code, "faxd returned an empty preview response");
+            }
+            catch (JsonException e) { throw Unreadable(code, "preview", e); }
+        }
+        catch (FaxApiException e) when (e.StatusCode is 404 or 405 or 501)
+        {
+            return null;   // this server cannot preview; showing one must not be required
+        }
+    }
+
+    public Task DownloadPdfAsync(string id, string destPath, CancellationToken ct = default) =>
+        DownloadToAsync("jobs/" + Uri.EscapeDataString(id) + "/pdf", destPath, ct);
+
+    /// <summary>GET /jobs/{id}/confirmation.pdf: the printable sheet (404 when the server has none).</summary>
+    public Task DownloadConfirmationAsync(string id, string destPath, CancellationToken ct = default) =>
+        DownloadToAsync("jobs/" + Uri.EscapeDataString(id) + "/confirmation.pdf", destPath, ct);
+
+    private async Task DownloadToAsync(string relativePath, string destPath, CancellationToken ct)
     {
         var dir = Path.GetDirectoryName(Path.GetFullPath(destPath));
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
         var tmp = destPath + ".part";
         try
         {
-            using var req = Req(HttpMethod.Get, "jobs/" + Uri.EscapeDataString(id) + "/pdf");
+            using var req = Req(HttpMethod.Get, relativePath);
             HttpResponseMessage resp;
             try { resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct); }
             catch (Exception e) when (IsNetwork(e, ct)) { throw new FaxApiException(0, "cannot reach faxd: " + e.Message, e); }

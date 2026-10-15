@@ -88,6 +88,49 @@ public class FaxApiSendFeatureTests : IDisposable
     }
 
     [Fact]
+    public async Task Preview_parses_the_rendered_pages_and_a_server_without_the_route_answers_null()
+    {
+        var png1 = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A };
+        var png2 = new byte[] { 0x00, 0x01, 0x02, 0xFF };
+        _srv.Handler = (ctx, _) => FakeServer.Json(ctx,
+            "{\"pages\":5,\"shown\":2,\"rendered\":[\"" + Convert.ToBase64String(png1) + "\",\""
+            + Convert.ToBase64String(png2) + "\"],\"stamped\":true}");
+        var ep = SendEndpoint.From(new ClientConfig { Server = "127.0.0.1", Port = _srv.Port, Token = "t" });
+        var preview = await Api().PreviewJobAsync(ep, new[] { (Encoding.ASCII.GetBytes("%PDF-a"), "a.pdf") }, "5552345678");
+        Assert.NotNull(preview);
+        Assert.Equal(5, preview!.Pages);
+        Assert.Equal(2, preview.Shown);
+        Assert.True(preview.Stamped);
+        Assert.Equal(png1, preview.Rendered[0]);
+        Assert.Equal(png2, preview.Rendered[1]);
+        var r = Assert.Single(_srv.Requests);
+        Assert.Equal("POST", r.Method);
+        Assert.Equal("/preview", r.PathAndQuery);
+        Assert.Equal("5552345678", r.Headers["X-Fax-To"]);
+        Assert.StartsWith("multipart/form-data", r.Headers["Content-Type"]);
+
+        _srv.Handler = (ctx, _) => FakeServer.Json(ctx, "{\"error\":\"not found\"}", 404);
+        Assert.Null(await Api().PreviewJobAsync(ep, new[] { (Encoding.ASCII.GetBytes("%PDF-a"), "a.pdf") }, "5552345678"));
+    }
+
+    [Fact]
+    public async Task DownloadConfirmation_writes_the_sheet()
+    {
+        var bytes = Encoding.ASCII.GetBytes("%PDF-1.4 sheet");
+        _srv.Handler = async (ctx, _) =>
+        {
+            ctx.Response.ContentType = "application/pdf";
+            ctx.Response.ContentLength64 = bytes.Length;
+            await ctx.Response.OutputStream.WriteAsync(bytes);
+            ctx.Response.Close();
+        };
+        var dest = Path.Combine(Path.GetTempPath(), "lanfax-" + Guid.NewGuid().ToString("N"), "c.pdf");
+        await Api().DownloadConfirmationAsync("lfabc", dest);
+        Assert.Equal(bytes, File.ReadAllBytes(dest));
+        Assert.Equal("/jobs/lfabc/confirmation.pdf", Assert.Single(_srv.Requests).PathAndQuery);
+    }
+
+    [Fact]
     public async Task Cancel_posts_and_parses_the_answer()
     {
         _srv.Handler = (ctx, _) => FakeServer.Json(ctx,

@@ -782,6 +782,49 @@ Seven user asks from the 2026-10-14 blank-page incident, all implemented:
   click (or right-click) a sent row opens the same window. `Job` gained an
   optional `Detail`; `MonitorRow` carries the raw `State`.
 
+## Page preview and the confirmation sheet (1.2.0)
+
+- **Resizable send window with a live page preview**: a dialog with
+  documents (print, compose, retry, resume, suspect) becomes a Sizable
+  window (default 1100x700, minimum 880x560, maximizable): the fields keep
+  to a fixed 420 px column on the right and `PagePreviewPanel` fills the
+  rest, showing the pages exactly as the server will fax them (merged, and
+  stamped with the fax header and page numbers when `FAXD_FAX_HEADER` is
+  on). One page fills the panel; several tile in as many columns as the
+  width allows and wrap with a scroll bar, so widening the window shows
+  more pages side by side. The tray's test-page prompt has nothing to
+  preview and stays the compact FixedDialog it was.
+- **`POST /preview`** renders the pages: `SendExecutor.PreviewAsync` reads
+  the documents (same limits as a send) and asks the server, which returns
+  the first 8 pages as PNGs (`FaxPreview`: total pages, shown, base64
+  PNGs, stamped). A 404/405/501 (older faxd) is "no preview on this
+  server"; 401/network/5xx/400 are "preview unavailable" with the server's
+  reason — a preview is a courtesy, like the blank-page check, and never
+  blocks or changes a send. The panel decodes the PNGs (`FaxPageImage`
+  keeps the stream GDI+ needs) and owns/disposes them.
+- **Refresh triggers**: dialog shown, documents added/removed, test-page
+  checkbox, and number edits — debounced 500 ms (`_previewTimer`), one
+  fetch at a time (a generation counter discards stale answers, a
+  `CancellationTokenSource` cancels in-flight uploads). Because the pages
+  carry the number only when the server stamps, the dialog skips refetching
+  after a number change once it has seen `stamped: false`. Placeholders:
+  rendering, no documents, invalid number, unavailable, older server; the
+  test page says its sheet is built when the fax is sent. The caption line
+  reads "First k of n pages, as faxed" when the server capped the render
+  (8 pages).
+- **Confirmation sheet**: faxd builds a printable one-page PDF receipt per
+  finished outbound fax (`GET /jobs/<id>/confirmation.pdf`, cached
+  server-side; see faxd-spec.md "confirmation.py"). The client downloads it
+  to `%LocalAppData%\LANFax\cache\confirm-<id>.pdf` through
+  `FaxApi.DownloadConfirmationAsync` and opens it: `PdfOpener.
+  OpenConfirmationAsync` (same 404/in-use/unauthorized handling as the fax
+  PDF; the two share the opener's dedupe table, keyed per kind + id so both
+  can be open at once). Entry
+  points: `ReceiptDialog`'s "Open confirmation sheet" button (enabled for
+  terminal outbound faxes) and the jobs grid's right-click "Open
+  confirmation sheet" (sent/failed/cancelled). The web page links
+  "confirmation" beside "open" on the same rows.
+
 ## Build and test rules
 
 - Tests first in `LANFax.Tests` for Core: number normalization, spool

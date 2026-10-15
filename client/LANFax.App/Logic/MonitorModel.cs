@@ -203,11 +203,16 @@ public sealed partial class MonitorModel(TimeZoneInfo zone)
     /// <c>&lt;cacheDir&gt;\&lt;id&gt;.pdf</c>. The id comes from the server: only letters, digits, '_' and '-' (faxd's
     /// are "lf" plus 12 hex), at most 64, so it can never name a path outside <paramref name="cacheDir"/>.
     /// </summary>
-    public static string PdfCachePath(string cacheDir, string id)
+    public static string PdfCachePath(string cacheDir, string id) => CachePath(cacheDir, id, ext: ".pdf");
+
+    /// <summary><c>&lt;cacheDir&gt;\confirm-&lt;id&gt;.pdf</c>: the fax's printable confirmation sheet.</summary>
+    public static string ConfirmationCachePath(string cacheDir, string id) => CachePath(cacheDir, id, "confirm-", ".pdf");
+
+    private static string CachePath(string cacheDir, string id, string prefix = "", string ext = "")
     {
         if (!SafeId().IsMatch(id)) throw new ArgumentException("not a job id: " + id, nameof(id));
         var dir = Path.GetFullPath(cacheDir);
-        var path = Path.GetFullPath(Path.Combine(dir, id + ".pdf"));
+        var path = Path.GetFullPath(Path.Combine(dir, prefix + id + ext));
         if (!string.Equals(Path.GetDirectoryName(path), dir.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException("not a job id: " + id, nameof(id));
         return path;

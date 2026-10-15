@@ -55,6 +55,7 @@ class Config:
     event_retention_days: int = 30         # FAXD_EVENT_RETENTION_DAYS; job_events older are pruned, 0 = keep
     gs_bin: str = "gs"                     # FAXD_GS_BIN; the merge/stamp/blank-analysis binary
     fax_header: bool = False               # FAXD_FAX_HEADER (1/true/yes/on); stamp sender/recipient/date + page numbers
+    confirmations_dir: str = "/var/lib/faxd/confirmations"   # FAXD_CONFIRMATIONS_DIR; cached confirmation sheets
 
 def load(env_file="/etc/faxserver/settings.env", environ=os.environ) -> Config
 ```
@@ -439,6 +440,8 @@ def compose(gs_bin, parts, *, header=None, footer=False, timeout=60.0) -> bytes
 def page_count(gs_bin, pdf, timeout=30.0) -> int | None      # bbox device, HiRes lines
 def blank_pages(gs_bin, pdf, *, dpi=50, threshold=252, max_pages=200) -> list[int]
 def header_text(station_id, to, now=None) -> str              # "TO <to> FROM <station> <date>"
+def preview_pages(gs_bin, pdf, *, dpi=80, max_pages=8, ...) -> list[bytes]   # PNGs for POST /preview
+def page_jpeg(gs_bin, pdf, *, page=1, dpi=48, timeout=30.0) -> bytes | None  # the confirmation thumbnail
 ```
 
 - `compose`: one PDF out of `(name, bytes)` parts via `-sDEVICE=pdfwrite`;
@@ -460,6 +463,36 @@ numbers on every outbound fax at enqueue time. A stamping failure on a
 single document falls back to the original bytes; a merge failure of
 several parts refuses the request (400). The stored sent PDF is the
 stamped one, so the receipt matches what was faxed.
+
+`preview_pages` renders the first pages with the `pnggray` device at 80 dpi
+for the client's compose preview; a page over 4 MB or a series over 12 MB
+ends the list (`shown` stays honest against `pages`). GsError propagates.
+`page_jpeg` renders one page as a JPEG for the confirmation sheet and is
+best effort (`None` on any gs failure).
+
+## confirmation.py
+
+The fax confirmation sheet: a printable one-page Letter PDF receipt for a
+finished outbound fax, hand-built like testpage.py (Helvetica base-14,
+correct xref) because gs draws rather than typesets.
+
+```python
+def build_confirmation(job, events, *, station_id, version, now=None, thumbnail=None) -> bytes
+def format_duration(seconds) -> str
+def confirmation_path(directory, job_id) -> str | None        # None when the daemon has no cache dir
+def write_confirmation(path, pdf) -> None                     # atomic (temp + replace)
+```
+
+The sheet carries the result word (sent→OK green, failed→FAILED red,
+cancelled→CANCELLED grey), the classic fields (To, Station ID, Started,
+Finished, Duration, Pages, Subject, Document, Job ID, Detail, Error), the
+transmission log when job_events exist (they are pruned after
+`event_retention_days`, so an old fax's sheet may omit it), a footer stamp,
+and — when the fax's PDF is still on disk — a first-page thumbnail: the
+JPEG `gs.page_jpeg` rendered, embedded with DCTDecode (no re-encoding) and
+scaled to its true aspect. ASCII only (non-latin-1 becomes `?`), long
+values wrap, missing values are omitted. Nothing here can fail the fax
+route except a genuine bug: build errors answer 500.
 
 ## api.py
 
@@ -493,8 +526,10 @@ Routes:
 | `GET /jobs?direction=out&state=sent,failed&limit=50` | `{"jobs":[…]}` newest first. `since=` filters `created_at >=` (raw text compare); `updated_since=<iso8601>` filters `updated_at >=` (normalized to UTC `…Z`, naive = UTC, 400 if unparseable). A reconnecting client polls `updated_since=<last sync>` to catch up. |
 | `GET /jobs/<id>` | job dict + `"events": [...]` |
 | `GET /jobs/<id>/pdf` | streams `pdf_path` as `application/pdf`, `Content-Disposition: inline; filename="<filename>"`; 404 if missing |
+| `GET /jobs/<id>/confirmation.pdf` | the printable confirmation sheet (see confirmation.py): 404 for an unknown id, an inbound fax, or a non-terminal job; otherwise built on the first ask (job row, events, thumbnail from the sent PDF while it exists) and cached at `confirmations_dir/<id>.pdf`, then served. A failed build is 500. |
 | `POST /jobs` | body is one PDF (`Content-Type: application/pdf`) or, for a multi-document fax, `multipart/form-data` with a `file` part per PDF (quoted or bare filenames; each part must start `%PDF`; the boundary must be at least 8 characters and CRLF-anchored, at most 50 parts, and a malformed part is a 400 -- the parser scans with find(), never split()). `enqueue_fn` receives the parts list; several parts are merged (and everything stamped when `FAXD_FAX_HEADER=1`) by `gs.compose`. Headers `X-Fax-To` (required), `X-Fax-Subject` (optional), `Idempotency-Key` (optional, 16-128 chars `[A-Za-z0-9._:-]`, else 400 naming the minimum; clients send a random GUID). Keys are global, not per caller ip: a laptop that lost the response and resumes from another ip (Wi-Fi vs Ethernet, new DHCP lease) must dedupe, and random GUIDs do not collide between honest callers. Returns 201 with the new job dict; a repeated key returns 200 with the job it created first and writes nothing (the body is read and discarded), unless the stored job's `to_number` differs from the normalized `X-Fax-To`: then 409 `{"error": "idempotency key already used for a different number"}` and nothing is written. Max body 25 MB (413 before reading; read into one preallocated buffer, no extra copy). At most 2 bodies are read at once: a third upload gets 503 `Retry-After: 2` without its body being read, and the connection is closed (a client that already sent the body may see a reset instead: retry with the same key). |
 | `POST /analyze` | The pre-send blank-page check (the client's "page N appears blank" prompt): same body forms as `POST /jobs`, merged the way a send would but unstamped (a stamp would ink every page), and answered `{"pages": n, "blank_pages": [1-based numbers]}`. Nothing is enqueued; the same 25 MB cap and upload semaphore apply. An older faxd without the route answers 404, which the client treats as "cannot pre-check" and skips. |
+| `POST /preview` | The send window's page preview: same body forms and caps as `/analyze`, merged the way a send would — stamped exactly when `FAXD_FAX_HEADER` is on, which requires header `X-Fax-To` (normalized and allowlist-checked; 400 when missing or refused) so the header line reads as it will on paper — then the first 8 pages rendered as PNGs (gs stops at 8 via a page range). Answer `{"pages": n|null, "shown": k, "rendered": ["<base64 png>", ...], "stamped": bool}` — `stamped` tells the client whether the pages carry the number (it skips refetching on number edits when false). A merge failure is 400 like `/analyze`; a failed page count or render degrades (`pages: null`, empty `rendered`). Nothing is enqueued. One preview runs at a time (`MAX_PREVIEWS`; a second caller gets 503 `Retry-After: 2`) so previews cannot starve the real send slots. An older faxd answers 404; the client shows no preview and carries on. |
 | `POST /jobs/<id>/cancel` | Stops a job the user no longer wants sent. `queued`: the row is marked cancelled first (a concurrent pipeline pickup cannot win), then the feeding files are removed -- faxd's own staging copies are deleted, a share-dropped user file is moved to `failed/` (kept, but out of every rule's reach), the pending `.<name>.part` and any outqueue `.env` naming the file go too; a file that survives removal puts the row back to `queued` and answers 409 (honest: it may still be faxed). `dialing`/`sending`: the live channel (from `AmiProgress.channel_for`) is hung up through AMI, then the row is cancelled; the receipt the pipeline writes afterwards finds a terminal row and changes nothing. 404 unknown id; 409 with the reason when terminal, when the call is being placed but has no channel yet, or when the pipeline moved the job on between the read and the guarded write. Returns the cancelled row (200). |
 | `GET /inbox?limit=50` | inbound jobs newest first |
 | `POST /arm` | JSON `{"minutes": 60}` -> arm state |
@@ -537,7 +572,8 @@ One file, no build step, no external CDN (must work offline over VPN).
 Sections: header with status pill (registrations, daemon ok), arm card
 (state + countdown, buttons 1h / 4h / 8h / 20 min test window / Disarm),
 send card (file picker + number + subject + Send; "Send test page to number"
-+ Send test), jobs table (time, to, state, pages, error, open pdf), inbox
++ Send test), jobs table (time, to, state, pages, error, open pdf,
+confirmation for a finished outbound fax), inbox
 table (time, from, open pdf). Token: an inline Connect card (password input,
 Connect button, one-line hint) shown when no token is stored or any request
 returns 401 (no `prompt()`: embedded and some mobile browsers refuse it); kept
