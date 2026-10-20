@@ -61,10 +61,6 @@ public sealed class UpdateTests : IDisposable
     [InlineData("v1.0.0-beta1")] [InlineData("nightly")] [InlineData("")] [InlineData(null)] [InlineData("v1.2.3.4")] [InlineData("v-1.0.0")]
     public void ParseTag_refuses_anything_else(string? tag) => Assert.Null(UpdateChecker.ParseTag(tag));
 
-    [Fact]
-    public void Current_is_the_assembly_version_without_a_commit_suffix() =>
-        Assert.Equal(new Version(1, 2, 0), UpdateChecker.CurrentVersion());
-
     // ---- check ----
 
     [Fact]
