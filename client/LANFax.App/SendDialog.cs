@@ -347,6 +347,7 @@ internal sealed class SendDialog : Form
         foreach (var d in _docs)
             _documents.Items.Add(Path.GetFileName(d.Path));
         if (at >= 0 && at < _documents.Items.Count) _documents.SelectedIndex = at;
+        Session.SetDocuments(_docs.Select(d => d.Path)); // what Send sends; a locked session keeps its frozen plan
         SchedulePreview();
         UpdateEnabled();
     }

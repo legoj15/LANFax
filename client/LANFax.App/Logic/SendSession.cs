@@ -128,7 +128,18 @@ public sealed class SendSession
     private readonly bool _testPageWhenEmpty;
 
     public Guid SpoolId { get; }
-    public IReadOnlyList<string> PdfPaths { get; }
+    public IReadOnlyList<string> PdfPaths { get; private set; }
+
+    /// <summary>
+    /// The dialog's current document list, in send order: what the next unlocked attempt sends. Ignored while locked
+    /// or in flight, where the frozen plan must go out unchanged.
+    /// </summary>
+    public void SetDocuments(IEnumerable<string> pdfPaths)
+    {
+        if (LockedPlan != null || _inFlight != null) return;
+        PdfPaths = pdfPaths.ToList();
+    }
+
     /// <summary>The first (cover) document; null with none.</summary>
     public string? PdfPath => PdfPaths.Count > 0 ? PdfPaths[0] : null;
     public string IdempotencyKey { get; private set; }
