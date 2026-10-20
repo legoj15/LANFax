@@ -4,7 +4,7 @@
 #define AppName "LANFax"
 ; Fallback only: build.ps1 passes /DAppVersion=<Version from Directory.Build.props>, and a test keeps this equal to it.
 #ifndef AppVersion
-  #define AppVersion "1.2.1"
+  #define AppVersion "1.2.2"
 #endif
 #define AppExe "LANFax.exe"
 ; The published app folder. The test suite compiles this script with /DAppSource=<stub dir>, so no publish is needed there.

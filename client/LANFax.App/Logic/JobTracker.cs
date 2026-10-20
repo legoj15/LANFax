@@ -142,12 +142,16 @@ public sealed class JobTracker(string spoolDir, Action<string>? log = null)
     /// </summary>
     public SendRequest Reoffer(SendRequest original, SendSession? session = null)
     {
-        if (original.PdfPath == null) return original; // a test page or compose: no document, no record
-        var pdf = original.PdfPath;
-        var (t, status) = Load(JsonPath(original.SpoolId));
-        var offer = status == LoadStatus.Ok && t != null ? OfferFor(original.SpoolId, t) : null;
+        // A locked plan names its own documents, which the dialog may have changed from the ones it opened with
+        // (a compose fax opens with none): its record is under the plan's first document.
+        var plan = session?.LockedPlan is { Route: SendRoute.Document, PdfPaths.Count: > 0 } lp ? lp : null;
+        var id = plan?.JobId ?? original.SpoolId;
+        var pdf = plan?.PdfPath ?? original.PdfPath;
+        if (pdf == null) return original; // a test page or an unsent compose: no document, no record
+        var (t, status) = Load(JsonPath(id));
+        var offer = status == LoadStatus.Ok && t != null ? OfferFor(id, t) : null;
         if (offer == null && session?.LockedPlan is { } locked)
-            offer = new SendRequest(original.SpoolId, pdf, locked.Number, locked.Subject, SendKind.Resume, locked,
+            offer = new SendRequest(id, pdf, locked.Number, locked.Subject, SendKind.Resume, locked,
                 session.LockedServer?.Authority, locked.PartIds.Where(g => g != locked.JobId).ToList() is { Count: > 0 } parts ? parts : null);
         offer ??= original;
         if (original.Kind == SendKind.Suspect && offer.LockedPlan == null && offer.Kind != SendKind.Suspect)

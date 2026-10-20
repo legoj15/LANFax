@@ -293,6 +293,44 @@ public sealed class JobTrackerTests : IDisposable
     }
 
     [Fact]
+    public void Compose_fax_uncertain_then_cancel_reopens_locked_on_its_documents()
+    {
+        // The compose window opens with no document; the record is under its first added document's id.
+        var t = new JobTracker(_dir);
+        var (a, aPdf) = Spooled();
+        var (b, bPdf) = Spooled();
+        var original = new SendRequest(Guid.NewGuid(), null, Kind: SendKind.Compose);
+        var s = SendSession.For(original);
+        s.SetDocuments([aPdf, bPdf]);
+        var p = s.Build("5552345678", null, false, false);
+        t.BeginSend(p, ServerA); s.Started(p, ServerA); s.Failed(AttemptOutcome.Uncertain); t.RecordFailure(s, p);
+        Assert.True(s.CancelKeepsDocumentFor(original.Kind));
+
+        var again = t.Reoffer(original, s);
+        Assert.Equal(SendKind.Resume, again.Kind);
+        Assert.Equal(p, again.LockedPlan);
+        Assert.Equal(new[] { aPdf, bPdf }, again.AllPdfPaths);
+        Assert.Equal(p.IdempotencyKey, SendSession.For(again).IdempotencyKey);
+    }
+
+    [Fact]
+    public void Removing_the_printed_document_then_uncertain_reopens_on_what_was_sent()
+    {
+        var t = new JobTracker(_dir);
+        var (id, pdf) = Spooled();
+        var (a, aPdf) = Spooled();
+        var original = new SendRequest(id, pdf);
+        var s = SendSession.For(original);
+        s.SetDocuments([aPdf]); // the print was removed, another document added
+        var p = s.Build("5552345678", null, false, false);
+        t.BeginSend(p, ServerA); s.Started(p, ServerA); s.Failed(AttemptOutcome.Uncertain); t.RecordFailure(s, p);
+
+        var again = t.Reoffer(original, s);
+        Assert.Equal(p, again.LockedPlan);
+        Assert.Equal(new[] { aPdf }, again.AllPdfPaths);
+    }
+
+    [Fact]
     public void Reoffer_of_an_untouched_request_is_that_request()
     {
         var t = new JobTracker(_dir);
